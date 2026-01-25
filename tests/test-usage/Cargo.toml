@@ -1,0 +1,14 @@
+[package]
+name = "test-usage"
+version = "0.1.0"
+edition = "2024"
+description = "Usage fixture crate that consumes test-proc-macros during integration tests."
+keywords = ["testing", "macros", "fixtures", "rust"]
+categories = ["development-tools"]
+license = "MIT"
+repository = "https://github.com/yasuo-ozu/macra"
+authors = ["yasuo-ozu"]
+publish = false
+
+[dependencies]
+test-proc-macros = { path = "../test-proc-macros" }

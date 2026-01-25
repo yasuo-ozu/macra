@@ -1,10 +1,28 @@
 use std::io::{BufRead, BufReader, Read};
 
+/// The kind of macro invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MacroExpansionKind {
+    /// Function-like macro: `name!(...)` / `name![...]` / `name!{...}`
+    Bang,
+    /// Attribute macro: `#[name]` or `#[name(...)]`
+    Attribute,
+    /// Derive macro: `#[derive(Name)]`
+    Derive,
+}
+
 /// A single macro expansion pair: the "expanding" text and the "to" text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MacroExpansion {
     pub expanding: String,
+    pub arguments: String,
     pub to: String,
+    /// Macro name (e.g. `"println"`, `"derive"`, `"test"`).
+    pub name: String,
+    /// Kind of macro invocation.
+    pub kind: MacroExpansionKind,
+    /// Raw input token stream that the macro receives.
+    pub input: String,
 }
 
 /// A group of macro expansions from a single `note: trace_macro` block.
@@ -78,6 +96,62 @@ impl<R: Read> TraceParser<R> {
         Some(content)
     }
 
+    /// Extract macro name from an `expanding` string.
+    ///
+    /// The expanding string has the form `name! { args }` (or with `()` / `[]`).
+    /// Returns the name part before `!`.
+    fn extract_macro_name(expanding: &str) -> String {
+        if let Some(bang_pos) = expanding.find('!') {
+            expanding[..bang_pos].trim().to_string()
+        } else {
+            expanding.to_string()
+        }
+    }
+
+    /// Extract macro arguments from an `expanding` string.
+    ///
+    /// The expanding string has the form `name! { args }` (or with `()` / `[]`).
+    /// Returns the content between the outermost delimiters, trimmed.
+    fn extract_arguments(expanding: &str) -> String {
+        // Find the `!` that separates macro name from arguments
+        let bang_pos = match expanding.find('!') {
+            Some(p) => p,
+            None => return String::new(),
+        };
+        let after_bang = expanding[bang_pos + 1..].trim_start();
+        let first_char = match after_bang.chars().next() {
+            Some(c) => c,
+            None => return String::new(),
+        };
+        let (open, close) = match first_char {
+            '{' => ('{', '}'),
+            '(' => ('(', ')'),
+            '[' => ('[', ']'),
+            _ => return String::new(),
+        };
+        let mut depth = 0i32;
+        let mut start = None;
+        let mut end = None;
+        for (i, ch) in after_bang.char_indices() {
+            if ch == open {
+                depth += 1;
+                if start.is_none() {
+                    start = Some(i + ch.len_utf8());
+                }
+            } else if ch == close {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(i);
+                    break;
+                }
+            }
+        }
+        match (start, end) {
+            (Some(s), Some(e)) => after_bang[s..e].trim().to_string(),
+            _ => String::new(),
+        }
+    }
+
     fn parse_trace_group(&mut self) -> Option<TraceGroup> {
         let mut expansions = Vec::new();
 
@@ -111,7 +185,16 @@ impl<R: Read> TraceParser<R> {
                     if to_line.contains("= note: to `") {
                         self.read_line(); // consume the line
                         let to = self.extract_backtick_content(&to_line)?;
-                        expansions.push(MacroExpansion { expanding, to });
+                        let input = Self::extract_arguments(&expanding);
+                        let name = Self::extract_macro_name(&expanding);
+                        expansions.push(MacroExpansion {
+                            expanding,
+                            arguments: String::new(),
+                            to,
+                            name,
+                            kind: MacroExpansionKind::Bang,
+                            input,
+                        });
                         break;
                     } else if to_line.starts_with("note: trace_macro")
                         || to_line.contains("= note: expanding `")

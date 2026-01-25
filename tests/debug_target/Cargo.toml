@@ -1,0 +1,14 @@
+[package]
+name = "debug-target"
+version = "0.1.0"
+edition = "2024"
+description = "Test fixture crate used as an expansion/debug target in integration tests."
+keywords = ["testing", "macros", "fixtures", "rust"]
+categories = ["development-tools"]
+license = "MIT"
+repository = "https://github.com/yasuo-ozu/macra"
+authors = ["yasuo-ozu"]
+publish = false
+
+[dependencies]
+debug-macros = { path = "../debug_macros" }
