@@ -20,6 +20,10 @@ context, which is useful for:
 - investigating specific macro invocations when tools like rust-analyzer `expandMacro` or
   `cargo expand` are too all-at-once for practical debugging
 
+## Screenshot
+
+[![asciicast](https://asciinema.org/a/8ZoXg8XHY8jnC8PW.svg)](https://asciinema.org/a/8ZoXg8XHY8jnC8PW)
+
 ## Install
 
 ### From crates.io (when published)
