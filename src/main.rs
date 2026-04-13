@@ -183,40 +183,6 @@ impl ExpansionCache {
         result
     }
 
-    /// Calculate similarity score between two strings (0.0 to 1.0)
-    fn similarity_score(a: &str, b: &str) -> f64 {
-        let a_norm = Self::normalize_tokens(a);
-        let b_norm = Self::normalize_tokens(b);
-
-        if a_norm.is_empty() || b_norm.is_empty() {
-            return 0.0;
-        }
-
-        let a_chars: Vec<char> = a_norm.chars().collect();
-        let b_chars: Vec<char> = b_norm.chars().collect();
-        let m = a_chars.len();
-        let n = b_chars.len();
-
-        let mut prev = vec![0usize; n + 1];
-        let mut curr = vec![0usize; n + 1];
-
-        for i in 1..=m {
-            for j in 1..=n {
-                if a_chars[i - 1] == b_chars[j - 1] {
-                    curr[j] = prev[j - 1] + 1;
-                } else {
-                    curr[j] = curr[j - 1].max(prev[j]);
-                }
-            }
-            std::mem::swap(&mut prev, &mut curr);
-            curr.fill(0);
-        }
-
-        let lcs_len = prev[n];
-        let max_len = m.max(n);
-        lcs_len as f64 / max_len as f64
-    }
-
     /// Convert MacroKind to MacroExpansionKind for comparison.
     fn to_expansion_kind(kind: MacroKind) -> MacroExpansionKind {
         match kind {
@@ -228,108 +194,89 @@ impl ExpansionCache {
 
     /// Check if a MacroExpansion matches the given input, arguments, name, and kind
     /// using normalized comparison for input and arguments.
+    /// When `relaxed_name` is true, also matches mangled names that contain the
+    /// source name (e.g. `__Parse_temporal_<hash>` matches source name `Parse`).
     fn expansion_matches(
         exp: &MacroExpansion,
         input: &str,
         arguments: &str,
         name: &str,
         kind: MacroKind,
+        relaxed_name: bool,
     ) -> bool {
         let macro_name = name.rsplit("::").next().unwrap_or(name).trim();
         let exp_name = exp.name.rsplit("::").next().unwrap_or(&exp.name).trim();
+        let name_matches = exp_name == macro_name
+            || (relaxed_name
+                && exp_name.starts_with("__")
+                && exp_name[2..].starts_with(macro_name));
         let input_matches = if exp.input.is_empty() {
-            // rustc may truncate very large macro invocations in trace output
-            // and emit only `name!` without arguments.
-            exp.kind == MacroExpansionKind::Bang && exp.expanding.trim_end().ends_with('!')
+            // Either both inputs are empty (normal match), or rustc may
+            // truncate very large macro invocations and emit only `name!`
+            // without arguments (fallback).
+            input.is_empty()
+                || (exp.kind == MacroExpansionKind::Bang
+                    && exp.expanding.trim_end().ends_with('!'))
         } else {
             Self::normalize_tokens(&exp.input) == Self::normalize_tokens(input)
         };
-        exp_name == macro_name
+        name_matches
             && exp.kind == Self::to_expansion_kind(kind)
             && input_matches
             && Self::normalize_tokens(&exp.arguments) == Self::normalize_tokens(arguments)
     }
 
     /// Search cached expansions for a matching trace. Returns the index if found.
-    /// Log messages are collected into `logs` for display in the TUI.
     fn search_expansions(
         inner: &CacheInner,
         input: &str,
         arguments: &str,
         name: &str,
         kind: MacroKind,
-        logs: &mut Vec<String>,
     ) -> Option<usize> {
-        logs.push(format!(
-            "input: {}, arguments: {}, name: {}, kind: {}",
-            input,
-            arguments,
-            name,
-            kind.as_str()
-        ));
-        // Search from current_idx forward
-        for idx in inner.current_idx..inner.expansions.len() {
-            let exp = &inner.expansions[idx];
-            logs.push(format!(
-                "  [{}] name={}, kind={:?}, input={}, args={}",
-                idx, exp.name, exp.kind, exp.input, exp.arguments
-            ));
-            if Self::expansion_matches(exp, input, arguments, name, kind) {
-                logs.push(format!(
-                    "match at idx {}, name: {name}, arguments: {arguments}, input: {input}",
-                    idx
-                ));
-                return Some(idx);
+        // Exact name match first, then relaxed name match as fallback
+        for relaxed in [false, true] {
+            for idx in inner.current_idx..inner.expansions.len() {
+                let exp = &inner.expansions[idx];
+                if Self::expansion_matches(exp, input, arguments, name, kind, relaxed) {
+                    return Some(idx);
+                }
+            }
+            // Wrap around: search from beginning to current_idx
+            for idx in 0..inner.current_idx {
+                let exp = &inner.expansions[idx];
+                if Self::expansion_matches(exp, input, arguments, name, kind, relaxed) {
+                    return Some(idx);
+                }
             }
         }
-        logs.push("wrap around".to_string());
-        // Wrap around: search from beginning to current_idx
-        for idx in 0..inner.current_idx {
-            let exp = &inner.expansions[idx];
-            logs.push(format!(
-                "  [{}] name={}, kind={:?}, input={}, args={}",
-                idx, exp.name, exp.kind, exp.input, exp.arguments
-            ));
-            if Self::expansion_matches(exp, input, arguments, name, kind) {
-                logs.push(format!(
-                    "match at idx {}, name: {name}, arguments: {arguments}, input: {input}",
-                    idx
-                ));
-                return Some(idx);
-            }
-        }
-        logs.push(format!(
-            "not match name: {name}, arguments: {arguments}, input: {input}",
-        ));
 
         None
     }
 
     /// Find an expansion that matches the given macro input/arguments.
     /// Blocks until a match is found or the iterator is exhausted.
-    /// Returns `(expansion_text, log_messages)`.
     fn find_trace_for_tokens(
         &self,
         input: &str,
         arguments: &str,
         name: &str,
         kind: MacroKind,
-    ) -> (Option<String>, Vec<String>) {
+    ) -> Option<String> {
         let (ref mutex, ref condvar) = *self.inner;
         let mut inner = mutex.lock().unwrap();
-        let mut logs = Vec::new();
 
         loop {
             if let Some(idx) =
-                Self::search_expansions(&inner, input, arguments, name, kind, &mut logs)
+                Self::search_expansions(&inner, input, arguments, name, kind)
             {
                 let result = inner.expansions[idx].to.clone();
                 inner.current_idx = idx + 1;
-                return (Some(result), logs);
+                return Some(result);
             }
 
             if inner.done {
-                return (None, logs);
+                return None;
             }
 
             // Wait for more data from the background thread
@@ -337,29 +284,81 @@ impl ExpansionCache {
         }
     }
 
-    /// Get nearest matching traces sorted by similarity.
-    /// Returns (scored_traces, total_trace_count).
-    fn get_nearest_traces(&self, tokens: &str, limit: usize) -> (Vec<(String, f64)>, usize) {
+    /// Write a diagnostic log file for a failed expansion.
+    /// Contains the macro info dump followed by all cached expansion traces.
+    /// Returns the path to the log file.
+    fn write_error_log(
+        &self,
+        name: &str,
+        kind: MacroKind,
+        input: &str,
+        arguments: &str,
+    ) -> Option<PathBuf> {
+        use std::io::Write;
+
+        let tmp_dir = std::env::temp_dir().join("macra");
+        if std::fs::create_dir_all(&tmp_dir).is_err() {
+            return None;
+        }
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let log_path = tmp_dir.join(format!("expansion-error-{}.log", timestamp));
+
+        let mut file = match std::fs::File::create(&log_path) {
+            Ok(f) => f,
+            Err(_) => return None,
+        };
+
+        // Dump macro info
+        let _ = writeln!(file, "name: {}", name);
+        let _ = writeln!(file, "kind: {}", kind.as_str());
+        let _ = writeln!(file, "input: {}", input);
+        let _ = writeln!(file, "arguments: {}", arguments);
+        let _ = writeln!(file);
+
+        // Dump all cached expansions (--show-expansion format)
         let (ref mutex, _) = *self.inner;
         let inner = mutex.lock().unwrap();
 
-        let total = inner.expansions.len();
-        let mut scored: Vec<(String, f64)> = inner
-            .expansions
-            .iter()
-            .map(|exp| {
-                let score = Self::similarity_score(tokens, &exp.expanding);
-                let display = if exp.expanding.len() > 60 {
-                    format!("{}...", &exp.expanding[..57])
-                } else {
-                    exp.expanding.clone()
-                };
-                (display, score)
-            })
-            .collect();
+        if inner.expansions.is_empty() {
+            let _ = writeln!(file, "No macro expansions found.");
+        } else {
+            let mut first = true;
+            for expansion in &inner.expansions {
+                if !first {
+                    let _ = writeln!(file);
+                }
+                first = false;
 
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        (scored.into_iter().take(limit).collect(), total)
+                let caller = match expansion.kind {
+                    MacroExpansionKind::Bang => format!("{}!", expansion.name),
+                    MacroExpansionKind::Attribute => {
+                        if expansion.arguments.is_empty() {
+                            format!("#[{}]", expansion.name)
+                        } else {
+                            format!(
+                                "#[{}({})]",
+                                expansion.name,
+                                expansion.arguments.replace('\n', " ")
+                            )
+                        }
+                    }
+                    MacroExpansionKind::Derive => format!("#[derive({})]", expansion.name),
+                };
+
+                let _ = writeln!(file, "== {} ==", caller);
+                if !expansion.input.is_empty() {
+                    let _ = writeln!(file, "{}", expansion.input);
+                }
+                let _ = writeln!(file, "---");
+                let _ = writeln!(file, "{}", expansion.to);
+            }
+        }
+
+        Some(log_path)
     }
 
     /// Take the stored error (if any), clearing it.
@@ -788,10 +787,10 @@ impl App {
         }
 
         // Find matching trace (blocks until found or iterator exhausted)
-        let (trace_result, _logs) = self
+        let expanded_text = match self
             .expansion_cache
-            .find_trace_for_tokens(&input, &arguments, &name, kind);
-        let expanded_text = match trace_result {
+            .find_trace_for_tokens(&input, &arguments, &name, kind)
+        {
             Some(text) => text,
             None => {
                 // Mark as failed and show error
@@ -834,36 +833,22 @@ impl App {
                     return;
                 }
 
-                let (nearest, total) = self.expansion_cache.get_nearest_traces(&input, 8);
-                let available_str = if nearest.is_empty() {
-                    "No trace data available.\n\
-                     Make sure -Z trace-macros is producing output.\n\
-                     Some macros (built-in attributes, compiler intrinsics) don't produce traces."
-                        .to_string()
-                } else {
-                    let matches: Vec<String> = nearest
-                        .iter()
-                        .map(|(s, score)| format!("{:.0}% {}", score * 100.0, s))
-                        .collect();
-                    format!(
-                        "Nearest matches ({} total traces):\n  {}",
-                        total,
-                        matches.join("\n  ")
-                    )
-                };
+                // Write diagnostic log file
+                let log_info =
+                    match self
+                        .expansion_cache
+                        .write_error_log(&name, kind, &input, &arguments)
+                    {
+                        Some(path) => format!("Log: {}", path.display()),
+                        None => "Failed to write log file.".to_string(),
+                    };
                 self.error_message = Some(format!(
-                    "Expansion Error: No trace found for '{}' (type: {})\n\
-                     Tokens: {}\n\n\
+                    "Expansion Error: No trace found for '{}' (type: {})\n\n\
                      {}\n\n\
                      Press Enter to dismiss.",
                     name,
                     kind.as_str(),
-                    if input.len() > 50 {
-                        format!("{}...", &input[..47])
-                    } else {
-                        input.clone()
-                    },
-                    available_str
+                    log_info,
                 ));
                 return;
             }
@@ -2309,7 +2294,8 @@ mod tests {
             "$ _a (a) @ 'a'",
             "",
             "impl_char",
-            MacroKind::Functional
+            MacroKind::Functional,
+            false
         ));
     }
 
@@ -2329,7 +2315,64 @@ mod tests {
             "x",
             "",
             "foo",
-            MacroKind::Functional
+            MacroKind::Functional,
+            false
+        ));
+    }
+
+    #[test]
+    fn expansion_matches_empty_input_bang_macro() {
+        // rustc normalizes `mystruct_hello!()` to `mystruct_hello! { }` in trace,
+        // so expanding doesn't end with `!`. Both inputs are empty → should match.
+        let exp = MacroExpansion {
+            expanding: "mystruct_hello! { }".to_string(),
+            arguments: String::new(),
+            to: "println!(\"hello\");".to_string(),
+            name: "mystruct_hello".to_string(),
+            kind: MacroExpansionKind::Bang,
+            input: String::new(),
+        };
+
+        assert!(ExpansionCache::expansion_matches(
+            &exp,
+            "",
+            "",
+            "mystruct_hello",
+            MacroKind::Functional,
+            false
+        ));
+    }
+
+    #[test]
+    fn expansion_matches_mangled_name_relaxed() {
+        // Proc-macro crates like decycle generate mangled helper macros
+        // (e.g. `__Parse_temporal_<hash>!`). Relaxed matching should find them.
+        let exp = MacroExpansion {
+            expanding: "__Parse_temporal_9874485626140785372! { args }".to_string(),
+            arguments: String::new(),
+            to: "expanded".to_string(),
+            name: "__Parse_temporal_9874485626140785372".to_string(),
+            kind: MacroExpansionKind::Bang,
+            input: "args".to_string(),
+        };
+
+        // Exact match fails
+        assert!(!ExpansionCache::expansion_matches(
+            &exp,
+            "args",
+            "",
+            "Parse",
+            MacroKind::Functional,
+            false
+        ));
+        // Relaxed match succeeds
+        assert!(ExpansionCache::expansion_matches(
+            &exp,
+            "args",
+            "",
+            "Parse",
+            MacroKind::Functional,
+            true
         ));
     }
 }
