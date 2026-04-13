@@ -75,7 +75,7 @@ dependencies = [
 
 [[package]]
 name = "cargo-macra"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "cargo_metadata",
  "clap",
@@ -426,7 +426,7 @@ dependencies = [
 
 [[package]]
 name = "macra"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -434,7 +434,7 @@ dependencies = [
 
 [[package]]
 name = "macra-hook"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "libc",
  "serde",
