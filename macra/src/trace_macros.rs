@@ -118,7 +118,7 @@ impl TraceMacros {
     /// (from rustc's `-Z trace-macros`) are emitted after the child exits.
     pub fn run(&self) -> io::Result<MacroExpansionIter> {
         let mut cmd = Command::new(&self.cargo_path);
-        cmd.arg("check").arg("--message-format=json");
+        cmd.arg("check");
         cmd.env("RUSTC_BOOTSTRAP", "1");
 
         if let Some(ref pkg) = self.args.package {
@@ -176,58 +176,50 @@ impl TraceMacros {
 
         let (tx, rx) = mpsc::channel();
 
-        // Read stderr for hook lines
-        let tx_stderr = tx.clone();
-        let stderr_thread = thread::spawn(move || {
+        // Drain stdout in a background thread to prevent the child from blocking
+        let stdout_thread = thread::spawn(move || {
+            use std::io::Read;
+            let mut stdout = stdout;
+            let mut buf = [0u8; 4096];
+            loop {
+                match stdout.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        });
+
+        // Read stderr: handle hook lines immediately, collect the rest for
+        // trace-macros parsing after the child exits.
+        thread::spawn(move || {
             use std::io::BufRead;
             let reader = io::BufReader::new(stderr);
+            let mut stderr_buf = String::new();
+
             for line in reader.lines() {
                 let line = match line {
                     Ok(l) => l,
                     Err(e) => {
-                        let _ = tx_stderr.send(Err(e));
+                        let _ = tx.send(Err(e));
                         break;
                     }
                 };
                 if let Some(json) = line.strip_prefix(HOOK_LINE_PREFIX) {
                     if let Some(expansion) = parse_hook_json(json) {
-                        let _ = tx_stderr.send(Ok(expansion));
+                        let _ = tx.send(Ok(expansion));
                     }
-                }
-            }
-        });
-
-        // Read stdout for --message-format=json compiler messages
-        thread::spawn(move || {
-            use std::io::BufRead;
-            let reader = io::BufReader::new(stdout);
-            let mut rendered_buf = String::new();
-
-            for line in reader.lines() {
-                let line = match line {
-                    Ok(l) => l,
-                    Err(_) => break,
-                };
-                // Extract "rendered" field from cargo JSON messages
-                if let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) {
-                    if let Some(rendered) = msg
-                        .get("message")
-                        .and_then(|m| m.get("rendered"))
-                        .and_then(|r| r.as_str())
-                    {
-                        rendered_buf.push_str(rendered);
-                    }
+                } else {
+                    stderr_buf.push_str(&line);
+                    stderr_buf.push('\n');
                 }
             }
 
-            // Wait for stderr thread to finish
-            let _ = stderr_thread.join();
-
-            // Wait for child to finish
+            // Wait for stdout draining and child process to finish
+            let _ = stdout_thread.join();
             let _ = child.wait();
 
-            // Parse all rendered compiler output for trace-macros
-            for group in parse_trace(rendered_buf.as_bytes()) {
+            // Parse plain-text trace-macros output from stderr
+            for group in parse_trace(stderr_buf.as_bytes()) {
                 for expansion in group.expansions {
                     let _ = tx.send(Ok(expansion));
                 }
