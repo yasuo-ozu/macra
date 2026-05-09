@@ -210,7 +210,12 @@ impl ExpansionCache {
             || (relaxed_name
                 && exp_name.starts_with("__")
                 && exp_name[2..].starts_with(macro_name));
-        let input_matches = if exp.input.is_empty() {
+        let input_matches = if kind == MacroKind::Attribute {
+            // Hook-captured attribute macros serialize doc comments differently
+            // than syn (/// vs #[doc = "..."]). The arguments alone are
+            // sufficient to identify the specific invocation.
+            true
+        } else if exp.input.is_empty() {
             // Either both inputs are empty (normal match), or rustc may
             // truncate very large macro invocations and emit only `name!`
             // without arguments (fallback).
@@ -1129,8 +1134,13 @@ impl App {
             node.derive_sibling_snapshot = derive_sibling_snapshot;
         }
 
-        // Parse expanded content to find child macros (use content without markers)
-        let child_macros = find_macros(&content_for_parsing);
+        // Parse expanded content to find child macros (use content without markers).
+        // Replace $crate with a valid identifier so syn::parse_file() can parse
+        // expanded macro output that contains $crate tokens.
+        const DOLLAR_CRATE_PLACEHOLDER: &str = "__macra_dollar_crate__";
+        let content_for_parsing_safe =
+            content_for_parsing.replace("$crate", DOLLAR_CRATE_PLACEHOLDER);
+        let child_macros = find_macros(&content_for_parsing_safe);
 
         // Create child nodes
         let mut child_ids = Vec::new();
@@ -1164,8 +1174,12 @@ impl App {
                     col_end: child_mac.col_end,
                     line_end: adjusted_line + (child_mac.line_end - child_mac.line),
                     item_line_end: adjusted_line + (child_mac.item_line_end - child_mac.line),
-                    input: child_mac.input,
-                    arguments: child_mac.arguments,
+                    input: child_mac
+                        .input
+                        .replace(DOLLAR_CRATE_PLACEHOLDER, "$crate"),
+                    arguments: child_mac
+                        .arguments
+                        .replace(DOLLAR_CRATE_PLACEHOLDER, "$crate"),
                     sibling_derives: child_mac.sibling_derives,
                 },
                 id: child_id,

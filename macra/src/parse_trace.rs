@@ -68,24 +68,31 @@ impl<R: Read> TraceParser<R> {
 
     /// Extract content between backticks, handling multi-line content.
     /// Returns the content and consumes lines as needed.
+    ///
+    /// The rustc trace-macros output wraps expanding/to content in backticks:
+    ///   `= note: to \`CONTENT\``
+    /// Content may itself contain backticks (e.g. doc comments with markdown
+    /// links like `` [`something`] ``).  For single-line content the closing
+    /// backtick is the *last* backtick on the line.  For multi-line content
+    /// the closing backtick is the last character on the final line.
     fn extract_backtick_content(&mut self, first_line: &str) -> Option<String> {
         // Find the opening backtick
         let start_idx = first_line.find('`')?;
         let after_backtick = &first_line[start_idx + 1..];
 
-        // Check if content ends on the same line
-        if let Some(end_idx) = after_backtick.find('`') {
+        // Check if content ends on the same line (use rfind to skip inner backticks)
+        if let Some(end_idx) = after_backtick.rfind('`') {
             return Some(after_backtick[..end_idx].to_string());
         }
 
-        // Multi-line content: collect until closing backtick
+        // Multi-line content: collect until closing backtick at end of line
         let mut content = after_backtick.to_string();
 
         loop {
             let line = self.read_line()?;
-            if let Some(end_idx) = line.find('`') {
+            if line.ends_with('`') {
                 content.push('\n');
-                content.push_str(&line[..end_idx]);
+                content.push_str(&line[..line.len() - 1]);
                 break;
             } else {
                 content.push('\n');
