@@ -1384,24 +1384,8 @@ impl App {
     fn reload_trace(&mut self) {
         self.status = "Reloading trace data...".to_string();
 
-        // Touch source files to force recompilation (cargo skips unchanged crates)
-        if let Some(ref manifest_path) = self.trace_macros.args().manifest_path {
-            let manifest = PathBuf::from(manifest_path);
-            if let Some(dir) = manifest.parent() {
-                let src_dir = dir.join("src");
-                if src_dir.is_dir() {
-                    // Touch all .rs files in src/
-                    if let Ok(entries) = std::fs::read_dir(&src_dir) {
-                        for entry in entries.flatten() {
-                            let path = entry.path();
-                            if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-                                let _ = filetime::set_file_mtime(&path, filetime::FileTime::now());
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // Touch the target source file to force recompilation.
+        let _ = filetime::set_file_mtime(&self.file_path, filetime::FileTime::now());
 
         match self.trace_macros.run() {
             Ok(iter) => {
@@ -2225,6 +2209,13 @@ fn main() -> io::Result<()> {
 
     eprintln!("Loading source from {}", src_path.display());
     let source = std::fs::read_to_string(&src_path)?;
+
+    // Touch the source file to invalidate cargo's cache and force recompilation.
+    // This ensures the macra-hook (LD_PRELOAD) can intercept proc-macro loading,
+    // which is necessary because cargo caches stderr output and replays it on
+    // subsequent runs — if a previous compilation ran without the hook, the cached
+    // stderr won't contain proc-macro expansion data.
+    let _ = filetime::set_file_mtime(&src_path, filetime::FileTime::now());
 
     eprintln!("Running cargo with -Z trace-macros...");
     let tm = build_trace_macros(&args);
