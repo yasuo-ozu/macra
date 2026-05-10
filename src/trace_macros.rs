@@ -1,8 +1,11 @@
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
+#[cfg(target_os = "macos")]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::parse_trace::{MacroExpansion, MacroExpansionKind, parse_trace};
 
@@ -17,8 +20,8 @@ pub struct Args {
     pub manifest_path: Option<String>,
     pub cargo_args: Vec<String>,
     /// Path to the macra-hook shared library (e.g. `libmacra_hook.so`).
-    /// When set, the library is injected via `LD_PRELOAD` / `DYLD_INSERT_LIBRARIES`.
-    pub hook_lib: Option<PathBuf>,
+    /// When non-empty, the library is injected via `LD_PRELOAD` / `DYLD_INSERT_LIBRARIES`.
+    pub hook_lib: PathBuf,
 }
 
 /// Spawns `cargo check` with `-Z trace-macros` (and optionally the macra-hook)
@@ -32,6 +35,20 @@ pub struct TraceMacros {
 /// process.
 pub struct MacroExpansionIter {
     rx: mpsc::Receiver<io::Result<MacroExpansion>>,
+}
+
+/// Result of spawning trace-macros collection.
+pub struct TraceRun {
+    pub iter: MacroExpansionIter,
+    /// Receives cargo check result once the child exits.
+    pub check_result: mpsc::Receiver<io::Result<CheckResult>>,
+}
+
+/// Result details for the traced `cargo check` execution.
+pub struct CheckResult {
+    pub success: bool,
+    pub stdout: String,
+    pub stderr: String,
 }
 
 impl MacroExpansionIter {
@@ -58,6 +75,8 @@ impl Iterator for MacroExpansionIter {
 }
 
 const HOOK_LINE_PREFIX: &str = "__MACRA_HOOK__:";
+#[cfg(target_os = "macos")]
+static LINKER_WRAPPER_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(serde::Deserialize)]
 struct HookRecord {
@@ -116,7 +135,7 @@ impl TraceMacros {
     /// Hook-based expansions (proc-macros captured via `LD_PRELOAD`) are emitted
     /// immediately as the child process writes them.  Trace-macros expansions
     /// (from rustc's `-Z trace-macros`) are emitted after the child exits.
-    pub fn run(&self) -> io::Result<MacroExpansionIter> {
+    pub fn run(&self) -> io::Result<TraceRun> {
         let mut cmd = Command::new(&self.cargo_path);
         cmd.arg("check");
         cmd.env("RUSTC_BOOTSTRAP", "1");
@@ -150,18 +169,63 @@ impl TraceMacros {
             rustflags.push(' ');
         }
         rustflags.push_str("-Z trace-macros");
-        cmd.env("RUSTFLAGS", rustflags);
 
         // Set up macra-hook via LD_PRELOAD if available
-        if let Some(ref lib) = self.args.hook_lib {
-            let lib = lib.canonicalize().unwrap_or_else(|_| lib.clone());
+        if !self.args.hook_lib.as_os_str().is_empty() {
+            let lib = self
+                .args
+                .hook_lib
+                .canonicalize()
+                .unwrap_or_else(|_| self.args.hook_lib.clone());
             if cfg!(target_os = "macos") {
                 cmd.env("DYLD_INSERT_LIBRARIES", &lib);
+                // DYLD_INSERT_LIBRARIES propagates into the linker process (cc),
+                // which can fail due to arch constraints on newer macOS runners.
+                // Route linker invocations through a tiny wrapper that unsets DYLD.
+                #[cfg(target_os = "macos")]
+                if let Ok(wrapper) = create_macos_linker_wrapper() {
+                    cmd.env("CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER", &wrapper);
+                    cmd.env("CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER", &wrapper);
+                    // Also cover toolchains/build scripts that consult CC directly.
+                    cmd.env("CC", &wrapper);
+                }
+            } else if cfg!(target_os = "windows") {
+                // On Windows, use RUSTC_WRAPPER to inject the hook DLL into
+                // rustc via CreateRemoteThread + LoadLibraryW.
+                #[cfg(target_os = "windows")]
+                if let Some(wrapper_exe) = crate::find_wrapper_exe(
+                    std::env::current_exe().ok().as_deref(),
+                ) {
+                    cmd.env("RUSTC_WRAPPER", &wrapper_exe);
+                    cmd.env("MACRA_HOOK_DLL_PATH", &lib);
+                }
             } else {
                 cmd.env("LD_PRELOAD", &lib);
             }
+
+            // Include a hook-specific cfg flag in RUSTFLAGS so that cargo's
+            // build fingerprint changes when switching between hook-enabled
+            // and non-hook builds.  Without this, a previous build without the
+            // hook (but with the same -Z trace-macros flag) would leave cached
+            // artifacts that cargo considers "Fresh", causing it to replay
+            // the cached stderr — which lacks hook output.
+            rustflags.push_str(" --cfg macra_hook_active");
+
+            // All platforms use stderr for hook output.  The hook library
+            // writes JSON lines to stderr with a `__MACRA_HOOK__:` prefix.
+            // Cargo caches and replays stderr diagnostics for "Fresh" crates,
+            // so hook output from previously-compiled dependencies is
+            // automatically available even when cargo skips recompilation.
+            // This is critical because parallel tests share a target directory
+            // and only the first test to compile a dependency crate triggers
+            // actual rustc invocations.
+            //
+            // On Windows (RUSTC_WRAPPER), rustc inherits the wrapper's stderr
+            // handle via bInheritHandles=TRUE in CreateProcessW, so hook
+            // output reaches cargo's stderr pipe just like on Linux/macOS.
         }
 
+        cmd.env("RUSTFLAGS", rustflags);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         let mut child = cmd.spawn()?;
@@ -175,22 +239,28 @@ impl TraceMacros {
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "failed to capture stderr"))?;
 
         let (tx, rx) = mpsc::channel();
+        let (status_tx, status_rx) = mpsc::channel();
 
-        // Drain stdout in a background thread to prevent the child from blocking
+        // Drain stdout in a background thread to prevent the child from blocking.
+        // Keep a copy because some cargo/rustc setups emit diagnostics on stdout.
         let stdout_thread = thread::spawn(move || {
             use std::io::Read;
             let mut stdout = stdout;
+            let mut collected = String::new();
             let mut buf = [0u8; 4096];
             loop {
                 match stdout.read(&mut buf) {
                     Ok(0) | Err(_) => break,
-                    Ok(_) => {}
+                    Ok(n) => {
+                        collected.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    }
                 }
             }
+            collected
         });
 
-        // Read stderr: handle hook lines immediately, collect the rest for
-        // trace-macros parsing after the child exits.
+        // Read stderr: handle hook lines (legacy fallback), collect the rest
+        // for trace-macros parsing after the child exits.
         thread::spawn(move || {
             use std::io::BufRead;
             let reader = io::BufReader::new(stderr);
@@ -204,6 +274,8 @@ impl TraceMacros {
                         break;
                     }
                 };
+                // Legacy path: hook output on stderr (when MACRA_HOOK_OUTPUT_DIR
+                // is not used or the hook falls back to stderr).
                 if let Some(json) = line.strip_prefix(HOOK_LINE_PREFIX) {
                     if let Some(expansion) = parse_hook_json(json) {
                         let _ = tx.send(Ok(expansion));
@@ -215,21 +287,125 @@ impl TraceMacros {
             }
 
             // Wait for stdout draining and child process to finish
-            let _ = stdout_thread.join();
-            let _ = child.wait();
+            let stdout_buf = stdout_thread.join().unwrap_or_default();
+            let wait_result: io::Result<ExitStatus> = child.wait();
 
-            // Parse plain-text trace-macros output from stderr
+            // Parse plain-text trace-macros output from stderr and stdout.
             for group in parse_trace(stderr_buf.as_bytes()) {
                 for expansion in group.expansions {
                     let _ = tx.send(Ok(expansion));
+                }
+            }
+            for group in parse_trace(stdout_buf.as_bytes()) {
+                for expansion in group.expansions {
+                    let _ = tx.send(Ok(expansion));
+                }
+            }
+
+            match wait_result {
+                Ok(status) => {
+                    let _ = status_tx.send(Ok(CheckResult {
+                        success: status.success(),
+                        stdout: stdout_buf,
+                        stderr: stderr_buf,
+                    }));
+                }
+                Err(e) => {
+                    let _ = status_tx.send(Err(e));
                 }
             }
 
             // tx drops here, closing the channel
         });
 
-        Ok(MacroExpansionIter { rx })
+        Ok(TraceRun {
+            iter: MacroExpansionIter { rx },
+            check_result: status_rx,
+        })
     }
+}
+
+#[cfg(target_os = "macos")]
+fn create_macos_linker_wrapper() -> io::Result<PathBuf> {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let unique = LINKER_WRAPPER_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir();
+    let bin_path = dir.join(format!(
+        "cargo-macra-linker-wrapper-{}-{}",
+        std::process::id(),
+        unique
+    ));
+
+    // Compile a native arm64 binary wrapper instead of a shell script.
+    // On newer macOS, system binaries like /bin/sh are arm64e.  dyld refuses
+    // to inject an arm64 dylib into an arm64e process, so the shell script
+    // approach dies with SIGABRT before the `unset` line ever runs.
+    // A compiled arm64 binary can load the arm64 hook dylib harmlessly, then
+    // unset DYLD_INSERT_LIBRARIES before exec-ing the real (arm64e) linker.
+    let c_src = concat!(
+        "#include <stdlib.h>\n",
+        "#include <unistd.h>\n",
+        "#include <string.h>\n",
+        "int main(int argc, char *argv[]) {\n",
+        "    (void)argc;\n",
+        "    unsetenv(\"DYLD_INSERT_LIBRARIES\");\n",
+        "    if (argv[1]) {\n",
+        "        const char *b = strrchr(argv[1], '/');\n",
+        "        if (!b) b = argv[1]; else b++;\n",
+        "        if (strcmp(b,\"cc\")==0||strcmp(b,\"clang\")==0||strcmp(b,\"gcc\")==0) {\n",
+        "            execvp(argv[1], argv+1);\n",
+        "            _exit(127);\n",
+        "        }\n",
+        "    }\n",
+        "    argv[0] = \"/usr/bin/cc\";\n",
+        "    execvp(\"/usr/bin/cc\", argv);\n",
+        "    _exit(127);\n",
+        "}\n",
+    );
+
+    let src_path = dir.join(format!(
+        "cargo-macra-linker-wrapper-{}-{}.c",
+        std::process::id(),
+        unique
+    ));
+    fs::write(&src_path, c_src)?;
+    let compile = std::process::Command::new("cc")
+        .arg("-o")
+        .arg(&bin_path)
+        .arg(&src_path)
+        .status();
+    let _ = fs::remove_file(&src_path);
+
+    if let Ok(st) = compile {
+        if st.success() {
+            return Ok(bin_path);
+        }
+    }
+
+    // Fallback: shell script (works on systems where /bin/sh is arm64).
+    let script_path = dir.join(format!(
+        "cargo-macra-linker-wrapper-{}-{}.sh",
+        std::process::id(),
+        unique
+    ));
+    let script = r#"#!/bin/sh
+unset DYLD_INSERT_LIBRARIES
+if [ "$#" -gt 0 ]; then
+  case "$1" in
+    */cc|cc|*/clang|clang|*/gcc|gcc)
+      linker="$1"
+      shift
+      exec "$linker" "$@"
+      ;;
+  esac
+fi
+exec /usr/bin/cc "$@"
+"#;
+    fs::write(&script_path, script)?;
+    fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))?;
+    Ok(script_path)
 }
 
 #[cfg(test)]

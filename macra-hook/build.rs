@@ -14,6 +14,7 @@ fn main() {
     for i in 0..NUM_TRAMPOLINES {
         code.push_str(&format!(
             r#"
+#[allow(unused)]
 extern "C" fn trampoline_{i}(config: crate::types::BridgeConfig<'_>) -> crate::types::Buffer {{
     trampoline_impl({i}, config)
 }}
@@ -24,12 +25,12 @@ extern "C" fn trampoline_{i}(config: crate::types::BridgeConfig<'_>) -> crate::t
 
     // Generate the trampoline array
     code.push_str(&format!(
-        "\npub const NUM_TRAMPOLINES: usize = {};\n\n",
+        "\n#[allow(unused)]\npub const NUM_TRAMPOLINES: usize = {};\n\n",
         NUM_TRAMPOLINES
     ));
 
     code.push_str(
-        "pub static TRAMPOLINE_FNS: [extern \"C\" fn(crate::types::BridgeConfig<'_>) -> crate::types::Buffer; NUM_TRAMPOLINES] = [\n"
+        "\n#[allow(unused)]\npub static TRAMPOLINE_FNS: [extern \"C\" fn(crate::types::BridgeConfig<'_>) -> crate::types::Buffer; NUM_TRAMPOLINES] = [\n"
     );
     for i in 0..NUM_TRAMPOLINES {
         code.push_str(&format!("    trampoline_{},\n", i));

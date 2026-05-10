@@ -11,8 +11,8 @@ use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use macra::parse_trace::{MacroExpansion, MacroExpansionKind};
-use macra::trace_macros::{MacroExpansionIter, TraceMacros};
+use cargo_macra::parse_trace::{MacroExpansion, MacroExpansionKind};
+use cargo_macra::trace_macros::{MacroExpansionIter, TraceMacros};
 use macro_finder::{MacroCall, MacroKind, find_macros, is_builtin_attribute};
 use ratatui::{
     prelude::*,
@@ -97,6 +97,8 @@ struct CacheInner {
     current_idx: usize,
     done: bool,
     error: Option<String>,
+    /// Stored build failure message (non-zero exit from cargo check).
+    build_error: Option<String>,
 }
 
 struct ExpansionCache {
@@ -104,13 +106,17 @@ struct ExpansionCache {
 }
 
 impl ExpansionCache {
-    fn new(iter: MacroExpansionIter) -> Self {
+    fn new(
+        iter: MacroExpansionIter,
+        check_result: std::sync::mpsc::Receiver<io::Result<cargo_macra::trace_macros::CheckResult>>,
+    ) -> Self {
         let inner = Arc::new((
             Mutex::new(CacheInner {
                 expansions: Vec::new(),
                 current_idx: 0,
                 done: false,
                 error: None,
+                build_error: None,
             }),
             Condvar::new(),
         ));
@@ -129,7 +135,23 @@ impl ExpansionCache {
                         cache.error = Some(format!("{}", e));
                         cache.done = true;
                         condvar.notify_all();
-                        return;
+                        break;
+                    }
+                }
+            }
+            // Check the build result after the expansion stream is exhausted.
+            if let Ok(Ok(result)) = check_result.recv() {
+                if !result.success {
+                    // Extract compiler error lines from stderr (skip hook/trace noise).
+                    let errors: Vec<&str> = result
+                        .stderr
+                        .lines()
+                        .filter(|l| l.starts_with("error"))
+                        .collect();
+                    if !errors.is_empty() {
+                        let msg = errors.join("\n");
+                        let mut cache = mutex.lock().unwrap();
+                        cache.build_error = Some(msg);
                     }
                 }
             }
@@ -139,48 +161,6 @@ impl ExpansionCache {
         });
 
         Self { inner }
-    }
-
-    /// Normalize tokens for comparison.
-    ///
-    /// - Removes spaces adjacent to punctuation (e.g., `a :: b` → `a::b`)
-    /// - Collapses remaining whitespace to single space
-    /// - Normalizes bracket types (`{}`, `[]` → `()`)
-    fn normalize_tokens(s: &str) -> String {
-        let chars: Vec<char> = s.chars().collect();
-        let mut result = String::with_capacity(chars.len());
-
-        fn is_punct(c: char) -> bool {
-            !c.is_alphanumeric() && c != '_' && c != '"' && c != '\'' && !c.is_whitespace()
-        }
-
-        let mut i = 0;
-        while i < chars.len() {
-            let c = chars[i];
-            if c.is_whitespace() {
-                // Look at prev (non-whitespace) and next (non-whitespace) to decide
-                let prev = result.chars().last();
-                // Skip all whitespace
-                while i < chars.len() && chars[i].is_whitespace() {
-                    i += 1;
-                }
-                let next = chars.get(i).copied();
-                // Drop space if adjacent to punctuation on either side
-                let prev_is_punct = prev.map_or(true, is_punct);
-                let next_is_punct = next.map_or(true, is_punct);
-                if !prev_is_punct && !next_is_punct {
-                    result.push(' ');
-                }
-            } else {
-                match c {
-                    '{' | '[' => result.push('('),
-                    '}' | ']' => result.push(')'),
-                    _ => result.push(c),
-                }
-                i += 1;
-            }
-        }
-        result
     }
 
     /// Convert MacroKind to MacroExpansionKind for comparison.
@@ -223,12 +203,13 @@ impl ExpansionCache {
                 || (exp.kind == MacroExpansionKind::Bang
                     && exp.expanding.trim_end().ends_with('!'))
         } else {
-            Self::normalize_tokens(&exp.input) == Self::normalize_tokens(input)
+            cargo_macra::normalize_tokens(&exp.input) == cargo_macra::normalize_tokens(input)
         };
         name_matches
             && exp.kind == Self::to_expansion_kind(kind)
             && input_matches
-            && Self::normalize_tokens(&exp.arguments) == Self::normalize_tokens(arguments)
+            && cargo_macra::normalize_tokens(&exp.arguments)
+                == cargo_macra::normalize_tokens(arguments)
     }
 
     /// Search cached expansions for a matching trace. Returns the index if found.
@@ -371,6 +352,13 @@ impl ExpansionCache {
         let (ref mutex, _) = *self.inner;
         let mut inner = mutex.lock().unwrap();
         inner.error.take()
+    }
+
+    /// Return the stored build error (if any).
+    fn build_error(&self) -> Option<String> {
+        let (ref mutex, _) = *self.inner;
+        let inner = mutex.lock().unwrap();
+        inner.build_error.clone()
     }
 }
 
@@ -834,6 +822,18 @@ impl App {
                     self.error_message = Some(format!(
                         "Expansion Stream Error\n\n{}\n\nPress Enter to dismiss.",
                         err
+                    ));
+                    return;
+                }
+
+                // Check if the build failed — that explains why the trace is missing.
+                if let Some(build_err) = self.expansion_cache.build_error() {
+                    self.error_message = Some(format!(
+                        "Build Error: cargo check failed, so '{}' was not expanded.\n\n\
+                         {}\n\n\
+                         Press Enter to dismiss.",
+                        name,
+                        build_err,
                     ));
                     return;
                 }
@@ -1384,28 +1384,12 @@ impl App {
     fn reload_trace(&mut self) {
         self.status = "Reloading trace data...".to_string();
 
-        // Touch source files to force recompilation (cargo skips unchanged crates)
-        if let Some(ref manifest_path) = self.trace_macros.args().manifest_path {
-            let manifest = PathBuf::from(manifest_path);
-            if let Some(dir) = manifest.parent() {
-                let src_dir = dir.join("src");
-                if src_dir.is_dir() {
-                    // Touch all .rs files in src/
-                    if let Ok(entries) = std::fs::read_dir(&src_dir) {
-                        for entry in entries.flatten() {
-                            let path = entry.path();
-                            if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-                                let _ = filetime::set_file_mtime(&path, filetime::FileTime::now());
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // Touch the target source file to force recompilation.
+        let _ = filetime::set_file_mtime(&self.file_path, filetime::FileTime::now());
 
         match self.trace_macros.run() {
-            Ok(iter) => {
-                self.expansion_cache = ExpansionCache::new(iter);
+            Ok(run) => {
+                self.expansion_cache = ExpansionCache::new(run.iter, run.check_result);
                 self.status = "Reloaded trace data.".to_string();
             }
             Err(e) => {
@@ -1718,44 +1702,9 @@ fn find_source_file(args: &Args) -> io::Result<PathBuf> {
     Ok(src_path)
 }
 
-/// Find the macra-hook shared library
-fn find_hook_lib() -> Option<PathBuf> {
-    let lib_name = if cfg!(target_os = "macos") {
-        "libmacra_hook.dylib"
-    } else if cfg!(target_os = "windows") {
-        "macra_hook.dll"
-    } else {
-        "libmacra_hook.so"
-    };
-
-    // Try to find in the same directory as cargo-macra
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let hook_lib = dir.join(lib_name);
-            if hook_lib.exists() {
-                return Some(hook_lib);
-            }
-        }
-    }
-
-    // Try common locations
-    let paths = [
-        PathBuf::from(format!("./target/debug/{}", lib_name)),
-        PathBuf::from(format!("./target/release/{}", lib_name)),
-    ];
-
-    for path in paths {
-        if path.exists() {
-            return Some(path);
-        }
-    }
-
-    None
-}
-
 fn build_trace_macros(args: &Args) -> TraceMacros {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let tm_args = macra::trace_macros::Args {
+    let tm_args = cargo_macra::trace_macros::Args {
         package: args.package.clone(),
         bin: args.bin.clone(),
         lib: args.lib,
@@ -1763,7 +1712,7 @@ fn build_trace_macros(args: &Args) -> TraceMacros {
         example: args.example.clone(),
         manifest_path: args.manifest_path.clone(),
         cargo_args: args.cargo_args.clone(),
-        hook_lib: find_hook_lib(),
+        hook_lib: cargo_macra::find_hook_lib(std::env::current_exe().ok().as_deref()).unwrap_or_default(),
     };
     TraceMacros::new(std::path::Path::new(&cargo), &tm_args)
 }
@@ -2226,17 +2175,24 @@ fn main() -> io::Result<()> {
     eprintln!("Loading source from {}", src_path.display());
     let source = std::fs::read_to_string(&src_path)?;
 
+    // Touch the source file to invalidate cargo's cache and force recompilation.
+    // This ensures the macra-hook (LD_PRELOAD) can intercept proc-macro loading,
+    // which is necessary because cargo caches stderr output and replays it on
+    // subsequent runs — if a previous compilation ran without the hook, the cached
+    // stderr won't contain proc-macro expansion data.
+    let _ = filetime::set_file_mtime(&src_path, filetime::FileTime::now());
+
     eprintln!("Running cargo with -Z trace-macros...");
     let tm = build_trace_macros(&args);
-    let iter = tm.run()?;
+    let run = tm.run()?;
 
     if args.show_expansion {
-        let expansions: Vec<_> = iter.collect::<io::Result<Vec<_>>>()?;
+        let expansions: Vec<_> = run.iter.collect::<io::Result<Vec<_>>>()?;
         print_expansions(&expansions);
         return Ok(());
     }
 
-    let cache = ExpansionCache::new(iter);
+    let cache = ExpansionCache::new(run.iter, run.check_result);
     run_app(source, src_path, module_path, cache, tm)
 }
 
@@ -2247,8 +2203,8 @@ fn main() -> io::Result<()> {
 ///   input tokens
 ///   ---
 ///   output tokens
-fn print_expansions(expansions: &[macra::parse_trace::MacroExpansion]) {
-    use macra::parse_trace::MacroExpansionKind;
+fn print_expansions(expansions: &[cargo_macra::parse_trace::MacroExpansion]) {
+    use cargo_macra::parse_trace::MacroExpansionKind;
 
     if expansions.is_empty() {
         println!("No macro expansions found.");

@@ -4,8 +4,9 @@
 //! We wrap this closure to intercept token stream operations and capture
 //! the string representations of proc macro inputs and outputs.
 //!
-//! Protocol format (nightly 1.95, single-byte method tags):
-//! - Method tag: u8 enum discriminant
+//! Protocol format (two-byte method tags, matching `with_api!` enum order):
+//! - Byte 0: `Method` enum variant (0=FreeFunctions, 1=TokenStream, 2=Span, 3=Symbol)
+//! - Byte 1: method index within the group
 //! - Handle: u32_le
 //! - String encoding: usize_le length + UTF-8 bytes
 
@@ -37,9 +38,13 @@ struct OriginalDispatch {
 // Safety: The dispatch closure is only used within a single thread during a proc macro invocation.
 unsafe impl Send for OriginalDispatch {}
 
-/// Bridge API method tags (from `with_api!` macro order in mod.rs)
-const TAG_TS_FROM_STR: u8 = 0x09;
-const TAG_TS_TO_STRING: u8 = 0x0A;
+/// Bridge API method group tag for TokenStream methods.
+const METHOD_TOKEN_STREAM: u8 = 0x01;
+
+/// TokenStream method indices (from `with_api!` enum order):
+/// drop=0, clone=1, is_empty=2, expand_expr=3, from_str=4, to_string=5, ...
+const TS_FROM_STR: u8 = 0x04;
+const TS_TO_STRING: u8 = 0x05;
 
 /// Read a usize in little-endian from a byte slice at the given offset.
 /// On 64-bit systems, usize is 8 bytes.
@@ -68,7 +73,8 @@ fn extract_string(data: &[u8], offset: usize) -> Option<String> {
 /// The wrapped dispatch function that intercepts bridge RPC calls
 unsafe extern "C" fn wrapped_dispatch(env: *mut u8, request: Buffer) -> Buffer {
     let request_data = request.as_slice().to_vec();
-    let tag = request_data.first().copied();
+    let method_group = request_data.first().copied();
+    let method_index = request_data.get(1).copied();
 
     // Forward to original dispatch
     let response = ORIGINAL_DISPATCH.with(|orig| {
@@ -77,16 +83,16 @@ unsafe extern "C" fn wrapped_dispatch(env: *mut u8, request: Buffer) -> Buffer {
         unsafe { (orig.call)(orig.env, request) }
     });
 
-    // POST-FORWARD: Check the method tag and capture strings
-    if let Some(tag) = tag {
-        if tag == TAG_TS_FROM_STR {
-            // ts_from_str: request = [0x09] [usize_le len] [UTF-8 string]
-            if let Some(s) = extract_string(&request_data, 1) {
+    // POST-FORWARD: Check the method tags and capture strings
+    if method_group == Some(METHOD_TOKEN_STREAM) {
+        if method_index == Some(TS_FROM_STR) {
+            // ts_from_str: request = [0x01] [0x04] [usize_le len] [UTF-8 string]
+            if let Some(s) = extract_string(&request_data, 2) {
                 CAPTURED.with(|c| {
                     c.borrow_mut().from_str_calls.push(s);
                 });
             }
-        } else if tag == TAG_TS_TO_STRING {
+        } else if method_index == Some(TS_TO_STRING) {
             // ts_to_string: response = [0x00 Ok] [usize_le len] [UTF-8 string]
             let response_data = response.as_slice();
             if response_data.first() == Some(&0x00) {
@@ -140,7 +146,7 @@ pub unsafe fn install_dispatch_interceptor<'a>(
 /// # Safety
 /// The dispatch closure's env pointer must still be valid.
 pub unsafe fn call_to_string_on_handle(handle: u32) -> Option<String> {
-    let mut request = vec![TAG_TS_TO_STRING];
+    let mut request = vec![METHOD_TOKEN_STREAM, TS_TO_STRING];
     request.extend_from_slice(&handle.to_le_bytes());
     let buf = Buffer::from_vec(request);
 

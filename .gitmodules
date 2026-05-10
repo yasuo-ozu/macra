@@ -1,0 +1,24 @@
+[submodule "tests/external_crates/coinduction"]
+	path = tests/external_crates/coinduction
+	url = https://github.com/yasuo-ozu/coinduction
+[submodule "tests/external_crates/decycle"]
+	path = tests/external_crates/decycle
+	url = https://github.com/yasuo-ozu/decycle
+[submodule "tests/external_crates/addr_of_enum"]
+	path = tests/external_crates/addr_of_enum
+	url = https://github.com/yasuo-ozu/addr_of_enum
+[submodule "tests/external_crates/discriminant"]
+	path = tests/external_crates/discriminant
+	url = https://github.com/yasuo-ozu/discriminant
+[submodule "tests/external_crates/flat_enum"]
+	path = tests/external_crates/flat_enum
+	url = https://github.com/yasuo-ozu/flat_enum
+[submodule "tests/external_crates/newer-type"]
+	path = tests/external_crates/newer-type
+	url = https://github.com/yasuo-ozu/newer-type
+[submodule "tests/external_crates/parametrized"]
+	path = tests/external_crates/parametrized
+	url = https://github.com/yasuo-ozu/parametrized
+[submodule "tests/external_crates/sumtype"]
+	path = tests/external_crates/sumtype
+	url = https://github.com/yasuo-ozu/sumtype
