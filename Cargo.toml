@@ -2,6 +2,7 @@
 name = "cargo-macra"
 version = "0.1.3"
 edition = "2024"
+rust-version = "1.85"
 description = "CLI for working with macro expansion and diagnostics in Rust projects."
 keywords = ["cargo", "macros", "rust", "tooling"]
 categories = ["command-line-utilities", "development-tools"]

@@ -2,6 +2,7 @@
 name = "macra"
 version = "0.1.3"
 edition = "2024"
+rust-version = "1.85"
 description = "Core library for macro-related analysis and serialization used by cargo-macra."
 keywords = ["macros", "analysis", "rust", "tooling"]
 categories = ["development-tools"]

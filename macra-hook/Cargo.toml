@@ -2,6 +2,7 @@
 name = "macra-hook"
 version = "0.1.3"
 edition = "2024"
+rust-version = "1.85"
 description = "Dynamic hook library for macra runtime integrations."
 keywords = ["macros", "ffi", "rust", "tooling"]
 categories = ["development-tools"]

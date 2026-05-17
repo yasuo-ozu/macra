@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  test:
+    name: Test (rustc ${{ matrix.rust }})
+    continue-on-error: ${{ matrix.experimental }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rust: 1.85.0
+            experimental: false
+          - rust: 1.86.0
+            experimental: false
+          - rust: 1.87.0
+            experimental: false
+          - rust: 1.88.0
+            experimental: false
+          - rust: 1.89.0
+            experimental: false
+          - rust: 1.90.0
+            experimental: false
+          - rust: 1.91.0
+            experimental: false
+          - rust: nightly
+            experimental: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust ${{ matrix.rust }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --workspace --all-targets

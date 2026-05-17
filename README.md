@@ -4,8 +4,8 @@
 [crates.io]: https://crates.io/crates/cargo-macra
 [Documentation]: https://img.shields.io/docsrs/cargo-macra
 [docs.rs]: https://docs.rs/cargo-macra/latest/cargo_macra/
-[GitHub Actions]: https://github.com/yasuo-ozu/macra/actions/workflows/rust.yml/badge.svg
-[actions]: https://github.com/yasuo-ozu/macra/actions/workflows/rust.yml
+[GitHub Actions]: https://github.com/yasuo-ozu/macra/actions/workflows/ci.yml/badge.svg
+[actions]: https://github.com/yasuo-ozu/macra/actions/workflows/ci.yml
 
 Interactive Rust macro expansion viewer with a terminal UI.
 
