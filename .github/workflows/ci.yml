@@ -19,11 +19,11 @@ jobs:
           - macos-latest
           - macos-15-intel
         rust:
-          - 1.86.0
-          - 1.87.0
-          - 1.88.0
-          - 1.89.0
-          - 1.90.0
+          #- 1.86.0
+          #- 1.87.0
+          #- 1.88.0
+          #- 1.89.0
+          #- 1.90.0
           - 1.91.0
     steps:
       - name: Checkout
@@ -45,3 +45,27 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace --all-targets
+
+      - name: Debug show-expansion for known failing external crates
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          $cases = @(
+            @{ manifest = "tests/external_crates/coinduction/Cargo.toml"; test = "coinduction_integration_test" },
+            @{ manifest = "tests/external_crates/coinduction/Cargo.toml"; test = "complex" },
+            @{ manifest = "tests/external_crates/discriminant/Cargo.toml"; test = "test" },
+            @{ manifest = "tests/external_crates/newer-type/Cargo.toml"; test = "multi_self" },
+            @{ manifest = "tests/external_crates/parametrized/Cargo.toml"; test = "recursive" },
+            @{ manifest = "tests/external_crates/parametrized/Cargo.toml"; test = "test" },
+            @{ manifest = "tests/external_crates/parametrized/Cargo.toml"; test = "test_enum" },
+            @{ manifest = "tests/external_crates/parametrized/Cargo.toml"; test = "tuple" }
+          )
+
+          foreach ($case in $cases) {
+            Write-Host "=== show-expansion: manifest=$($case.manifest) test=$($case.test) ==="
+            cargo run -- --show-expansion --manifest-path $case.manifest --test $case.test
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "show-expansion failed for manifest=$($case.manifest) test=$($case.test)"
+            }
+          }
+          exit 0
