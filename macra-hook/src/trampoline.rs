@@ -57,9 +57,9 @@ fn extract_input_handles(input_buf: &[u8], kind: &str) -> Vec<u32> {
 /// The core trampoline implementation called by each generated trampoline function.
 ///
 /// 1. Wraps the dispatch closure with our interceptor
-/// 2. Calls to_string on input TokenStream handles to capture input
+/// 2. Calls to_string on input TokenStream handles to capture input (before run)
 /// 3. Calls the original `run` function with the modified config
-/// 4. Captures from_str calls as output
+/// 4. Extracts output handle from result and calls to_string (after run, still in session)
 fn trampoline_impl(idx: usize, config: BridgeConfig<'_>) -> Buffer {
     let (original_run, name, kind) = {
         let slots = SLOTS.lock().unwrap();
@@ -78,13 +78,19 @@ fn trampoline_impl(idx: usize, config: BridgeConfig<'_>) -> Buffer {
     // Install our dispatch interceptor
     let wrapped_dispatch = unsafe { dispatch::install_dispatch_interceptor(&config.dispatch) };
 
-    // Call to_string on input handles to capture input text
+    // Call to_string on input handles BEFORE run() to capture the input.
+    // This must happen before run() because the proc macro may consume or
+    // modify the input tokens during execution.
     let mut input_strings = Vec::new();
     for &handle in &input_handles {
         if let Some(s) = unsafe { dispatch::call_to_string_on_handle(handle) } {
             input_strings.push(s);
         }
     }
+
+    // Clear any to_string results captured from our own input calls above,
+    // so they don't pollute the captured output.
+    let _ = dispatch::take_captured();
 
     // Create a new BridgeConfig with the wrapped dispatch
     let wrapped_config = BridgeConfig {
@@ -97,21 +103,19 @@ fn trampoline_impl(idx: usize, config: BridgeConfig<'_>) -> Buffer {
     // Call the original run function
     let result = (original_run)(wrapped_config);
 
-    // Capture the intercepted strings (from_str calls = fallback output)
+    // Capture the intercepted strings from the macro execution
     let captured = dispatch::take_captured();
 
     // Try to extract the output handle from the result buffer and call to_string.
     // Result encoding: Result<Option<TokenStream>, PanicMessage>
     //   [0x00 Ok | 0x01 Err] [0x00 Some | 0x01 None] [u32_le handle if Some]
-    // Option uses enum order: Some=0x00, None=0x01
-    // The dispatch is still valid here because our trampoline hasn't returned
-    // to the server yet (the server's stack frame with the dispatch closure is alive).
+    // The dispatch is still valid here because our trampoline (the bridge client)
+    // hasn't returned yet — the server-side dispatch loop is still alive.
     let output = {
         let result_data = result.as_slice();
         let output_from_handle = if result_data.len() >= 6
             && result_data[0] == 0x00  // Result::Ok
-            && result_data[1] == 0x00
-        // Option::Some
+            && result_data[1] == 0x00  // Option::Some
         {
             let handle = u32::from_le_bytes(result_data[2..6].try_into().unwrap());
             unsafe { dispatch::call_to_string_on_handle(handle) }

@@ -47,6 +47,27 @@ impl<R: Read> TraceParser<R> {
         }
     }
 
+    fn strip_ansi_escape_sequences(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\u{1b}' {
+                // Skip CSI sequences: ESC [ ... final-byte
+                if chars.peek() == Some(&'[') {
+                    let _ = chars.next();
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+            out.push(ch);
+        }
+        out
+    }
+
     fn read_line(&mut self) -> Option<String> {
         if let Some(line) = self.peeked_line.take() {
             return Some(line);
@@ -54,7 +75,10 @@ impl<R: Read> TraceParser<R> {
         self.current_line.clear();
         match self.reader.read_line(&mut self.current_line) {
             Ok(0) => None,
-            Ok(_) => Some(self.current_line.trim_end_matches('\n').to_string()),
+            Ok(_) => {
+                let line = self.current_line.trim_end_matches('\n');
+                Some(Self::strip_ansi_escape_sequences(line))
+            }
             Err(_) => None,
         }
     }

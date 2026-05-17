@@ -11,8 +11,8 @@ use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use macra::parse_trace::{MacroExpansion, MacroExpansionKind};
-use macra::trace_macros::{MacroExpansionIter, TraceMacros};
+use cargo_macra::parse_trace::{MacroExpansion, MacroExpansionKind};
+use cargo_macra::trace_macros::{MacroExpansionIter, TraceMacros};
 use macro_finder::{MacroCall, MacroKind, find_macros, is_builtin_attribute};
 use ratatui::{
     prelude::*,
@@ -1388,8 +1388,8 @@ impl App {
         let _ = filetime::set_file_mtime(&self.file_path, filetime::FileTime::now());
 
         match self.trace_macros.run() {
-            Ok(iter) => {
-                self.expansion_cache = ExpansionCache::new(iter);
+            Ok(run) => {
+                self.expansion_cache = ExpansionCache::new(run.iter);
                 self.status = "Reloaded trace data.".to_string();
             }
             Err(e) => {
@@ -1702,44 +1702,9 @@ fn find_source_file(args: &Args) -> io::Result<PathBuf> {
     Ok(src_path)
 }
 
-/// Find the macra-hook shared library
-fn find_hook_lib() -> Option<PathBuf> {
-    let lib_name = if cfg!(target_os = "macos") {
-        "libmacra_hook.dylib"
-    } else if cfg!(target_os = "windows") {
-        "macra_hook.dll"
-    } else {
-        "libmacra_hook.so"
-    };
-
-    // Try to find in the same directory as cargo-macra
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let hook_lib = dir.join(lib_name);
-            if hook_lib.exists() {
-                return Some(hook_lib);
-            }
-        }
-    }
-
-    // Try common locations
-    let paths = [
-        PathBuf::from(format!("./target/debug/{}", lib_name)),
-        PathBuf::from(format!("./target/release/{}", lib_name)),
-    ];
-
-    for path in paths {
-        if path.exists() {
-            return Some(path);
-        }
-    }
-
-    None
-}
-
 fn build_trace_macros(args: &Args) -> TraceMacros {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let tm_args = macra::trace_macros::Args {
+    let tm_args = cargo_macra::trace_macros::Args {
         package: args.package.clone(),
         bin: args.bin.clone(),
         lib: args.lib,
@@ -1747,7 +1712,7 @@ fn build_trace_macros(args: &Args) -> TraceMacros {
         example: args.example.clone(),
         manifest_path: args.manifest_path.clone(),
         cargo_args: args.cargo_args.clone(),
-        hook_lib: find_hook_lib(),
+        hook_lib: cargo_macra::find_hook_lib(std::env::current_exe().ok().as_deref()).unwrap_or_default(),
     };
     TraceMacros::new(std::path::Path::new(&cargo), &tm_args)
 }
@@ -2219,15 +2184,15 @@ fn main() -> io::Result<()> {
 
     eprintln!("Running cargo with -Z trace-macros...");
     let tm = build_trace_macros(&args);
-    let iter = tm.run()?;
+    let run = tm.run()?;
 
     if args.show_expansion {
-        let expansions: Vec<_> = iter.collect::<io::Result<Vec<_>>>()?;
+        let expansions: Vec<_> = run.iter.collect::<io::Result<Vec<_>>>()?;
         print_expansions(&expansions);
         return Ok(());
     }
 
-    let cache = ExpansionCache::new(iter);
+    let cache = ExpansionCache::new(run.iter);
     run_app(source, src_path, module_path, cache, tm)
 }
 
@@ -2238,8 +2203,8 @@ fn main() -> io::Result<()> {
 ///   input tokens
 ///   ---
 ///   output tokens
-fn print_expansions(expansions: &[macra::parse_trace::MacroExpansion]) {
-    use macra::parse_trace::MacroExpansionKind;
+fn print_expansions(expansions: &[cargo_macra::parse_trace::MacroExpansion]) {
+    use cargo_macra::parse_trace::MacroExpansionKind;
 
     if expansions.is_empty() {
         println!("No macro expansions found.");

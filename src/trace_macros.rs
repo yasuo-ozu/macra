@@ -1,5 +1,6 @@
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -17,8 +18,8 @@ pub struct Args {
     pub manifest_path: Option<String>,
     pub cargo_args: Vec<String>,
     /// Path to the macra-hook shared library (e.g. `libmacra_hook.so`).
-    /// When set, the library is injected via `LD_PRELOAD` / `DYLD_INSERT_LIBRARIES`.
-    pub hook_lib: Option<PathBuf>,
+    /// When non-empty, the library is injected via `LD_PRELOAD` / `DYLD_INSERT_LIBRARIES`.
+    pub hook_lib: PathBuf,
 }
 
 /// Spawns `cargo check` with `-Z trace-macros` (and optionally the macra-hook)
@@ -32,6 +33,13 @@ pub struct TraceMacros {
 /// process.
 pub struct MacroExpansionIter {
     rx: mpsc::Receiver<io::Result<MacroExpansion>>,
+}
+
+/// Result of spawning trace-macros collection.
+pub struct TraceRun {
+    pub iter: MacroExpansionIter,
+    /// Receives cargo check success (`true`) / failure (`false`) once the child exits.
+    pub check_success: mpsc::Receiver<io::Result<bool>>,
 }
 
 impl MacroExpansionIter {
@@ -116,7 +124,7 @@ impl TraceMacros {
     /// Hook-based expansions (proc-macros captured via `LD_PRELOAD`) are emitted
     /// immediately as the child process writes them.  Trace-macros expansions
     /// (from rustc's `-Z trace-macros`) are emitted after the child exits.
-    pub fn run(&self) -> io::Result<MacroExpansionIter> {
+    pub fn run(&self) -> io::Result<TraceRun> {
         let mut cmd = Command::new(&self.cargo_path);
         cmd.arg("check");
         cmd.env("RUSTC_BOOTSTRAP", "1");
@@ -153,8 +161,12 @@ impl TraceMacros {
         cmd.env("RUSTFLAGS", rustflags);
 
         // Set up macra-hook via LD_PRELOAD if available
-        if let Some(ref lib) = self.args.hook_lib {
-            let lib = lib.canonicalize().unwrap_or_else(|_| lib.clone());
+        if !self.args.hook_lib.as_os_str().is_empty() {
+            let lib = self
+                .args
+                .hook_lib
+                .canonicalize()
+                .unwrap_or_else(|_| self.args.hook_lib.clone());
             if cfg!(target_os = "macos") {
                 cmd.env("DYLD_INSERT_LIBRARIES", &lib);
             } else {
@@ -175,18 +187,24 @@ impl TraceMacros {
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "failed to capture stderr"))?;
 
         let (tx, rx) = mpsc::channel();
+        let (status_tx, status_rx) = mpsc::channel();
 
-        // Drain stdout in a background thread to prevent the child from blocking
+        // Drain stdout in a background thread to prevent the child from blocking.
+        // Keep a copy because some cargo/rustc setups emit diagnostics on stdout.
         let stdout_thread = thread::spawn(move || {
             use std::io::Read;
             let mut stdout = stdout;
+            let mut collected = String::new();
             let mut buf = [0u8; 4096];
             loop {
                 match stdout.read(&mut buf) {
                     Ok(0) | Err(_) => break,
-                    Ok(_) => {}
+                    Ok(n) => {
+                        collected.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    }
                 }
             }
+            collected
         });
 
         // Read stderr: handle hook lines immediately, collect the rest for
@@ -215,20 +233,37 @@ impl TraceMacros {
             }
 
             // Wait for stdout draining and child process to finish
-            let _ = stdout_thread.join();
-            let _ = child.wait();
+            let stdout_buf = stdout_thread.join().unwrap_or_default();
+            let wait_result: io::Result<ExitStatus> = child.wait();
 
-            // Parse plain-text trace-macros output from stderr
+            // Parse plain-text trace-macros output from stderr and stdout.
             for group in parse_trace(stderr_buf.as_bytes()) {
                 for expansion in group.expansions {
                     let _ = tx.send(Ok(expansion));
+                }
+            }
+            for group in parse_trace(stdout_buf.as_bytes()) {
+                for expansion in group.expansions {
+                    let _ = tx.send(Ok(expansion));
+                }
+            }
+
+            match wait_result {
+                Ok(status) => {
+                    let _ = status_tx.send(Ok(status.success()));
+                }
+                Err(e) => {
+                    let _ = status_tx.send(Err(e));
                 }
             }
 
             // tx drops here, closing the channel
         });
 
-        Ok(MacroExpansionIter { rx })
+        Ok(TraceRun {
+            iter: MacroExpansionIter { rx },
+            check_success: status_rx,
+        })
     }
 }
 
