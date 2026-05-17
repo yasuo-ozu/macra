@@ -8,33 +8,28 @@ on:
 
 jobs:
   test:
-    name: Test (rustc ${{ matrix.rust }})
-    continue-on-error: ${{ matrix.experimental }}
-    runs-on: ubuntu-latest
+    name: Test ( ${{ matrix.os }} ${{ matrix.rust }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - rust: 1.85.0
-            experimental: false
-          - rust: 1.86.0
-            experimental: false
-          - rust: 1.87.0
-            experimental: false
-          - rust: 1.88.0
-            experimental: false
-          - rust: 1.89.0
-            experimental: false
-          - rust: 1.90.0
-            experimental: false
-          - rust: 1.91.0
-            experimental: false
-          - rust: nightly
-            experimental: true
-
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+          - macos-15-intel
+        rust:
+          - 1.86.0
+          - 1.87.0
+          - 1.88.0
+          - 1.89.0
+          - 1.90.0
+          - 1.91.0
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+        with:
+          submodules: true
 
       - name: Install Rust ${{ matrix.rust }}
         uses: dtolnay/rust-toolchain@master
@@ -43,6 +38,10 @@ jobs:
 
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
+
+      - name: remove Cargo.lock
+        shell: bash
+        run: rm -f Cargo.lock
 
       - name: Run tests
         run: cargo test --workspace --all-targets
