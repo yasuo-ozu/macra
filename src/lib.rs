@@ -26,29 +26,36 @@ fn ensure_hook_lib() -> Option<PathBuf> {
     } else {
         "libmacra_hook.so"
     };
+    let arch = std::env::consts::ARCH;
 
     let version = env!("CARGO_PKG_VERSION");
     let file_name = if cfg!(target_os = "windows") {
-        format!("macra_hook-{}.dll", version)
+        format!("macra_hook-{}-{}.dll", version, arch)
     } else if cfg!(target_os = "macos") {
-        format!("libmacra_hook-{}.dylib", version)
+        format!("libmacra_hook-{}-{}.dylib", version, arch)
     } else {
-        format!("libmacra_hook-{}.so", version)
+        format!("libmacra_hook-{}-{}.so", version, arch)
     };
 
     let cache_dir = dirs_cache()?;
     let dest = cache_dir.join(&file_name);
-
-    // Also place a copy with the plain lib name so callers can find it
-    let dest_plain = cache_dir.join(lib_name);
+    let dest_plain = if cfg!(target_os = "windows") {
+        cache_dir.join(format!("macra_hook-{}.dll", arch))
+    } else if cfg!(target_os = "macos") {
+        cache_dir.join(format!("libmacra_hook-{}.dylib", arch))
+    } else {
+        cache_dir.join(format!("libmacra_hook-{}.so", arch))
+    };
 
     // If cached file exists with the right size, reuse it
     if let Ok(meta) = std::fs::metadata(&dest) {
         if meta.len() == HOOK_LIB_BYTES.len() as u64 {
-            // Ensure the plain-name symlink/copy exists too
+            // Ensure the arch-specific alias copy exists too.
             if !dest_plain.exists() {
                 let _ = std::fs::copy(&dest, &dest_plain);
             }
+            // Keep backward compatibility with the legacy plain file name.
+            let _ = std::fs::copy(&dest, cache_dir.join(lib_name));
             return Some(dest_plain);
         }
     }
@@ -61,6 +68,7 @@ fn ensure_hook_lib() -> Option<PathBuf> {
         return None;
     }
     let _ = std::fs::copy(&dest, &dest_plain);
+    let _ = std::fs::copy(&dest, cache_dir.join(lib_name));
 
     Some(dest_plain)
 }
@@ -91,6 +99,14 @@ pub fn find_hook_lib(current_exe: Option<&Path>) -> Option<PathBuf> {
     } else {
         "libmacra_hook.so"
     };
+    let arch = std::env::consts::ARCH;
+    let arch_name = if cfg!(target_os = "windows") {
+        format!("macra_hook-{}.dll", arch)
+    } else if cfg!(target_os = "macos") {
+        format!("libmacra_hook-{}.dylib", arch)
+    } else {
+        format!("libmacra_hook-{}.so", arch)
+    };
 
     if let Some(exe) = current_exe {
         if let Some(dir) = exe.parent() {
@@ -102,6 +118,8 @@ pub fn find_hook_lib(current_exe: Option<&Path>) -> Option<PathBuf> {
     }
 
     let paths = [
+        PathBuf::from(format!("./target/debug/{}", arch_name)),
+        PathBuf::from(format!("./target/release/{}", arch_name)),
         PathBuf::from(format!("./target/debug/{}", lib_name)),
         PathBuf::from(format!("./target/release/{}", lib_name)),
     ];
