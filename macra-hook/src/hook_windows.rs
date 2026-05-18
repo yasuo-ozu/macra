@@ -1,9 +1,12 @@
 //! Windows hook via DLL injection + IAT patching.
 //!
 //! When this DLL is loaded into a rustc process (via DllMain), it patches
-//! the Import Address Table (IAT) to redirect `GetProcAddress` calls through
-//! our hook. The hook checks for `__rustc_proc_macro_decls_*` symbols and
-//! wraps them via `trampoline::intercept_proc_macro_table()`.
+//! the Import Address Table (IAT) to redirect `GetProcAddress`, `LoadLibraryW`,
+//! and `LoadLibraryExW` calls through our hooks. The GetProcAddress hook checks
+//! for `__rustc_proc_macro_decls_*` symbols and wraps them via
+//! `trampoline::intercept_proc_macro_table()`. The LoadLibrary hooks ensure that
+//! dynamically loaded modules (e.g. `librustc_driver-*.dll`) also get their IATs
+//! patched.
 
 use crate::trampoline;
 use std::ffi::CStr;
@@ -33,10 +36,24 @@ const IMPORT_DESC_SIZE: usize = 20;
 /// Saved pointer to the real `GetProcAddress`.
 static REAL_GET_PROC_ADDRESS: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 
+/// Saved pointer to the real `LoadLibraryW`.
+static REAL_LOAD_LIBRARY_W: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
+
+/// Saved pointer to the real `LoadLibraryExW`.
+static REAL_LOAD_LIBRARY_EX_W: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
+
 type GetProcAddressFn = unsafe extern "system" fn(
     windows_sys::Win32::Foundation::HMODULE,
     *const u8,
 ) -> Option<unsafe extern "system" fn()>;
+
+type LoadLibraryWFn = unsafe extern "system" fn(*const u16) -> windows_sys::Win32::Foundation::HMODULE;
+
+type LoadLibraryExWFn = unsafe extern "system" fn(
+    *const u16,
+    windows_sys::Win32::Foundation::HANDLE,
+    u32,
+) -> windows_sys::Win32::Foundation::HMODULE;
 
 /// Read a u16 from a pointer offset (unaligned-safe).
 unsafe fn read_u16(base: *const u8, offset: usize) -> u16 {
@@ -71,15 +88,30 @@ pub(crate) fn install_hook() {
             Some(f) => f,
             None => return,
         };
-
         REAL_GET_PROC_ADDRESS.store(real_gpa as *mut (), Ordering::Release);
 
-        patch_all_modules(real_gpa as usize);
+        let real_llw = windows_sys::Win32::System::LibraryLoader::GetProcAddress(
+            kernel32,
+            b"LoadLibraryW\0".as_ptr(),
+        );
+        if let Some(f) = real_llw {
+            REAL_LOAD_LIBRARY_W.store(f as *mut (), Ordering::Release);
+        }
+
+        let real_llew = windows_sys::Win32::System::LibraryLoader::GetProcAddress(
+            kernel32,
+            b"LoadLibraryExW\0".as_ptr(),
+        );
+        if let Some(f) = real_llew {
+            REAL_LOAD_LIBRARY_EX_W.store(f as *mut (), Ordering::Release);
+        }
+
+        patch_all_modules();
     }
 }
 
 /// Enumerate loaded modules and patch IAT in each.
-unsafe fn patch_all_modules(real_gpa_addr: usize) {
+unsafe fn patch_all_modules() {
     let snapshot = unsafe {
         windows_sys::Win32::System::Diagnostics::ToolHelp::CreateToolhelp32Snapshot(
             windows_sys::Win32::System::Diagnostics::ToolHelp::TH32CS_SNAPMODULE,
@@ -92,7 +124,7 @@ unsafe fn patch_all_modules(real_gpa_addr: usize) {
             windows_sys::Win32::System::LibraryLoader::GetModuleHandleA(std::ptr::null())
         };
         if !main_module.is_null() {
-            unsafe { patch_module_iat(main_module as *const u8, real_gpa_addr) };
+            unsafe { patch_module_iat(main_module as *const u8) };
         }
         return;
     }
@@ -110,7 +142,7 @@ unsafe fn patch_all_modules(real_gpa_addr: usize) {
     while ok != 0 {
         let base = entry.modBaseAddr;
         if !base.is_null() {
-            unsafe { patch_module_iat(base, real_gpa_addr) };
+            unsafe { patch_module_iat(base) };
         }
         ok = unsafe {
             windows_sys::Win32::System::Diagnostics::ToolHelp::Module32NextW(snapshot, &mut entry)
@@ -122,10 +154,11 @@ unsafe fn patch_all_modules(real_gpa_addr: usize) {
     }
 }
 
-/// Patch a single module's IAT to redirect GetProcAddress to our hook.
+/// Patch a single module's IAT to redirect GetProcAddress, LoadLibraryW,
+/// and LoadLibraryExW to our hooks.
 ///
 /// Uses raw offset-based PE parsing to avoid struct layout bugs.
-unsafe fn patch_module_iat(base: *const u8, real_gpa_addr: usize) {
+unsafe fn patch_module_iat(base: *const u8) {
     // Validate DOS header
     if unsafe { read_u16(base, 0) } != IMAGE_DOS_SIGNATURE {
         return;
@@ -167,6 +200,11 @@ unsafe fn patch_module_iat(base: *const u8, real_gpa_addr: usize) {
         return;
     }
 
+    // Load real function addresses from atomics
+    let real_gpa_addr = REAL_GET_PROC_ADDRESS.load(Ordering::Acquire) as usize;
+    let real_llw_addr = REAL_LOAD_LIBRARY_W.load(Ordering::Acquire) as usize;
+    let real_llew_addr = REAL_LOAD_LIBRARY_EX_W.load(Ordering::Acquire) as usize;
+
     // Walk import descriptors
     let mut desc_ptr = unsafe { base.add(import_rva) };
 
@@ -193,6 +231,8 @@ unsafe fn patch_module_iat(base: *const u8, real_gpa_addr: usize) {
                             original_first_thunk,
                             first_thunk,
                             real_gpa_addr,
+                            real_llw_addr,
+                            real_llew_addr,
                         );
                     }
                 }
@@ -203,12 +243,15 @@ unsafe fn patch_module_iat(base: *const u8, real_gpa_addr: usize) {
     }
 }
 
-/// Patch GetProcAddress thunks in a single import descriptor.
+/// Patch import thunks in a single import descriptor for GetProcAddress,
+/// LoadLibraryW, and LoadLibraryExW.
 unsafe fn patch_import_thunks(
     base: *const u8,
     original_first_thunk_rva: usize,
     first_thunk_rva: usize,
     real_gpa_addr: usize,
+    real_llw_addr: usize,
+    real_llew_addr: usize,
 ) {
     // Use OriginalFirstThunk (INT) for name lookup, FirstThunk (IAT) for patching.
     let int_rva = if original_first_thunk_rva != 0 {
@@ -234,31 +277,46 @@ unsafe fn patch_import_thunks(
             // The name starts at offset 2 (after the Hint u16)
             let name_ptr = unsafe { base.add(thunk_data + 2) } as *const i8;
             if let Ok(name) = unsafe { CStr::from_ptr(name_ptr) }.to_str() {
-                if name == "GetProcAddress" {
-                    let current = unsafe { *iat_entry };
-                    if current == real_gpa_addr {
-                        let mut old_protect: u32 = 0;
-                        let ok = unsafe {
+                let (real_addr, hook_addr) = match name {
+                    "GetProcAddress" => {
+                        (real_gpa_addr, hooked_get_proc_address as usize)
+                    }
+                    "LoadLibraryW" if real_llw_addr != 0 => {
+                        (real_llw_addr, hooked_load_library_w as usize)
+                    }
+                    "LoadLibraryExW" if real_llew_addr != 0 => {
+                        (real_llew_addr, hooked_load_library_ex_w as usize)
+                    }
+                    _ => {
+                        int_entry = unsafe { int_entry.add(1) };
+                        iat_entry = unsafe { iat_entry.add(1) };
+                        continue;
+                    }
+                };
+
+                let current = unsafe { *iat_entry };
+                if current == real_addr {
+                    let mut old_protect: u32 = 0;
+                    let ok = unsafe {
+                        windows_sys::Win32::System::Memory::VirtualProtect(
+                            iat_entry as *const _,
+                            std::mem::size_of::<usize>(),
+                            windows_sys::Win32::System::Memory::PAGE_READWRITE,
+                            &mut old_protect,
+                        )
+                    };
+                    if ok != 0 {
+                        unsafe {
+                            *iat_entry = hook_addr;
+                        }
+                        let mut dummy: u32 = 0;
+                        unsafe {
                             windows_sys::Win32::System::Memory::VirtualProtect(
                                 iat_entry as *const _,
                                 std::mem::size_of::<usize>(),
-                                windows_sys::Win32::System::Memory::PAGE_READWRITE,
-                                &mut old_protect,
-                            )
-                        };
-                        if ok != 0 {
-                            unsafe {
-                                *iat_entry = hooked_get_proc_address as usize;
-                            }
-                            let mut dummy: u32 = 0;
-                            unsafe {
-                                windows_sys::Win32::System::Memory::VirtualProtect(
-                                    iat_entry as *const _,
-                                    std::mem::size_of::<usize>(),
-                                    old_protect,
-                                    &mut dummy,
-                                );
-                            }
+                                old_protect,
+                                &mut dummy,
+                            );
                         }
                     }
                 }
@@ -268,6 +326,36 @@ unsafe fn patch_import_thunks(
         int_entry = unsafe { int_entry.add(1) };
         iat_entry = unsafe { iat_entry.add(1) };
     }
+}
+
+/// Our hooked LoadLibraryW. Calls the real LoadLibraryW, then patches
+/// the newly loaded module's IAT so that it also uses our hooks.
+unsafe extern "system" fn hooked_load_library_w(
+    lp_lib_file_name: *const u16,
+) -> windows_sys::Win32::Foundation::HMODULE {
+    let real_fn_ptr = REAL_LOAD_LIBRARY_W.load(Ordering::Acquire);
+    let real: LoadLibraryWFn = unsafe { std::mem::transmute(real_fn_ptr) };
+    let result = unsafe { real(lp_lib_file_name) };
+    if !result.is_null() {
+        unsafe { patch_module_iat(result as *const u8) };
+    }
+    result
+}
+
+/// Our hooked LoadLibraryExW. Calls the real LoadLibraryExW, then patches
+/// the newly loaded module's IAT so that it also uses our hooks.
+unsafe extern "system" fn hooked_load_library_ex_w(
+    lp_lib_file_name: *const u16,
+    h_file: windows_sys::Win32::Foundation::HANDLE,
+    dw_flags: u32,
+) -> windows_sys::Win32::Foundation::HMODULE {
+    let real_fn_ptr = REAL_LOAD_LIBRARY_EX_W.load(Ordering::Acquire);
+    let real: LoadLibraryExWFn = unsafe { std::mem::transmute(real_fn_ptr) };
+    let result = unsafe { real(lp_lib_file_name, h_file, dw_flags) };
+    if !result.is_null() {
+        unsafe { patch_module_iat(result as *const u8) };
+    }
+    result
 }
 
 /// Our hooked GetProcAddress. Calls the real GetProcAddress, then checks

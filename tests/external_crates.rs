@@ -56,6 +56,104 @@ fn equals_normalized(actual: &str, expected: &str) -> bool {
     cargo_macra::normalize_tokens(actual) == cargo_macra::normalize_tokens(expected)
 }
 
+enum NameMatch<'a> {
+    Exact(&'a str),
+    Prefix(&'a str),
+}
+
+/// Assertion helper with diagnostic output for easier CI debugging.
+fn assert_expansion(
+    expansions: &[MacroExpansion],
+    kind: MacroExpansionKind,
+    name: NameMatch<'_>,
+    expected_input: &str,
+    expected_output_prefix: &str,
+) {
+    let name_matches = |n: &str| -> bool {
+        match &name {
+            NameMatch::Exact(s) => n == *s,
+            NameMatch::Prefix(s) => n.starts_with(*s),
+        }
+    };
+
+    let name_display = match &name {
+        NameMatch::Exact(s) => format!("name={s}"),
+        NameMatch::Prefix(s) => format!("prefix={s}"),
+    };
+
+    // Find expansions matching kind + name + input
+    let candidates: Vec<_> = expansions
+        .iter()
+        .filter(|e| e.kind == kind && name_matches(&e.name))
+        .collect();
+
+    if candidates.is_empty() {
+        let all_names: Vec<_> = expansions
+            .iter()
+            .map(|e| format!("{:?}:{}", e.kind, e.name))
+            .collect();
+        panic!(
+            "assert_expansion: no expansions found for kind={kind:?} {name_display}\n\
+             Available expansions ({}):\n  {}",
+            all_names.len(),
+            all_names.join("\n  ")
+        );
+    }
+
+    let input_matches: Vec<_> = candidates
+        .iter()
+        .filter(|e| equals_normalized(&e.input, expected_input))
+        .collect();
+
+    if input_matches.is_empty() {
+        let candidate_inputs: Vec<_> = candidates
+            .iter()
+            .map(|e| {
+                format!(
+                    "  name={}\n    input(normalized)={}",
+                    e.name,
+                    cargo_macra::normalize_tokens(&e.input)
+                )
+            })
+            .collect();
+        panic!(
+            "assert_expansion: found {} expansion(s) for kind={kind:?} {name_display}, \
+             but none match expected input.\n\
+             Expected input (normalized): {}\n\
+             Candidates:\n{}",
+            candidates.len(),
+            cargo_macra::normalize_tokens(expected_input),
+            candidate_inputs.join("\n")
+        );
+    }
+
+    for e in &input_matches {
+        if starts_with_normalized(&e.to, expected_output_prefix) {
+            return; // Success
+        }
+    }
+
+    // All matched kind+name+input but output didn't match
+    let actual_outputs: Vec<_> = input_matches
+        .iter()
+        .map(|e| {
+            format!(
+                "  name={}\n    output(normalized)={}",
+                e.name,
+                cargo_macra::normalize_tokens(&e.to)
+            )
+        })
+        .collect();
+    panic!(
+        "assert_expansion: found expansion(s) matching kind={kind:?} {name_display} + input, \
+         but output doesn't start with expected prefix.\n\
+         Expected output prefix (normalized): {}\n\
+         Actual output(s):\n{}",
+        cargo_macra::normalize_tokens(expected_output_prefix),
+        actual_outputs.join("\n")
+    );
+}
+
 #[test]
 fn external_crate_coinduction_test_coinduction_integration_test() {
     let expansions = run_trace_for_repo("coinduction", Some("coinduction_integration_test"));
@@ -1005,22 +1103,17 @@ AssociatedConstNewType where BasicType : AssociatedConstTrait <>
                 (), Repeater, "#,
             )
     }));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Bang
-            && e.name.starts_with("__newer_type_macro__")
-            && equals_normalized(
-                &e.input,
-                r#"(FunctionPointerTrait) struct FunctionPointerNewType(BasicType);"#,
-            )
-            && starts_with_normalized(
-                &e.to,
-                r#":: newer_type :: __implement_internal!
+    assert_expansion(
+        &expansions,
+        MacroExpansionKind::Bang,
+        NameMatch::Prefix("__newer_type_macro__"),
+        r#"(FunctionPointerTrait) struct FunctionPointerNewType(BasicType);"#,
+        r#":: newer_type :: __implement_internal!
             {
                 ((FunctionPointerTrait) struct FunctionPointerNewType(BasicType);) trait
                 FunctionPointerTrait { fn apply_fn(& self, f : fn(i32) -> i32) -> i32; },
                 , :: newer_type, (i32, fn(i32) -> i32), Repeater, "#,
-            )
-    }));
+    );
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name.starts_with("__newer_type_macro__")
@@ -1395,16 +1488,14 @@ __sumtype_macro_"#)
 #[test]
 fn external_crate_parametrized_test_flatten_bug() {
     let expansions = run_trace_for_repo("parametrized", Some("flatten_bug"));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Attribute
-            && e.name == "parametrized"
-            && equals_normalized(&e.input, r#"#[allow(unused)] enum MyEnum<A> { E1(A), E2((A,)), }"#)
-            && starts_with_normalized(
-                &e.to,
-                r#"#[allow(unused)] enum MyEnum < A > { E1(A), E2((A,)), }
+    assert_expansion(
+        &expansions,
+        MacroExpansionKind::Attribute,
+        NameMatch::Exact("parametrized"),
+        r#"#[allow(unused)] enum MyEnum<A> { E1(A), E2((A,)), }"#,
+        r#"#[allow(unused)] enum MyEnum < A > { E1(A), E2((A,)), }
 #[:: parametrized :: _imp :: sumtype :: sumtype(:: parametrized :: _imp :: sumtype :: traits :: Iterator)] impl < A > :: parametrized :: Parametrized <0usize > for MyEnum < A >"#,
-            )
-    }));
+    );
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "sumtrait"
