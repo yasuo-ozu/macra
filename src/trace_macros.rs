@@ -187,6 +187,8 @@ impl TraceMacros {
                 if let Ok(wrapper) = create_macos_linker_wrapper() {
                     cmd.env("CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER", &wrapper);
                     cmd.env("CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER", &wrapper);
+                    // Also cover toolchains/build scripts that consult CC directly.
+                    cmd.env("CC", &wrapper);
                 }
             } else {
                 cmd.env("LD_PRELOAD", &lib);
@@ -296,16 +298,81 @@ fn create_macos_linker_wrapper() -> io::Result<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
 
     let unique = LINKER_WRAPPER_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!(
-        "cargo-macra-linker-wrapper-{}-{}.sh",
+    let dir = std::env::temp_dir();
+    let bin_path = dir.join(format!(
+        "cargo-macra-linker-wrapper-{}-{}",
         std::process::id(),
         unique
     ));
 
-    let script = "#!/bin/sh\nunset DYLD_INSERT_LIBRARIES\nexec /usr/bin/cc \"$@\"\n";
-    fs::write(&path, script)?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
-    Ok(path)
+    // Compile a native arm64 binary wrapper instead of a shell script.
+    // On newer macOS, system binaries like /bin/sh are arm64e.  dyld refuses
+    // to inject an arm64 dylib into an arm64e process, so the shell script
+    // approach dies with SIGABRT before the `unset` line ever runs.
+    // A compiled arm64 binary can load the arm64 hook dylib harmlessly, then
+    // unset DYLD_INSERT_LIBRARIES before exec-ing the real (arm64e) linker.
+    let c_src = concat!(
+        "#include <stdlib.h>\n",
+        "#include <unistd.h>\n",
+        "#include <string.h>\n",
+        "int main(int argc, char *argv[]) {\n",
+        "    (void)argc;\n",
+        "    unsetenv(\"DYLD_INSERT_LIBRARIES\");\n",
+        "    if (argv[1]) {\n",
+        "        const char *b = strrchr(argv[1], '/');\n",
+        "        if (!b) b = argv[1]; else b++;\n",
+        "        if (strcmp(b,\"cc\")==0||strcmp(b,\"clang\")==0||strcmp(b,\"gcc\")==0) {\n",
+        "            execvp(argv[1], argv+1);\n",
+        "            _exit(127);\n",
+        "        }\n",
+        "    }\n",
+        "    argv[0] = \"/usr/bin/cc\";\n",
+        "    execvp(\"/usr/bin/cc\", argv);\n",
+        "    _exit(127);\n",
+        "}\n",
+    );
+
+    let src_path = dir.join(format!(
+        "cargo-macra-linker-wrapper-{}-{}.c",
+        std::process::id(),
+        unique
+    ));
+    fs::write(&src_path, c_src)?;
+    let compile = std::process::Command::new("cc")
+        .arg("-o")
+        .arg(&bin_path)
+        .arg(&src_path)
+        .status();
+    let _ = fs::remove_file(&src_path);
+
+    if let Ok(st) = compile {
+        if st.success() {
+            return Ok(bin_path);
+        }
+    }
+
+    // Fallback: shell script (works on systems where /bin/sh is arm64).
+    let script_path = dir.join(format!(
+        "cargo-macra-linker-wrapper-{}-{}.sh",
+        std::process::id(),
+        unique
+    ));
+    let script = r#"#!/bin/sh
+unset DYLD_INSERT_LIBRARIES
+if [ "$#" -gt 0 ]; then
+  case "$1" in
+    */cc|cc|*/clang|clang|*/gcc|gcc)
+      linker="$1"
+      shift
+      exec "$linker" "$@"
+      ;;
+  esac
+fi
+exec /usr/bin/cc "$@"
+"#;
+    fs::write(&script_path, script)?;
+    fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))?;
+    Ok(script_path)
 }
 
 #[cfg(test)]
