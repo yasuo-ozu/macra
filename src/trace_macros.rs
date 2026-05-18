@@ -38,8 +38,15 @@ pub struct MacroExpansionIter {
 /// Result of spawning trace-macros collection.
 pub struct TraceRun {
     pub iter: MacroExpansionIter,
-    /// Receives cargo check success (`true`) / failure (`false`) once the child exits.
-    pub check_success: mpsc::Receiver<io::Result<bool>>,
+    /// Receives cargo check result once the child exits.
+    pub check_result: mpsc::Receiver<io::Result<CheckResult>>,
+}
+
+/// Result details for the traced `cargo check` execution.
+pub struct CheckResult {
+    pub success: bool,
+    pub stdout: String,
+    pub stderr: String,
 }
 
 impl MacroExpansionIter {
@@ -250,7 +257,11 @@ impl TraceMacros {
 
             match wait_result {
                 Ok(status) => {
-                    let _ = status_tx.send(Ok(status.success()));
+                    let _ = status_tx.send(Ok(CheckResult {
+                        success: status.success(),
+                        stdout: stdout_buf,
+                        stderr: stderr_buf,
+                    }));
                 }
                 Err(e) => {
                     let _ = status_tx.send(Err(e));
@@ -262,7 +273,7 @@ impl TraceMacros {
 
         Ok(TraceRun {
             iter: MacroExpansionIter { rx },
-            check_success: status_rx,
+            check_result: status_rx,
         })
     }
 }

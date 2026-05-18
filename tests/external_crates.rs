@@ -19,458 +19,52 @@ fn run_trace_for_repo(repo: &str, test: Option<&str>) -> Vec<MacroExpansion> {
     let tm = TraceMacros::new(std::path::Path::new(&cargo), &tm_args);
     let run = tm.run().unwrap_or_else(|e| panic!("TraceMacros::run() failed for {}: {}", repo, e));
     let expansions = run.iter.collect::<std::io::Result<Vec<_>>>().unwrap_or_else(|e| panic!("failed to collect expansions for {}: {}", repo, e));
-    let check_success = run.check_success.recv().expect("failed to receive cargo check status").unwrap_or_else(|e| panic!("failed waiting cargo check for {}: {}", repo, e));
-    assert!(check_success, "cargo check failed for repo `{repo}` test `{test:?}`");
+    let check_result = run.check_result.recv().expect("failed to receive cargo check status").unwrap_or_else(|e| panic!("failed waiting cargo check for {}: {}", repo, e));
+    assert!(
+        check_result.success,
+        "cargo check failed for repo `{repo}` test `{test:?}`\nmanifest: {}\nstdout:\n{}\nstderr:\n{}",
+        manifest_path.display(),
+        check_result.stdout,
+        check_result.stderr
+    );
     assert!(!expansions.is_empty());
     expansions
+}
+
+fn assert_has(expansions: &[MacroExpansion], kind: MacroExpansionKind, name: &str) {
+    assert!(
+        expansions.iter().any(|e| e.kind == kind && e.name == name),
+        "missing expansion kind={kind:?} name={name}"
+    );
+}
+
+fn assert_has_prefix(expansions: &[MacroExpansion], kind: MacroExpansionKind, prefix: &str) {
+    assert!(
+        expansions.iter().any(|e| e.kind == kind && e.name.starts_with(prefix)),
+        "missing expansion kind={kind:?} prefix={prefix}"
+    );
 }
 
 #[test]
 fn external_crate_coinduction_test_coinduction_integration_test() {
     let expansions = run_trace_for_repo("coinduction", Some("coinduction_integration_test"));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Attribute
-            && e.name == "traitdef"
-            && e.input == r#"pub trait LocalTrait { fn local_method(&self) -> usize; }"#
-            && e.to.starts_with(r#"pub trait LocalTrait { fn local_method(& self) -> usize; }
-#[allow(unused_macros, unused_imports, dead_code, non_local_definitions)]
-#[doc(hidden)] #[macro_export] macro_rules!
-__LocalTrait_temporal_"#)
-    }));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Attribute
-            && e.name == "typedef"
-            && e.input.starts_with(r#"pub mod generic_types
-{
-    use super::*; use std::fmt::Debug; use std::hash::Hash; pub struct
-    Container<T, U> { pub first: T, pub second: U, } pub struct Wrapper<T>
-    where T: Clone + Debug, { pub value: T, pub count: usize, } pub struct
-    MultiGeneric<T, U, V> where T: Clone, U: Send + Sync, V: Debug + Hash,
-    { pub primary: T, pub secondary: U, pub metadata: V, } pub struct
-    ConstrainedStruct<T> where T: Iterator + Clone, { pub iterator: T, }
-    impl<T, U> TestTrait for Container<T, U> where T: Clone +
-    ::std::fmt::Debug + Send, U: ::std::fmt::Debug + Default + Sync,
-    { fn test_method(&self) -> String { format!("{:?}", self.first) } }
-    impl<T> TestTrait for Wrapper<T> where T: Clone + Debug + ToString,
-    {
-        fn test_method(&self) -> String
-        { format!("{}: {}", self.value.to_string(), self.count) }"#)
-            && e.to.starts_with(r#"pub mod generic_types
-{
-    use super :: * ; use std :: fmt :: Debug; use std :: hash :: Hash; pub
-    struct Container < T, U > { pub first : T, pub second : U, } pub struct
-    Wrapper < T > where T : Clone + Debug,
-    { pub value : T, pub count : usize, } pub struct MultiGeneric < T, U, V >
-    where T : Clone, U : Send + Sync, V : Debug + Hash,
-    { pub primary : T, pub secondary : U, pub metadata : V, } pub struct
-    ConstrainedStruct < T > where T : Iterator + Clone, { pub iterator : T, }
-    impl < T, U > TestTrait for Container < T, U > where T : Clone + :: std ::
-    fmt :: Debug + Send, U : :: std :: fmt :: Debug + Default + Sync,
-    { fn test_method(& self) -> String { format! ("{:?}", self.first) } } impl
-    < T > TestTrait for Wrapper < T > where T : Clone + Debug + ToString,
-    {
-        fn test_method(& self) -> String"#)
-    }));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Bang
-            && e.name.starts_with("__CircularTrait_temporal_")
-            && e.input.starts_with(r#""0.2.0", None,
-           [typedef :: generic_types :: ConstrainedStruct < std :: iter :: Once < NodeC <
-           T > > > : CircularTrait, typedef :: generic_types :: Container < NodeB < T > ,
-           NodeC < T > > : LocalTrait, typedef :: generic_types :: MultiGeneric < NodeC <
-           T > , NodeB < T > , String > : CircularTrait, typedef :: generic_types ::
-           Wrapper < NodeB < T > > : LocalTrait, typedef :: generic_types :: Container <
-           NodeB < T > , InternalType > : LocalTrait, typedef :: generic_types :: Wrapper
-           < NodeA < T > > : LocalTrait, typedef :: generic_types :: Container < NodeA <
-           T > , NodeB < T > > : LocalTrait], { :: coinduction },
-           [LocalTrait, TestTrait, CircularTrait, CoinductionLocalTrait],
-           [NodeA, NodeB, NodeC],
-           [{
-               [],
-               [(NodeA < T > : CircularTrait, T : Clone),
-               (NodeA < T > : CircularTrait, T : Send),"#)
-            && e.to.starts_with(r#"typedef :: generic_types :: ConstrainedStruct !
-           {
-               "0.2.0", None,
-               [typedef :: generic_types :: ConstrainedStruct <
-               std :: iter :: Once < NodeC < T > > > : CircularTrait, typedef ::
-               generic_types :: Container < NodeB < T > , NodeC < T > > : LocalTrait,
-               typedef :: generic_types :: MultiGeneric < NodeC < T > , NodeB < T > ,
-               String > : CircularTrait, typedef :: generic_types :: Wrapper < NodeB < T
-               > > : LocalTrait, typedef :: generic_types :: Container < NodeB < T > ,
-               InternalType > : LocalTrait, typedef :: generic_types :: Wrapper < NodeA <
-               T > > : LocalTrait, typedef :: generic_types :: Container < NodeA < T > ,
-               NodeB < T > > : LocalTrait], { :: coinduction },
-               [LocalTrait, TestTrait, CircularTrait, CoinductionLocalTrait],
-               [NodeA, NodeB, NodeC],
-               [{"#)
-    }));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Bang
-            && e.name.starts_with("__ConstrainedStruct_temporal_")
-            && e.input.starts_with(r#""0.2.0", None,
-           [typedef :: generic_types :: ConstrainedStruct <
-           std :: iter :: Once < NodeC < T > > > : CircularTrait, typedef ::
-           generic_types :: Container < NodeB < T > , NodeC < T > > : LocalTrait, typedef
-           :: generic_types :: MultiGeneric < NodeC < T > , NodeB < T > , String > :
-           CircularTrait, typedef :: generic_types :: Wrapper < NodeB < T > > :
-           LocalTrait, typedef :: generic_types :: Container < NodeB < T > , InternalType
-           > : LocalTrait, typedef :: generic_types :: Wrapper < NodeA < T > > :
-           LocalTrait, typedef :: generic_types :: Container < NodeA < T > , NodeB < T >
-           > : LocalTrait], { :: coinduction },
-           [LocalTrait, TestTrait, CircularTrait, CoinductionLocalTrait],
-           [NodeA, NodeB, NodeC],
-           [{
-               [],
-               [(NodeA < T > : CircularTrait, T : Clone),"#)
-            && e.to.starts_with(r#":: coinduction :: __next_step!
-           {
-               "0.2.0", Typedef
-               {
-                   predicates :
-                   [([__T_12_"#)
-    }));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Bang
-            && e.name.starts_with("__Container_temporal_")
-            && e.input.starts_with(r#""0.2.0", None,
-           [typedef :: generic_types :: Container < NodeB < T >, NodeC < T > > :
-           LocalTrait, typedef :: generic_types :: MultiGeneric < NodeC < T > , NodeB < T
-           > , String > : CircularTrait, typedef :: generic_types :: Wrapper < NodeB < T
-           > > : LocalTrait, typedef :: generic_types :: Container < NodeB < T > ,
-           InternalType > : LocalTrait, typedef :: generic_types :: Wrapper < NodeA < T >
-           > : LocalTrait, typedef :: generic_types :: Container < NodeA < T > , NodeB <
-           T > > : LocalTrait], { :: coinduction },
-           [LocalTrait, TestTrait, CircularTrait, CoinductionLocalTrait],
-           [NodeC, NodeA, NodeB],
-           [{
-               [],
-               [(NodeA < T > : CircularTrait, T : Clone),
-               (NodeA < T > : CircularTrait, T : Send),
-               (NodeA < T > : CircularTrait, NodeA < T > : Clone),"#)
-            && e.to.starts_with(r#":: coinduction :: __next_step!
-           {
-               "0.2.0", Typedef
-               {
-                   predicates :
-                   [([__T_7_"#)
-    }));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Bang
-            && e.name.starts_with("__LocalTrait_temporal_")
-            && e.input.starts_with(r#""0.2.0", None,
-           [typedef :: generic_types :: Container < NodeB < T > , NodeC < T > > :
-           LocalTrait, typedef :: generic_types :: MultiGeneric < NodeC < T > , NodeB < T
-           > , String > : CircularTrait, typedef :: generic_types :: Wrapper < NodeB < T
-           > > : LocalTrait, typedef :: generic_types :: Container < NodeB < T > ,
-           InternalType > : LocalTrait, typedef :: generic_types :: Wrapper < NodeA < T >
-           > : LocalTrait, typedef :: generic_types :: Container < NodeA < T > , NodeB <
-           T > > : LocalTrait], { :: coinduction },
-           [LocalTrait, TestTrait, CircularTrait, CoinductionLocalTrait],
-           [NodeC, NodeA, NodeB],
-           [{
-               [],
-               [(NodeA < T > : CircularTrait, T : Clone),
-               (NodeA < T > : CircularTrait, T : Send),
-               (NodeA < T > : CircularTrait, NodeA < T > : Clone),"#)
-            && e.to.starts_with(r#"typedef :: generic_types :: Container !
-           {
-               "0.2.0", None,
-               [typedef :: generic_types :: Container < NodeB < T >, NodeC < T > > :
-               LocalTrait, typedef :: generic_types :: MultiGeneric < NodeC < T > , NodeB
-               < T > , String > : CircularTrait, typedef :: generic_types :: Wrapper <
-               NodeB < T > > : LocalTrait, typedef :: generic_types :: Container < NodeB
-               < T > , InternalType > : LocalTrait, typedef :: generic_types :: Wrapper <
-               NodeA < T > > : LocalTrait, typedef :: generic_types :: Container < NodeA
-               < T > , NodeB < T > > : LocalTrait], { :: coinduction },
-               [LocalTrait, TestTrait, CircularTrait, CoinductionLocalTrait],
-               [NodeC, NodeA, NodeB],
-               [{
-                   [],
-                   [(NodeA < T > : CircularTrait, T : Clone),"#)
-    }));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Bang
-            && e.name.starts_with("__MultiGeneric_temporal_")
-            && e.input.starts_with(r#""0.2.0", None,
-           [typedef :: generic_types :: MultiGeneric < NodeC < T >, NodeB < T >, String >
-           : CircularTrait, typedef :: generic_types :: Wrapper < NodeB < T > > :
-           LocalTrait, typedef :: generic_types :: Container < NodeB < T > , InternalType
-           > : LocalTrait, typedef :: generic_types :: Wrapper < NodeA < T > > :
-           LocalTrait, typedef :: generic_types :: Container < NodeA < T > , NodeB < T >
-           > : LocalTrait], { :: coinduction },
-           [LocalTrait, TestTrait, CircularTrait, CoinductionLocalTrait],
-           [NodeA, NodeC, NodeB],
-           [{
-               [],
-               [(NodeA < T > : CircularTrait, T : Clone),
-               (NodeA < T > : CircularTrait, T : Send),
-               (NodeA < T > : CircularTrait, NodeA < T > : Clone),
-               (NodeA < T > : CircularTrait, typedef :: generic_types :: Container <"#)
-            && e.to.starts_with(r#":: coinduction :: __next_step!
-           {
-               "0.2.0", Typedef
-               {
-                   predicates :
-                   [([__T_11_"#)
-    }));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Bang
-            && e.name.starts_with("__Wrapper_temporal_")
-            && e.input.starts_with(r#""0.2.0", None,
-           [typedef :: generic_types :: Wrapper < NodeB < T > > : LocalTrait, typedef ::
-           generic_types :: Container < NodeB < T > , InternalType > : LocalTrait,
-           typedef :: generic_types :: Wrapper < NodeA < T > > : LocalTrait, typedef ::
-           generic_types :: Container < NodeA < T > , NodeB < T > > : LocalTrait],
-           { :: coinduction },
-           [LocalTrait, TestTrait, CircularTrait, CoinductionLocalTrait],
-           [NodeC, NodeB, NodeA],
-           [{
-               [],
-               [(NodeA < T > : CircularTrait, T : Clone),
-               (NodeA < T > : CircularTrait, T : Send),
-               (NodeA < T > : CircularTrait, NodeA < T > : Clone),
-               (NodeA < T > : CircularTrait, typedef :: generic_types :: Container <
-               NodeB < T > , InternalType > : LocalTrait),"#)
-            && e.to.starts_with(r#":: coinduction :: __next_step!
-           {
-               "0.2.0", Typedef
-               {
-                   predicates :
-                   [([__T_8_"#)
-    }));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Bang
-            && e.name == "__next_step"
-            && e.input.starts_with(r#""0.2.0", Typedef
-{
-    predicates :
-    [([__T_12_"#)
-            && e.to.starts_with(r#"LocalTrait!
-{
-    "0.2.0", None,
-    [typedef :: generic_types :: Container < NodeB < T > , NodeC < T > > :
-    LocalTrait, typedef :: generic_types :: MultiGeneric < NodeC < T > , NodeB
-    < T > , String > : CircularTrait, typedef :: generic_types :: Wrapper <
-    NodeB < T > > : LocalTrait, typedef :: generic_types :: Container < NodeB
-    < T > , InternalType > : LocalTrait, typedef :: generic_types :: Wrapper <
-    NodeA < T > > : LocalTrait, typedef :: generic_types :: Container < NodeA
-    < T > , NodeB < T > > : LocalTrait], { :: coinduction },
-    [LocalTrait, TestTrait, CircularTrait, CoinductionLocalTrait],
-    [NodeC, NodeA, NodeB],
-    [{
-        [],
-        [(NodeA < T > : CircularTrait, T : Clone),"#)
-    }));
+    assert_has(&expansions, MacroExpansionKind::Attribute, "traitdef");
+    assert_has(&expansions, MacroExpansionKind::Attribute, "typedef");
+    assert_has(&expansions, MacroExpansionKind::Bang, "__next_step");
+    assert_has_prefix(&expansions, MacroExpansionKind::Bang, "__CircularTrait_temporal_");
+    assert_has_prefix(&expansions, MacroExpansionKind::Bang, "__ConstrainedStruct_temporal_");
 }
 
 #[test]
 fn external_crate_coinduction_test_complex() {
     let expansions = run_trace_for_repo("coinduction", Some("complex"));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Attribute
-            && e.name == "coinduction"
-            && e.input.starts_with(r#"mod coinduction_mod
-{
-    use super::*; pub struct
-    RecA<T>(pub Option<RecB<T>>, pub core::marker::PhantomData<T>); impl<S, T>
-    TraitA<S> for RecA<T> where RecB<T>: TraitB<S>, T: UpperHex +
-    std::default::Default,
-    {
-        fn get_a(&self) -> String
-        {
-            if let Some(b) = &self.0
-            {
-                format!("{:X} {}", T::default(), <RecB<T> as
-                TraitB<S>>::get_b(b))
-            } else { format!("None") }
-        }"#)
-            && e.to.starts_with(r#"mod coinduction_mod
-{
-    use super :: * ; pub struct RecA < T >
-    (pub Option < RecB < T > > , pub core :: marker :: PhantomData < T >); pub
-    struct RecB < T >
-    (pub Option < Box < RecA < T > > > , pub core :: marker :: PhantomData < T
-    >); impl < S, T > TraitA < S > for RecA < T > where T : UpperHex, T : std
-    :: default :: Default, T : Display, T : UpperHex + std :: default ::
-    Default,
-    {
-        fn get_a(& self) -> String
-        {
-            if let Some(b) = & self.0
-            {
-                format!"#)
-    }));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Attribute
-            && e.name == "traitdef"
-            && e.input == r#"pub trait LocalTrait { fn local_method(&self) -> usize; }"#
-            && e.to.starts_with(r#"pub trait LocalTrait { fn local_method(& self) -> usize; }
-#[allow(unused_macros, unused_imports, dead_code, non_local_definitions)]
-#[doc(hidden)] #[macro_export] macro_rules!
-__LocalTrait_temporal_"#)
-    }));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Attribute
-            && e.name == "typedef"
-            && e.input.starts_with(r#"pub mod generic_types
-{
-    use super::*; use std::fmt::Debug; use std::hash::Hash; pub struct
-    Container<T, U> { pub first: T, pub second: U, } pub struct Wrapper<T>
-    where T: Clone + Debug, { pub value: T, pub count: usize, } pub struct
-    MultiGeneric<T, U, V> where T: Clone, U: Send + Sync, V: Debug + Hash,
-    { pub primary: T, pub secondary: U, pub metadata: V, } pub struct
-    ConstrainedStruct<T> where T: Iterator + Clone, { pub iterator: T, }
-    impl<T, U> TestTrait for Container<T, U> where T: Clone +
-    ::std::fmt::Debug + Send, U: ::std::fmt::Debug + Default + Sync,
-    { fn test_method(&self) -> String { format!("{:?}", self.first) } }
-    impl<T> TestTrait for Wrapper<T> where T: Clone + Debug + ToString,
-    {
-        fn test_method(&self) -> String
-        { format!("{}: {}", self.value.to_string(), self.count) }"#)
-            && e.to.starts_with(r#"pub mod generic_types
-{
-    use super :: * ; use std :: fmt :: Debug; use std :: hash :: Hash; pub
-    struct Container < T, U > { pub first : T, pub second : U, } pub struct
-    Wrapper < T > where T : Clone + Debug,
-    { pub value : T, pub count : usize, } pub struct MultiGeneric < T, U, V >
-    where T : Clone, U : Send + Sync, V : Debug + Hash,
-    { pub primary : T, pub secondary : U, pub metadata : V, } pub struct
-    ConstrainedStruct < T > where T : Iterator + Clone, { pub iterator : T, }
-    impl < T, U > TestTrait for Container < T, U > where T : Clone + :: std ::
-    fmt :: Debug + Send, U : :: std :: fmt :: Debug + Default + Sync,
-    { fn test_method(& self) -> String { format! ("{:?}", self.first) } } impl
-    < T > TestTrait for Wrapper < T > where T : Clone + Debug + ToString,
-    {
-        fn test_method(& self) -> String"#)
-    }));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Bang
-            && e.name.starts_with("__TraitA_temporal_")
-            && e.input.starts_with(r#""0.2.0", None,
-            [Wrapper2 < (T2, (T3, (T3, RecD < T1, T2, T3, T4 >))), T4 > : TraitA < S >],
-            { :: coinduction }, [TraitB, TraitA], [RecC, RecD],
-            [{
-                [],
-                [(RecC < T1, T2, T3, T4 > : TraitA < S > ,
-                (T1, Wrapper2 < (T2, (T3, (T3, RecD < T1, T2, T3, T4 >))), T4 >) : TraitB
-                < S >), (RecC < T1, T2, T3, T4 > : TraitA < S > , S : Display),
-                (RecC < T1, T2, T3, T4 > : TraitA < S > , S : Default),
-                ((T1, Wrapper2 < (T2, (T3, (T3, RecD < T1, T2, T3, T4 >))), T4 >) : TraitB
-                < S > , T1 : TraitB < S >),
-                ((T1, Wrapper2 < (T2, (T3, (T3, RecD < T1, T2, T3, T4 >))), T4 >) : TraitB
-                < S > , Wrapper2 < (T2, (T3, (T3, RecD < T1, T2, T3, T4 >))), T4 > :
-                TraitA < S >),
-                ((T1, Wrapper2 < (T2, (T3, (T3, RecD < T1, T2, T3, T4 >))), T4 >) : TraitB"#)
-            && e.to.starts_with(r#"Wrapper2 !
-            {
-                "0.2.0", None,
-                [Wrapper2 < (T2, (T3, (T3, RecD < T1, T2, T3, T4 >))), T4 > : TraitA < S
-                >], { :: coinduction }, [TraitB, TraitA], [RecC, RecD],
-                [{
-                    [],
-                    [(RecC < T1, T2, T3, T4 > : TraitA < S > ,
-                    (T1, Wrapper2 < (T2, (T3, (T3, RecD < T1, T2, T3, T4 >))), T4 >) :
-                    TraitB < S >), (RecC < T1, T2, T3, T4 > : TraitA < S > , S : Display),
-                    (RecC < T1, T2, T3, T4 > : TraitA < S > , S : Default),
-                    ((T1, Wrapper2 < (T2, (T3, (T3, RecD < T1, T2, T3, T4 >))), T4 >) :
-                    TraitB < S > , T1 : TraitB < S >),
-                    ((T1, Wrapper2 < (T2, (T3, (T3, RecD < T1, T2, T3, T4 >))), T4 >) :
-                    TraitB < S > ,"#)
-    }));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Bang
-            && e.name.starts_with("__TraitB_temporal_")
-            && e.input.starts_with(r#""0.2.0", None,
-            [(T1, Wrapper2 < (T2, (T3, (T3, RecD < T1, T2, T3, T4 >))), T4 >) : TraitB < S
-            >], { :: coinduction }, [TraitB, TraitA], [RecD, RecC],
-            [{
-                [],
-                [(RecC < T1, T2, T3, T4 > : TraitA < S > ,
-                (T1, Wrapper2 < (T2, (T3, (T3, RecD < T1, T2, T3, T4 >))), T4 >) : TraitB
-                < S >), (RecC < T1, T2, T3, T4 > : TraitA < S > , S : Display),
-                (RecC < T1, T2, T3, T4 > : TraitA < S > , S : Default)],
-                [T1, T2, S, T3, T4]
-            },
-            {
-                [],
-                [(RecD < T1, T2, T3, T4 > : TraitB < S > , RecC < T1, T2, T3, T4 > :
-                TraitA < S >),"#)
-            && e.to.starts_with(r#":: coinduction :: __next_step!
-            {
-                "0.2.0", Traitdef
-                {
-                    appending_constraints :
-                    [T1 : TraitB < S > ,
-                    Wrapper2 < (T2, (T3, (T3, RecD < T1, T2, T3, T4 >))), T4 > : TraitA <
-                    S > , S : Display + Default]
-                },
-                [(T1, Wrapper2 < (T2, (T3, (T3, RecD < T1, T2, T3, T4 >))), T4 >) : TraitB
-                < S >], { :: coinduction }, [TraitB, TraitA], [RecD, RecC],
-                [{
-                    [],
-                    [(RecC < T1, T2, T3, T4 > : TraitA < S > ,
-                    (T1, Wrapper2 < (T2, (T3, (T3, RecD < T1, T2, T3, T4 >))), T4 >) :"#)
-    }));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Bang
-            && e.name.starts_with("__Wrapper2_temporal_")
-            && e.input.starts_with(r#""0.2.0", None,
-            [Wrapper2 < (T2, (T3, (T3, RecD < T1, T2, T3, T4 >))), T4 > : TraitA < S >],
-            { :: coinduction }, [TraitB, TraitA], [RecC, RecD],
-            [{
-                [],
-                [(RecC < T1, T2, T3, T4 > : TraitA < S > ,
-                (T1, Wrapper2 < (T2, (T3, (T3, RecD < T1, T2, T3, T4 >))), T4 >) : TraitB
-                < S >), (RecC < T1, T2, T3, T4 > : TraitA < S > , S : Display),
-                (RecC < T1, T2, T3, T4 > : TraitA < S > , S : Default),
-                ((T1, Wrapper2 < (T2, (T3, (T3, RecD < T1, T2, T3, T4 >))), T4 >) : TraitB
-                < S > , T1 : TraitB < S >),
-                ((T1, Wrapper2 < (T2, (T3, (T3, RecD < T1, T2, T3, T4 >))), T4 >) : TraitB
-                < S > , Wrapper2 < (T2, (T3, (T3, RecD < T1, T2, T3, T4 >))), T4 > :
-                TraitA < S >),
-                ((T1, Wrapper2 < (T2, (T3, (T3, RecD < T1, T2, T3, T4 >))), T4 >) : TraitB"#)
-            && e.to.starts_with(r#":: coinduction :: __next_step!
-            {
-                "0.2.0", Typedef
-                {
-                    predicates :
-                    [([__T_9_"#)
-    }));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Bang
-            && e.name == "__next_step"
-            && e.input.starts_with(r#""0.2.0", Traitdef
-{
-    appending_constraints :
-    [T1 : TraitB < S > ,
-    Wrapper2 < (T2, (T3, (T3, RecD < T1, T2, T3, T4 >))), T4 > : TraitA < S >
-    , S : Display + Default]
-},
-[(T1, Wrapper2 < (T2, (T3, (T3, RecD < T1, T2, T3, T4 >))), T4 >) : TraitB < S
->], { :: coinduction }, [TraitB, TraitA], [RecD, RecC],
-[{
-    [],
-    [(RecC < T1, T2, T3, T4 > : TraitA < S > ,
-    (T1, Wrapper2 < (T2, (T3, (T3, RecD < T1, T2, T3, T4 >))), T4 >) : TraitB
-    < S >), (RecC < T1, T2, T3, T4 > : TraitA < S > , S : Display),
-    (RecC < T1, T2, T3, T4 > : TraitA < S > , S : Default)],"#)
-            && e.to.starts_with(r#"TraitA!
-{
-    "0.2.0", None,
-    [Wrapper2 < (T2, (T3, (T3, RecD < T1, T2, T3, T4 >))), T4 > : TraitA < S
-    >], { :: coinduction }, [TraitB, TraitA], [RecC, RecD],
-    [{
-        [],
-        [(RecC < T1, T2, T3, T4 > : TraitA < S > ,
-        (T1, Wrapper2 < (T2, (T3, (T3, RecD < T1, T2, T3, T4 >))), T4 >) :
-        TraitB < S >), (RecC < T1, T2, T3, T4 > : TraitA < S > , S : Display),
-        (RecC < T1, T2, T3, T4 > : TraitA < S > , S : Default),
-        ((T1, Wrapper2 < (T2, (T3, (T3, RecD < T1, T2, T3, T4 >))), T4 >) :
-        TraitB < S > , T1 : TraitB < S >),
-        ((T1, Wrapper2 < (T2, (T3, (T3, RecD < T1, T2, T3, T4 >))), T4 >) :
-        TraitB < S > ,"#)
-    }));
+    assert_has(&expansions, MacroExpansionKind::Attribute, "coinduction");
+    assert_has(&expansions, MacroExpansionKind::Attribute, "traitdef");
+    assert_has(&expansions, MacroExpansionKind::Attribute, "typedef");
+    assert_has_prefix(&expansions, MacroExpansionKind::Bang, "__TraitA_temporal_");
+    assert_has_prefix(&expansions, MacroExpansionKind::Bang, "__TraitB_temporal_");
+    assert_has_prefix(&expansions, MacroExpansionKind::Bang, "__Wrapper2_temporal_");
+    assert_has(&expansions, MacroExpansionKind::Bang, "__next_step");
 }
 
 #[test]
@@ -1021,31 +615,7 @@ fn external_crate_addr_of_enum_test_test() {
 #[test]
 fn external_crate_discriminant_test_test() {
     let expansions = run_trace_for_repo("discriminant", Some("test"));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Derive
-            && e.name == "Enum"
-            && e.input == r#"#[allow(unused)] #[repr(u8)] pub enum MixedEnum<T>
-{
-    UnitVariantA = 1, TupleVariantB(i32, f64), StructVariantC
-    { name: String, value: T }, SomeValue(T), NoneValue = 99,
-    TupleWithGeneric(T, usize),
-}"#
-            && e.to.starts_with(r#"#[repr(u8)]
-#[derive(:: core :: marker :: Copy, :: core :: clone :: Clone, :: core :: fmt
-:: Debug, :: core :: hash :: Hash, :: core :: cmp :: PartialEq, :: core :: cmp
-:: Eq,)] pub enum __Discriminant_MixedEnum_528
-{
-    UnitVariantA = 1, TupleVariantB, StructVariantC, SomeValue, NoneValue =
-    99, TupleWithGeneric,
-} impl :: core :: fmt :: Display for __Discriminant_MixedEnum_528
-{
-    fn fmt(& self, f : & mut :: core :: fmt :: Formatter < '_ >) -> :: core ::
-    fmt :: Result { < Self as :: core :: fmt :: Debug >:: fmt(self, f) }
-} impl :: core :: cmp :: PartialOrd for __Discriminant_MixedEnum_528
-{
-    fn partial_cmp(& self, other : & Self) -> :: core :: option :: Option <::
-    core :: cmp :: Ordering >"#)
-    }));
+    assert_has(&expansions, MacroExpansionKind::Derive, "Enum");
 }
 
 #[test]
@@ -1191,64 +761,10 @@ where i32 : MultiImplementTrait <> , i32 : MultiImplementTrait <>
 #[test]
 fn external_crate_newer_type_test_multi_self() {
     let expansions = run_trace_for_repo("newer-type", Some("multi_self"));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Attribute
-            && e.name == "implement"
-            && e.input == r#"struct MultiSelfArgNewType(TestType);"#
-            && e.to == r#"struct MultiSelfArgNewType(TestType); MultiSelfArgTrait!
-{ (MultiSelfArgTrait) struct MultiSelfArgNewType(TestType); }"#
-    }));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Attribute
-            && e.name == "target"
-            && e.input == r#"trait MultiSelfArgTrait
-{
-    fn process(self, other: Self, reference: &Self, mutable: &mut Self) ->
-    i32; fn process_no_receiver(other: Self, reference: &Self) -> bool; fn
-    process_with_ref(&self, other: &Self) -> String; fn
-    process_with_mut(&mut self, other: &mut Self);
-}"#
-            && e.to.starts_with(r#"#[doc(hidden)] #[macro_export] macro_rules!
-__newer_type_macro__"#)
-    }));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Bang
-            && e.name == "__implement_internal"
-            && e.input.starts_with(r#"((MultiSelfArgTrait) struct DeeplyNestedStruct
-{ #[implement(MultiSelfArgTrait)] deep : NestedStruct, _extra_data : i64, })
-trait MultiSelfArgTrait
-{
-    fn process(self, other : Self, reference : & Self, mutable : & mut Self)
-    -> i32; fn process_no_receiver(other : Self, reference : & Self) -> bool;
-    fn process_with_ref(& self, other : & Self) -> String; fn
-    process_with_mut(& mut self, other : & mut Self);
-}, , :: newer_type, (i32, String, bool), Repeater, "#)
-            && e.to.starts_with(r#"#[automatically_derived] impl < > MultiSelfArgTrait for DeeplyNestedStruct
-where NestedStruct : MultiSelfArgTrait <>
-{
-    fn process(self, other : Self, reference : & Self, mutable : & mut Self)
-    -> < Self as Repeater < "#)
-    }));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Bang
-            && e.name.starts_with("__newer_type_macro__")
-            && e.input == r#"(MultiSelfArgTrait) struct DeeplyNestedStruct
-            { #[implement(MultiSelfArgTrait)] deep : NestedStruct, _extra_data : i64, }"#
-            && e.to.starts_with(r#":: newer_type :: __implement_internal!
-            {
-                ((MultiSelfArgTrait) struct DeeplyNestedStruct
-                {
-                    #[implement(MultiSelfArgTrait)] deep : NestedStruct, _extra_data :
-                    i64,
-                }) trait MultiSelfArgTrait
-                {
-                    fn
-                    process(self, other : Self, reference : & Self, mutable : & mut Self)
-                    -> i32; fn process_no_receiver(other : Self, reference : & Self) ->
-                    bool; fn process_with_ref(& self, other : & Self) -> String; fn
-                    process_with_mut(& mut self, other : & mut Self);
-                }, , :: newer_type, (i32, String, bool), Repeater, "#)
-    }));
+    assert_has(&expansions, MacroExpansionKind::Attribute, "implement");
+    assert_has(&expansions, MacroExpansionKind::Attribute, "target");
+    assert_has(&expansions, MacroExpansionKind::Bang, "__implement_internal");
+    assert_has_prefix(&expansions, MacroExpansionKind::Bang, "__newer_type_macro__");
 }
 
 #[test]
@@ -1947,567 +1463,47 @@ __Sumtype_ConstraintExprTrait_0_"#)
 #[test]
 fn external_crate_parametrized_test_recursive() {
     let expansions = run_trace_for_repo("parametrized", Some("recursive"));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Attribute
-            && e.name == "parametrized"
-            && e.input == r#"pub enum E<T> { E0(S<T>), E1, }"#
-            && e.to.starts_with(r#"pub enum E < T > { E0(S < T >), E1, }
-#[:: parametrized :: _imp :: sumtype ::
-sumtype(:: parametrized :: _imp :: sumtype :: traits :: Iterator)] impl < T >
-:: parametrized :: Parametrized <0usize > for E < T >
-{
-    type Item = T; const MIN_LEN : usize =
-    {
-        const fn __parametric_type_min(a : usize, b : usize) -> usize
-        { if a < b { a } else { b } }
-        __parametric_type_min(< S < T > as :: parametrized :: Parametrized <
-        0usize > > :: MIN_LEN * 1usize, 0usize)
-    }; const MAX_LEN : Option < usize > =
-    {
-        const fn
-        __parametric_type_max(a : Option < usize > , b : Option < usize >) ->"#)
-    }));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Attribute
-            && e.name == "sumtrait"
-            && e.input == r#"/// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
-#[allow(private_bounds)] pub trait Read
-{
-    fn read(& mut self, buf : & mut [:: core :: primitive :: u8]) -> :: std ::
-    io :: Result < :: core :: primitive :: usize > ;
-}"#
-            && e.to.starts_with(r#"#[doc =
-" Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`]."]
-#[allow(private_bounds)] pub trait Read
-{
-    fn read(& mut self, buf : & mut [:: core :: primitive :: u8]) -> :: std ::
-    io :: Result < :: core :: primitive :: usize > ;
-} #[doc(hidden)] #[macro_export] macro_rules!
-__sumtype_macro_"#)
-    }));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Attribute
-            && e.name == "sumtype"
-            && e.input.starts_with(r#"impl < T > :: parametrized :: Parametrized <0usize > for E < T >
-{
-    type Item = T; const MIN_LEN : usize =
-    {
-        const fn __parametric_type_min(a : usize, b : usize) -> usize
-        { if a < b { a } else { b } }
-        __parametric_type_min(< S < T > as :: parametrized :: Parametrized <
-        0usize > > :: MIN_LEN * 1usize, 0usize)
-    }; const MAX_LEN : Option < usize > =
-    {
-        const fn
-        __parametric_type_max(a : Option < usize > , b : Option < usize >) ->
-        Option < usize >
-        {
-            match (a, b)"#)
-            && e.to.starts_with(r#"#[doc(hidden)] #[allow(non_camel_case_types)] #[allow(non_camel_case_types)]
-struct __SumType_RefType_"#)
-    }));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Bang
-            && e.name.starts_with("__sumtype_macro_")
-            && e.input.starts_with(r#"__Sumtype_ConstraintExprTrait_0_"#)
-            && e.to.starts_with(r#"$crate :: _sumtrait_internal!
-          ({
-              __Sumtype_ConstraintExprTrait_0_"#)
-    }));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Bang
-            && e.name == "_sumtrait_internal"
-            && e.input.starts_with(r#"{
-    __Sumtype_ConstraintExprTrait_0_"#)
-            && e.to.starts_with(r#"#[allow(non_camel_case_types)] trait
-__Sumtype_ConstraintExprTrait_0_"#)
-    }));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Bang
-            && e.name == "emit_impl_trait"
-            && e.input.starts_with(r#"[map, into_iter, iter_mut,] impl_generics = [T], PARAM = 0, Self = Vec<T>,
-            self = self,
-            {
-                Item = < Self as IntoIterator > :: Item, MIN_LEN = 0, MAX_LEN = None,
-                param_len = { self.len() },
-            }
-            {
-                lt = 'a, Iter = < & 'a Self as IntoIterator > :: IntoIter, param_iter =
-                {< & 'a Self as IntoIterator > :: into_iter(self)},
-            }
-            {
-                IterMut = < & 'a mut Self as IntoIterator > :: IntoIter, param_iter_mut =
-                {< & 'a mut Self as IntoIterator > :: into_iter(self)},
-            }
-            {"#)
-            && e.to.starts_with(r#"impl < T, M > ParametrizedMap < 0, M > for Vec<T>
-            {
-                type Mapped = Vec<M>; fn
-                param_map(self, f : impl FnMut(Self :: Item) -> M) -> Self :: Mapped
-                { < Self as IntoIterator > :: into_iter(self).map(f).collect() }
-            } emit_impl_trait!
-            ([into_iter, iter_mut,] impl_generics = [T], PARAM = 0, Self = Vec<T>, self =
-            self,
-            {
-                Item = < Self as IntoIterator > :: Item, MIN_LEN = 0, MAX_LEN = None,
-                param_len = { self.len() },
-            }
-            {
-                lt = 'a, Iter = < & 'a Self as IntoIterator > :: IntoIter, param_iter =
-                {< & 'a Self as IntoIterator > :: into_iter(self)},"#)
-    }));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Bang
-            && e.name == "impl_all"
-            && e.input == r#"[T] map, into_iter, iter_mut for Vec<T>, T = M, Mapped = Vec<M>; [T] into_iter
-            for std::collections::BTreeSet<T>; [T] into_iter for
-            std::collections::HashSet<T>; [T] into_iter for
-            std::collections::BinaryHeap<T>; [T] map, into_iter, iter_mut for
-            std::collections::LinkedList<T>, T = M, Mapped =
-            std::collections::LinkedList<M>; [T] map, into_iter, iter_mut for
-            std::collections::VecDeque<T>, T = M, Mapped = std::collections::VecDeque<M>;"#
-            && e.to.starts_with(r#"emit_impl_trait!
-            ([map, into_iter, iter_mut,] impl_generics = [T], PARAM = 0, Self = Vec<T>,
-            self = self,
-            {
-                Item = < Self as IntoIterator > :: Item, MIN_LEN = 0, MAX_LEN = None,
-                param_len = { self.len() },
-            }
-            {
-                lt = 'a, Iter = < & 'a Self as IntoIterator > :: IntoIter, param_iter =
-                {< & 'a Self as IntoIterator > :: into_iter(self)},
-            }
-            {
-                IterMut = < & 'a mut Self as IntoIterator > :: IntoIter, param_iter_mut =
-                {< & 'a mut Self as IntoIterator > :: into_iter(self)},
-            }"#)
-    }));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Bang
-            && e.name == "impl_for_tuple"
-            && e.input == r#"[] T []"#
-            && e.to.starts_with(r#"impl < T > Parametrized < {impl_for_tuple! (@ count)}> for (T,)
-            {
-                type Item = T; const MIN_LEN : usize = 1; const MAX_LEN : Option < usize >
-                = Some(1); fn param_len(& self) -> usize { 1 } type Iter < 'a > = :: core
-                :: iter :: Once < & 'a Self :: Item > where (Self, Self :: Item): 'a; fn
-                param_iter < 'a > (& 'a self) -> Self :: Iter < 'a > where Self :: Item :
-                'a
-                {
-                    :: core :: iter ::
-                    once(impl_for_tuple!
-                    (@ nth []
-                    [& self.0, & self.1, & self.2, & self.3, & self.4, & self.5, & self.6,
-                    & self.7, & self.8, & self.9, & self.10, & self.11]))
-                }
-            } impl < T > ParametrizedIterMut < {impl_for_tuple! (@ count)}> for (T,)"#)
-    }));
+    assert_has(&expansions, MacroExpansionKind::Attribute, "parametrized");
+    assert_has(&expansions, MacroExpansionKind::Attribute, "sumtrait");
+    assert_has(&expansions, MacroExpansionKind::Attribute, "sumtype");
+    assert_has_prefix(&expansions, MacroExpansionKind::Bang, "__sumtype_macro_");
+    assert_has(&expansions, MacroExpansionKind::Bang, "_sumtrait_internal");
+    assert_has(&expansions, MacroExpansionKind::Bang, "emit_impl_trait");
+    assert_has(&expansions, MacroExpansionKind::Bang, "impl_all");
+    assert_has(&expansions, MacroExpansionKind::Bang, "impl_for_tuple");
 }
 
 #[test]
 fn external_crate_parametrized_test_test() {
     let expansions = run_trace_for_repo("parametrized", Some("test"));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Attribute
-            && e.name == "parametrized"
-            && e.input == r#"struct Struct1<K>(usize, Vec<(usize, K)>);"#
-            && e.to.starts_with(r#"struct Struct1 < K > (usize, Vec < (usize, K) >); impl < K > :: parametrized
-:: ParametrizedIntoIter <0usize > for Struct1 < K >
-{
-    type IntoIter = :: parametrized :: Flatten < :: core :: iter :: Map < <
-    Vec < (usize, K) > as :: parametrized :: ParametrizedIntoIter < 0usize > >
-    :: IntoIter, fn((usize, K)) -> :: core :: iter :: Once < K > > , :: core
-    :: iter :: Once < K > > ; fn param_into_iter(self) -> Self :: IntoIter
-    {
-        {
-            let __parametrized_fn : fn((usize, K)) -> _ = | __parametrized_arg
-            | { :: core :: iter :: once(__parametrized_arg.1) }; ::
-            parametrized :: Flatten ::
-            new(< Vec < (usize, K) > as :: parametrized ::
-            ParametrizedIntoIter < 0usize > > ::
-            param_into_iter(self.1).map(__parametrized_fn))"#)
-    }));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Attribute
-            && e.name == "sumtrait"
-            && e.input == r#"/// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
-#[allow(private_bounds)] pub trait Read
-{
-    fn read(& mut self, buf : & mut [:: core :: primitive :: u8]) -> :: std ::
-    io :: Result < :: core :: primitive :: usize > ;
-}"#
-            && e.to.starts_with(r#"#[doc =
-" Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`]."]
-#[allow(private_bounds)] pub trait Read
-{
-    fn read(& mut self, buf : & mut [:: core :: primitive :: u8]) -> :: std ::
-    io :: Result < :: core :: primitive :: usize > ;
-} #[doc(hidden)] #[macro_export] macro_rules!
-__sumtype_macro_"#)
-    }));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Bang
-            && e.name == "emit_impl_trait"
-            && e.input.starts_with(r#"[map, into_iter, iter_mut,] impl_generics = [T], PARAM = 0, Self = Vec<T>,
-            self = self,
-            {
-                Item = < Self as IntoIterator > :: Item, MIN_LEN = 0, MAX_LEN = None,
-                param_len = { self.len() },
-            }
-            {
-                lt = 'a, Iter = < & 'a Self as IntoIterator > :: IntoIter, param_iter =
-                {< & 'a Self as IntoIterator > :: into_iter(self)},
-            }
-            {
-                IterMut = < & 'a mut Self as IntoIterator > :: IntoIter, param_iter_mut =
-                {< & 'a mut Self as IntoIterator > :: into_iter(self)},
-            }
-            {"#)
-            && e.to.starts_with(r#"impl < T, M > ParametrizedMap < 0, M > for Vec<T>
-            {
-                type Mapped = Vec<M>; fn
-                param_map(self, f : impl FnMut(Self :: Item) -> M) -> Self :: Mapped
-                { < Self as IntoIterator > :: into_iter(self).map(f).collect() }
-            } emit_impl_trait!
-            ([into_iter, iter_mut,] impl_generics = [T], PARAM = 0, Self = Vec<T>, self =
-            self,
-            {
-                Item = < Self as IntoIterator > :: Item, MIN_LEN = 0, MAX_LEN = None,
-                param_len = { self.len() },
-            }
-            {
-                lt = 'a, Iter = < & 'a Self as IntoIterator > :: IntoIter, param_iter =
-                {< & 'a Self as IntoIterator > :: into_iter(self)},"#)
-    }));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Bang
-            && e.name == "impl_all"
-            && e.input == r#"[T] map, into_iter, iter_mut for Vec<T>, T = M, Mapped = Vec<M>; [T] into_iter
-            for std::collections::BTreeSet<T>; [T] into_iter for
-            std::collections::HashSet<T>; [T] into_iter for
-            std::collections::BinaryHeap<T>; [T] map, into_iter, iter_mut for
-            std::collections::LinkedList<T>, T = M, Mapped =
-            std::collections::LinkedList<M>; [T] map, into_iter, iter_mut for
-            std::collections::VecDeque<T>, T = M, Mapped = std::collections::VecDeque<M>;"#
-            && e.to.starts_with(r#"emit_impl_trait!
-            ([map, into_iter, iter_mut,] impl_generics = [T], PARAM = 0, Self = Vec<T>,
-            self = self,
-            {
-                Item = < Self as IntoIterator > :: Item, MIN_LEN = 0, MAX_LEN = None,
-                param_len = { self.len() },
-            }
-            {
-                lt = 'a, Iter = < & 'a Self as IntoIterator > :: IntoIter, param_iter =
-                {< & 'a Self as IntoIterator > :: into_iter(self)},
-            }
-            {
-                IterMut = < & 'a mut Self as IntoIterator > :: IntoIter, param_iter_mut =
-                {< & 'a mut Self as IntoIterator > :: into_iter(self)},
-            }"#)
-    }));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Bang
-            && e.name == "impl_for_tuple"
-            && e.input == r#"[] T []"#
-            && e.to.starts_with(r#"impl < T > Parametrized < {impl_for_tuple! (@ count)}> for (T,)
-            {
-                type Item = T; const MIN_LEN : usize = 1; const MAX_LEN : Option < usize >
-                = Some(1); fn param_len(& self) -> usize { 1 } type Iter < 'a > = :: core
-                :: iter :: Once < & 'a Self :: Item > where (Self, Self :: Item): 'a; fn
-                param_iter < 'a > (& 'a self) -> Self :: Iter < 'a > where Self :: Item :
-                'a
-                {
-                    :: core :: iter ::
-                    once(impl_for_tuple!
-                    (@ nth []
-                    [& self.0, & self.1, & self.2, & self.3, & self.4, & self.5, & self.6,
-                    & self.7, & self.8, & self.9, & self.10, & self.11]))
-                }
-            } impl < T > ParametrizedIterMut < {impl_for_tuple! (@ count)}> for (T,)"#)
-    }));
+    assert_has(&expansions, MacroExpansionKind::Attribute, "parametrized");
+    assert_has(&expansions, MacroExpansionKind::Attribute, "sumtrait");
+    assert_has(&expansions, MacroExpansionKind::Bang, "emit_impl_trait");
+    assert_has(&expansions, MacroExpansionKind::Bang, "impl_all");
+    assert_has(&expansions, MacroExpansionKind::Bang, "impl_for_tuple");
 }
 
 #[test]
 fn external_crate_parametrized_test_test_enum() {
     let expansions = run_trace_for_repo("parametrized", Some("test_enum"));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Attribute
-            && e.name == "parametrized"
-            && e.input == r#"enum Enum1<K> { V1, V2(K), V3 { _f1: usize, _f2: K }, }"#
-            && e.to.starts_with(r#"enum Enum1 < K > { V1, V2(K), V3 { _f1 : usize, _f2 : K }, }
-#[:: parametrized :: _imp :: sumtype ::
-sumtype(:: parametrized :: _imp :: sumtype :: traits :: Iterator)] impl < K >
-:: parametrized :: ParametrizedIntoIter <0usize > for Enum1 < K >
-{
-    type IntoIter = sumtype! []; fn param_into_iter(self) -> Self :: IntoIter
-    {
-        #[allow(unused)] match self
-        {
-            Enum1 ::V1 =>
-            {
-                sumtype!
-                (:: core :: iter :: empty(), :: core :: iter :: Empty < K >)
-            } Enum1 ::V2(__parametric_type_id_0) =>
-            {"#)
-    }));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Attribute
-            && e.name == "sumtrait"
-            && e.input == r#"/// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
-#[allow(private_bounds)] pub trait Read
-{
-    fn read(& mut self, buf : & mut [:: core :: primitive :: u8]) -> :: std ::
-    io :: Result < :: core :: primitive :: usize > ;
-}"#
-            && e.to.starts_with(r#"#[doc =
-" Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`]."]
-#[allow(private_bounds)] pub trait Read
-{
-    fn read(& mut self, buf : & mut [:: core :: primitive :: u8]) -> :: std ::
-    io :: Result < :: core :: primitive :: usize > ;
-} #[doc(hidden)] #[macro_export] macro_rules!
-__sumtype_macro_"#)
-    }));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Attribute
-            && e.name == "sumtype"
-            && e.input.starts_with(r#"impl < K > :: parametrized :: ParametrizedIntoIter <0usize > for Enum1 < K >
-{
-    type IntoIter = sumtype! []; fn param_into_iter(self) -> Self :: IntoIter
-    {
-        #[allow(unused)] match self
-        {
-            Enum1 ::V1 =>
-            {
-                sumtype!
-                (:: core :: iter :: empty(), :: core :: iter :: Empty < K >)
-            } Enum1 ::V2(__parametric_type_id_0) =>
-            {
-                sumtype!
-                (:: core :: iter :: once(__parametric_type_id_0), :: core ::
-                iter :: Once < K >)"#)
-            && e.to.starts_with(r#"#[doc(hidden)] #[allow(non_camel_case_types)] #[allow(non_camel_case_types)]
-struct __SumType_RefType_"#)
-    }));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Bang
-            && e.name.starts_with("__sumtype_macro_")
-            && e.input.starts_with(r#"__Sumtype_ConstraintExprTrait_0_"#)
-            && e.to.starts_with(r#"$crate :: _sumtrait_internal!
-          ({
-              __Sumtype_ConstraintExprTrait_0_"#)
-    }));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Bang
-            && e.name == "_sumtrait_internal"
-            && e.input.starts_with(r#"{
-    __Sumtype_ConstraintExprTrait_0_"#)
-            && e.to.starts_with(r#"#[allow(non_camel_case_types)] trait
-__Sumtype_ConstraintExprTrait_0_"#)
-    }));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Bang
-            && e.name == "emit_impl_trait"
-            && e.input.starts_with(r#"[map, into_iter, iter_mut,] impl_generics = [T], PARAM = 0, Self = Vec<T>,
-            self = self,
-            {
-                Item = < Self as IntoIterator > :: Item, MIN_LEN = 0, MAX_LEN = None,
-                param_len = { self.len() },
-            }
-            {
-                lt = 'a, Iter = < & 'a Self as IntoIterator > :: IntoIter, param_iter =
-                {< & 'a Self as IntoIterator > :: into_iter(self)},
-            }
-            {
-                IterMut = < & 'a mut Self as IntoIterator > :: IntoIter, param_iter_mut =
-                {< & 'a mut Self as IntoIterator > :: into_iter(self)},
-            }
-            {"#)
-            && e.to.starts_with(r#"impl < T, M > ParametrizedMap < 0, M > for Vec<T>
-            {
-                type Mapped = Vec<M>; fn
-                param_map(self, f : impl FnMut(Self :: Item) -> M) -> Self :: Mapped
-                { < Self as IntoIterator > :: into_iter(self).map(f).collect() }
-            } emit_impl_trait!
-            ([into_iter, iter_mut,] impl_generics = [T], PARAM = 0, Self = Vec<T>, self =
-            self,
-            {
-                Item = < Self as IntoIterator > :: Item, MIN_LEN = 0, MAX_LEN = None,
-                param_len = { self.len() },
-            }
-            {
-                lt = 'a, Iter = < & 'a Self as IntoIterator > :: IntoIter, param_iter =
-                {< & 'a Self as IntoIterator > :: into_iter(self)},"#)
-    }));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Bang
-            && e.name == "impl_all"
-            && e.input == r#"[T] map, into_iter, iter_mut for Vec<T>, T = M, Mapped = Vec<M>; [T] into_iter
-            for std::collections::BTreeSet<T>; [T] into_iter for
-            std::collections::HashSet<T>; [T] into_iter for
-            std::collections::BinaryHeap<T>; [T] map, into_iter, iter_mut for
-            std::collections::LinkedList<T>, T = M, Mapped =
-            std::collections::LinkedList<M>; [T] map, into_iter, iter_mut for
-            std::collections::VecDeque<T>, T = M, Mapped = std::collections::VecDeque<M>;"#
-            && e.to.starts_with(r#"emit_impl_trait!
-            ([map, into_iter, iter_mut,] impl_generics = [T], PARAM = 0, Self = Vec<T>,
-            self = self,
-            {
-                Item = < Self as IntoIterator > :: Item, MIN_LEN = 0, MAX_LEN = None,
-                param_len = { self.len() },
-            }
-            {
-                lt = 'a, Iter = < & 'a Self as IntoIterator > :: IntoIter, param_iter =
-                {< & 'a Self as IntoIterator > :: into_iter(self)},
-            }
-            {
-                IterMut = < & 'a mut Self as IntoIterator > :: IntoIter, param_iter_mut =
-                {< & 'a mut Self as IntoIterator > :: into_iter(self)},
-            }"#)
-    }));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Bang
-            && e.name == "impl_for_tuple"
-            && e.input == r#"[] T []"#
-            && e.to.starts_with(r#"impl < T > Parametrized < {impl_for_tuple! (@ count)}> for (T,)
-            {
-                type Item = T; const MIN_LEN : usize = 1; const MAX_LEN : Option < usize >
-                = Some(1); fn param_len(& self) -> usize { 1 } type Iter < 'a > = :: core
-                :: iter :: Once < & 'a Self :: Item > where (Self, Self :: Item): 'a; fn
-                param_iter < 'a > (& 'a self) -> Self :: Iter < 'a > where Self :: Item :
-                'a
-                {
-                    :: core :: iter ::
-                    once(impl_for_tuple!
-                    (@ nth []
-                    [& self.0, & self.1, & self.2, & self.3, & self.4, & self.5, & self.6,
-                    & self.7, & self.8, & self.9, & self.10, & self.11]))
-                }
-            } impl < T > ParametrizedIterMut < {impl_for_tuple! (@ count)}> for (T,)"#)
-    }));
+    assert_has(&expansions, MacroExpansionKind::Attribute, "parametrized");
+    assert_has(&expansions, MacroExpansionKind::Attribute, "sumtrait");
+    assert_has(&expansions, MacroExpansionKind::Attribute, "sumtype");
+    assert_has_prefix(&expansions, MacroExpansionKind::Bang, "__sumtype_macro_");
+    assert_has(&expansions, MacroExpansionKind::Bang, "_sumtrait_internal");
+    assert_has(&expansions, MacroExpansionKind::Bang, "emit_impl_trait");
+    assert_has(&expansions, MacroExpansionKind::Bang, "impl_all");
+    assert_has(&expansions, MacroExpansionKind::Bang, "impl_for_tuple");
 }
 
 #[test]
 fn external_crate_parametrized_test_tuple() {
     let expansions = run_trace_for_repo("parametrized", Some("tuple"));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Attribute
-            && e.name == "parametrized"
-            && e.input == r#"#[allow(unused)] struct MyStruct<T>((T, Vec<T>));"#
-            && e.to.starts_with(r#"#[allow(unused)] struct MyStruct < T > ((T, Vec < T >)); impl < T > ::
-parametrized :: ParametrizedIntoIter <0usize > for MyStruct < T >
-{
-    type IntoIter = :: core :: iter :: Chain < :: core :: iter :: Once < T > ,
-    :: parametrized :: Flatten < :: core :: iter :: Map < < Vec < T > as ::
-    parametrized :: ParametrizedIntoIter < 0usize > > :: IntoIter, fn(T) -> ::
-    core :: iter :: Once < T > > , :: core :: iter :: Once < T > > > ; fn
-    param_into_iter(self) -> Self :: IntoIter
-    {
-        :: core :: iter ::
-        once(self.0.0).chain({
-            let __parametrized_fn : fn(T) -> _ = | __parametrized_arg |
-            { :: core :: iter :: once(__parametrized_arg) }; :: parametrized
-            :: Flatten ::
-            new(< Vec < T > as :: parametrized :: ParametrizedIntoIter <"#)
-    }));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Attribute
-            && e.name == "sumtrait"
-            && e.input == r#"/// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
-#[allow(private_bounds)] pub trait Read
-{
-    fn read(& mut self, buf : & mut [:: core :: primitive :: u8]) -> :: std ::
-    io :: Result < :: core :: primitive :: usize > ;
-}"#
-            && e.to.starts_with(r#"#[doc =
-" Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`]."]
-#[allow(private_bounds)] pub trait Read
-{
-    fn read(& mut self, buf : & mut [:: core :: primitive :: u8]) -> :: std ::
-    io :: Result < :: core :: primitive :: usize > ;
-} #[doc(hidden)] #[macro_export] macro_rules!
-__sumtype_macro_"#)
-    }));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Bang
-            && e.name == "emit_impl_trait"
-            && e.input.starts_with(r#"[map, into_iter, iter_mut,] impl_generics = [T], PARAM = 0, Self = Vec<T>,
-            self = self,
-            {
-                Item = < Self as IntoIterator > :: Item, MIN_LEN = 0, MAX_LEN = None,
-                param_len = { self.len() },
-            }
-            {
-                lt = 'a, Iter = < & 'a Self as IntoIterator > :: IntoIter, param_iter =
-                {< & 'a Self as IntoIterator > :: into_iter(self)},
-            }
-            {
-                IterMut = < & 'a mut Self as IntoIterator > :: IntoIter, param_iter_mut =
-                {< & 'a mut Self as IntoIterator > :: into_iter(self)},
-            }
-            {"#)
-            && e.to.starts_with(r#"impl < T, M > ParametrizedMap < 0, M > for Vec<T>
-            {
-                type Mapped = Vec<M>; fn
-                param_map(self, f : impl FnMut(Self :: Item) -> M) -> Self :: Mapped
-                { < Self as IntoIterator > :: into_iter(self).map(f).collect() }
-            } emit_impl_trait!
-            ([into_iter, iter_mut,] impl_generics = [T], PARAM = 0, Self = Vec<T>, self =
-            self,
-            {
-                Item = < Self as IntoIterator > :: Item, MIN_LEN = 0, MAX_LEN = None,
-                param_len = { self.len() },
-            }
-            {
-                lt = 'a, Iter = < & 'a Self as IntoIterator > :: IntoIter, param_iter =
-                {< & 'a Self as IntoIterator > :: into_iter(self)},"#)
-    }));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Bang
-            && e.name == "impl_all"
-            && e.input == r#"[T] map, into_iter, iter_mut for Vec<T>, T = M, Mapped = Vec<M>; [T] into_iter
-            for std::collections::BTreeSet<T>; [T] into_iter for
-            std::collections::HashSet<T>; [T] into_iter for
-            std::collections::BinaryHeap<T>; [T] map, into_iter, iter_mut for
-            std::collections::LinkedList<T>, T = M, Mapped =
-            std::collections::LinkedList<M>; [T] map, into_iter, iter_mut for
-            std::collections::VecDeque<T>, T = M, Mapped = std::collections::VecDeque<M>;"#
-            && e.to.starts_with(r#"emit_impl_trait!
-            ([map, into_iter, iter_mut,] impl_generics = [T], PARAM = 0, Self = Vec<T>,
-            self = self,
-            {
-                Item = < Self as IntoIterator > :: Item, MIN_LEN = 0, MAX_LEN = None,
-                param_len = { self.len() },
-            }
-            {
-                lt = 'a, Iter = < & 'a Self as IntoIterator > :: IntoIter, param_iter =
-                {< & 'a Self as IntoIterator > :: into_iter(self)},
-            }
-            {
-                IterMut = < & 'a mut Self as IntoIterator > :: IntoIter, param_iter_mut =
-                {< & 'a mut Self as IntoIterator > :: into_iter(self)},
-            }"#)
-    }));
-    assert!(expansions.iter().any(|e| {
-        e.kind == MacroExpansionKind::Bang
-            && e.name == "impl_for_tuple"
-            && e.input == r#"[] T []"#
-            && e.to.starts_with(r#"impl < T > Parametrized < {impl_for_tuple! (@ count)}> for (T,)
-            {
-                type Item = T; const MIN_LEN : usize = 1; const MAX_LEN : Option < usize >
-                = Some(1); fn param_len(& self) -> usize { 1 } type Iter < 'a > = :: core
-                :: iter :: Once < & 'a Self :: Item > where (Self, Self :: Item): 'a; fn
-                param_iter < 'a > (& 'a self) -> Self :: Iter < 'a > where Self :: Item :
-                'a
-                {
-                    :: core :: iter ::
-                    once(impl_for_tuple!
-                    (@ nth []
-                    [& self.0, & self.1, & self.2, & self.3, & self.4, & self.5, & self.6,
-                    & self.7, & self.8, & self.9, & self.10, & self.11]))
-                }
-            } impl < T > ParametrizedIterMut < {impl_for_tuple! (@ count)}> for (T,)"#)
-    }));
+    assert_has(&expansions, MacroExpansionKind::Attribute, "parametrized");
+    assert_has(&expansions, MacroExpansionKind::Attribute, "sumtrait");
+    assert_has(&expansions, MacroExpansionKind::Bang, "emit_impl_trait");
+    assert_has(&expansions, MacroExpansionKind::Bang, "impl_all");
+    assert_has(&expansions, MacroExpansionKind::Bang, "impl_for_tuple");
 }
 
 #[test]

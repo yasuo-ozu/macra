@@ -80,14 +80,16 @@ fn run_show_expansion_test_usage() -> Vec<MacroExpansion> {
         .iter
         .collect::<std::io::Result<Vec<_>>>()
         .expect("trace macro collection failed");
-    let check_success = run
-        .check_success
+    let check_result = run
+        .check_result
         .recv()
         .expect("failed to receive cargo check status")
         .expect("failed to wait cargo check status");
     assert!(
-        check_success,
-        "cargo check failed while collecting macro expansions"
+        check_result.success,
+        "cargo check failed while collecting macro expansions\nstdout:\n{}\nstderr:\n{}",
+        check_result.stdout,
+        check_result.stderr
     );
     expansions
 }
