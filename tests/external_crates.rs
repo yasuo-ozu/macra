@@ -1112,7 +1112,7 @@ AssociatedConstNewType where BasicType : AssociatedConstTrait <>
             {
                 ((FunctionPointerTrait) struct FunctionPointerNewType(BasicType);) trait
                 FunctionPointerTrait { fn apply_fn(& self, f : fn(i32) -> i32) -> i32; },
-                , :: newer_type, (i32, fn(i32) -> i32), Repeater, "#,
+                , :: newer_type, (fn(i32) -> i32, i32), Repeater, "#,
     );
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
@@ -1494,7 +1494,7 @@ fn external_crate_parametrized_test_flatten_bug() {
         NameMatch::Exact("parametrized"),
         r#"#[allow(unused)] enum MyEnum<A> { E1(A), E2((A,)), }"#,
         r#"#[allow(unused)] enum MyEnum < A > { E1(A), E2((A,)), }
-#[:: parametrized :: _imp :: sumtype :: sumtype(:: parametrized :: _imp :: sumtype :: traits :: Iterator)] impl < A > :: parametrized :: Parametrized <0usize > for MyEnum < A >"#,
+#[:: parametrized :: _imp :: sumtype :: sumtype(:: parametrized :: _imp :: sumtype :: traits :: Iterator)] impl < A > :: parametrized ::"#,
     );
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute

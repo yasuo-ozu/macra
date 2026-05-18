@@ -349,10 +349,18 @@ unsafe extern "system" fn hooked_load_library_ex_w(
     h_file: windows_sys::Win32::Foundation::HANDLE,
     dw_flags: u32,
 ) -> windows_sys::Win32::Foundation::HMODULE {
+    // Flags that produce pseudo-handles (data-file or image-resource mappings)
+    // where the returned HMODULE is not a real module base address.
+    const LOAD_LIBRARY_AS_DATAFILE: u32 = 0x00000002;
+    const LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE: u32 = 0x00000040;
+    const LOAD_LIBRARY_AS_IMAGE_RESOURCE: u32 = 0x00000020;
+    const PSEUDO_HANDLE_FLAGS: u32 =
+        LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE | LOAD_LIBRARY_AS_IMAGE_RESOURCE;
+
     let real_fn_ptr = REAL_LOAD_LIBRARY_EX_W.load(Ordering::Acquire);
     let real: LoadLibraryExWFn = unsafe { std::mem::transmute(real_fn_ptr) };
     let result = unsafe { real(lp_lib_file_name, h_file, dw_flags) };
-    if !result.is_null() {
+    if !result.is_null() && (dw_flags & PSEUDO_HANDLE_FLAGS) == 0 {
         unsafe { patch_module_iat(result as *const u8) };
     }
     result
