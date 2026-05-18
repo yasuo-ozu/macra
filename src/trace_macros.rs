@@ -4,6 +4,7 @@ use std::process::ExitStatus;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
+#[cfg(target_os = "macos")]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::parse_trace::{MacroExpansion, MacroExpansionKind, parse_trace};
@@ -74,7 +75,6 @@ impl Iterator for MacroExpansionIter {
 }
 
 const HOOK_LINE_PREFIX: &str = "__MACRA_HOOK__:";
-static HOOK_OUTPUT_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "macos")]
 static LINKER_WRAPPER_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -172,7 +172,7 @@ impl TraceMacros {
         cmd.env("RUSTFLAGS", rustflags);
 
         // Set up macra-hook via LD_PRELOAD if available
-        let hook_output_dir = if !self.args.hook_lib.as_os_str().is_empty() {
+        if !self.args.hook_lib.as_os_str().is_empty() {
             let lib = self
                 .args
                 .hook_lib
@@ -204,34 +204,19 @@ impl TraceMacros {
                 cmd.env("LD_PRELOAD", &lib);
             }
 
-            // On Windows, direct hook output to per-process files in a temp
-            // directory.  The RUSTC_WRAPPER approach on Windows cannot easily
-            // share a stderr pipe, so file-based output is required.
-            // On Linux/macOS, the hook writes to stderr (via LD_PRELOAD /
-            // DYLD_INSERT_LIBRARIES) which the parent captures directly.
-            // Using file-based output on Linux was found to interfere with
-            // proc macro capture reliability.
-            let dir = if cfg!(target_os = "windows") {
-                let seq = HOOK_OUTPUT_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
-                let d = std::env::temp_dir().join(format!(
-                    "macra-hook-output-{}-{}-{}",
-                    std::process::id(),
-                    seq,
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_nanos())
-                        .unwrap_or(0)
-                ));
-                let _ = std::fs::create_dir_all(&d);
-                cmd.env("MACRA_HOOK_OUTPUT_DIR", &d);
-                Some(d)
-            } else {
-                None
-            };
-            dir
-        } else {
-            None
-        };
+            // All platforms use stderr for hook output.  The hook library
+            // writes JSON lines to stderr with a `__MACRA_HOOK__:` prefix.
+            // Cargo caches and replays stderr diagnostics for "Fresh" crates,
+            // so hook output from previously-compiled dependencies is
+            // automatically available even when cargo skips recompilation.
+            // This is critical because parallel tests share a target directory
+            // and only the first test to compile a dependency crate triggers
+            // actual rustc invocations.
+            //
+            // On Windows (RUSTC_WRAPPER), rustc inherits the wrapper's stderr
+            // handle via bInheritHandles=TRUE in CreateProcessW, so hook
+            // output reaches cargo's stderr pipe just like on Linux/macOS.
+        }
 
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
@@ -296,26 +281,6 @@ impl TraceMacros {
             // Wait for stdout draining and child process to finish
             let stdout_buf = stdout_thread.join().unwrap_or_default();
             let wait_result: io::Result<ExitStatus> = child.wait();
-
-            // Read hook output from the per-process files written by the hook
-            // library.  Each rustc process writes to {pid}.jsonl.
-            if let Some(ref dir) = hook_output_dir {
-                if let Ok(entries) = std::fs::read_dir(dir) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.extension().is_some_and(|e| e == "jsonl") {
-                            if let Ok(contents) = std::fs::read_to_string(&path) {
-                                for line in contents.lines() {
-                                    if let Some(expansion) = parse_hook_json(line) {
-                                        let _ = tx.send(Ok(expansion));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                let _ = std::fs::remove_dir_all(dir);
-            }
 
             // Parse plain-text trace-macros output from stderr and stdout.
             for group in parse_trace(stderr_buf.as_bytes()) {
