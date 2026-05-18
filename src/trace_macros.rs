@@ -4,7 +4,6 @@ use std::process::ExitStatus;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
-#[cfg(target_os = "macos")]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::parse_trace::{MacroExpansion, MacroExpansionKind, parse_trace};
@@ -75,6 +74,7 @@ impl Iterator for MacroExpansionIter {
 }
 
 const HOOK_LINE_PREFIX: &str = "__MACRA_HOOK__:";
+static HOOK_OUTPUT_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "macos")]
 static LINKER_WRAPPER_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -207,9 +207,13 @@ impl TraceMacros {
             // Direct hook output to per-process files in a temp directory
             // instead of stderr, avoiding pipe-buffer atomicity issues when
             // multiple concurrent rustc processes write large JSON lines.
+            // Use an atomic counter to guarantee unique dir names when
+            // multiple tests run in parallel within the same process.
+            let seq = HOOK_OUTPUT_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
             let dir = std::env::temp_dir().join(format!(
-                "macra-hook-output-{}-{}",
+                "macra-hook-output-{}-{}-{}",
                 std::process::id(),
+                seq,
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_nanos())
