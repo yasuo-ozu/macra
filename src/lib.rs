@@ -4,6 +4,46 @@ pub mod parse_normal;
 pub mod parse_trace;
 pub mod trace_macros;
 
+/// Normalize token-like text for resilient comparisons.
+///
+/// - Removes spaces adjacent to punctuation (e.g., `a :: b` -> `a::b`)
+/// - Collapses remaining whitespace to a single space
+/// - Normalizes bracket types (`{}`, `[]` -> `()`)
+pub fn normalize_tokens(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut result = String::with_capacity(chars.len());
+
+    fn is_punct(c: char) -> bool {
+        !c.is_alphanumeric() && c != '_' && c != '"' && c != '\'' && !c.is_whitespace()
+    }
+
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_whitespace() {
+            let prev = result.chars().last();
+            while i < chars.len() && chars[i].is_whitespace() {
+                i += 1;
+            }
+            let next = chars.get(i).copied();
+            let prev_is_punct = prev.map_or(true, is_punct);
+            let next_is_punct = next.map_or(true, is_punct);
+            if !prev_is_punct && !next_is_punct {
+                result.push(' ');
+            }
+        } else {
+            match c {
+                '{' | '[' => result.push('('),
+                '}' | ']' => result.push(')'),
+                _ => result.push(c),
+            }
+            i += 1;
+        }
+    }
+
+    result
+}
+
 #[cfg(target_os = "macos")]
 const HOOK_LIB_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/libmacra_hook.dylib"));

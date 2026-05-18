@@ -4,6 +4,8 @@ use std::process::ExitStatus;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
+#[cfg(target_os = "macos")]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::parse_trace::{MacroExpansion, MacroExpansionKind, parse_trace};
 
@@ -73,6 +75,8 @@ impl Iterator for MacroExpansionIter {
 }
 
 const HOOK_LINE_PREFIX: &str = "__MACRA_HOOK__:";
+#[cfg(target_os = "macos")]
+static LINKER_WRAPPER_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(serde::Deserialize)]
 struct HookRecord {
@@ -176,6 +180,14 @@ impl TraceMacros {
                 .unwrap_or_else(|_| self.args.hook_lib.clone());
             if cfg!(target_os = "macos") {
                 cmd.env("DYLD_INSERT_LIBRARIES", &lib);
+                // DYLD_INSERT_LIBRARIES propagates into the linker process (cc),
+                // which can fail due to arch constraints on newer macOS runners.
+                // Route linker invocations through a tiny wrapper that unsets DYLD.
+                #[cfg(target_os = "macos")]
+                if let Ok(wrapper) = create_macos_linker_wrapper() {
+                    cmd.env("CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER", &wrapper);
+                    cmd.env("CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER", &wrapper);
+                }
             } else {
                 cmd.env("LD_PRELOAD", &lib);
             }
@@ -276,6 +288,24 @@ impl TraceMacros {
             check_result: status_rx,
         })
     }
+}
+
+#[cfg(target_os = "macos")]
+fn create_macos_linker_wrapper() -> io::Result<PathBuf> {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let unique = LINKER_WRAPPER_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "cargo-macra-linker-wrapper-{}-{}.sh",
+        std::process::id(),
+        unique
+    ));
+
+    let script = "#!/bin/sh\nunset DYLD_INSERT_LIBRARIES\nexec /usr/bin/cc \"$@\"\n";
+    fs::write(&path, script)?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+    Ok(path)
 }
 
 #[cfg(test)]

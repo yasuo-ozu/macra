@@ -141,48 +141,6 @@ impl ExpansionCache {
         Self { inner }
     }
 
-    /// Normalize tokens for comparison.
-    ///
-    /// - Removes spaces adjacent to punctuation (e.g., `a :: b` → `a::b`)
-    /// - Collapses remaining whitespace to single space
-    /// - Normalizes bracket types (`{}`, `[]` → `()`)
-    fn normalize_tokens(s: &str) -> String {
-        let chars: Vec<char> = s.chars().collect();
-        let mut result = String::with_capacity(chars.len());
-
-        fn is_punct(c: char) -> bool {
-            !c.is_alphanumeric() && c != '_' && c != '"' && c != '\'' && !c.is_whitespace()
-        }
-
-        let mut i = 0;
-        while i < chars.len() {
-            let c = chars[i];
-            if c.is_whitespace() {
-                // Look at prev (non-whitespace) and next (non-whitespace) to decide
-                let prev = result.chars().last();
-                // Skip all whitespace
-                while i < chars.len() && chars[i].is_whitespace() {
-                    i += 1;
-                }
-                let next = chars.get(i).copied();
-                // Drop space if adjacent to punctuation on either side
-                let prev_is_punct = prev.map_or(true, is_punct);
-                let next_is_punct = next.map_or(true, is_punct);
-                if !prev_is_punct && !next_is_punct {
-                    result.push(' ');
-                }
-            } else {
-                match c {
-                    '{' | '[' => result.push('('),
-                    '}' | ']' => result.push(')'),
-                    _ => result.push(c),
-                }
-                i += 1;
-            }
-        }
-        result
-    }
-
     /// Convert MacroKind to MacroExpansionKind for comparison.
     fn to_expansion_kind(kind: MacroKind) -> MacroExpansionKind {
         match kind {
@@ -223,12 +181,13 @@ impl ExpansionCache {
                 || (exp.kind == MacroExpansionKind::Bang
                     && exp.expanding.trim_end().ends_with('!'))
         } else {
-            Self::normalize_tokens(&exp.input) == Self::normalize_tokens(input)
+            cargo_macra::normalize_tokens(&exp.input) == cargo_macra::normalize_tokens(input)
         };
         name_matches
             && exp.kind == Self::to_expansion_kind(kind)
             && input_matches
-            && Self::normalize_tokens(&exp.arguments) == Self::normalize_tokens(arguments)
+            && cargo_macra::normalize_tokens(&exp.arguments)
+                == cargo_macra::normalize_tokens(arguments)
     }
 
     /// Search cached expansions for a matching trace. Returns the index if found.
