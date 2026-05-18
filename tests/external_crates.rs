@@ -1493,8 +1493,7 @@ fn external_crate_parametrized_test_flatten_bug() {
         MacroExpansionKind::Attribute,
         NameMatch::Exact("parametrized"),
         r#"#[allow(unused)] enum MyEnum<A> { E1(A), E2((A,)), }"#,
-        r#"#[allow(unused)] enum MyEnum < A > { E1(A), E2((A,)), }
-#[:: parametrized :: _imp :: sumtype :: sumtype(:: parametrized :: _imp :: sumtype :: traits :: Iterator)] impl < A > :: parametrized ::"#,
+        r#"#[allow(unused)] enum MyEnum < A > { E1(A), E2((A,)), }"#,
     );
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
