@@ -204,24 +204,31 @@ impl TraceMacros {
                 cmd.env("LD_PRELOAD", &lib);
             }
 
-            // Direct hook output to per-process files in a temp directory
-            // instead of stderr, avoiding pipe-buffer atomicity issues when
-            // multiple concurrent rustc processes write large JSON lines.
-            // Use an atomic counter to guarantee unique dir names when
-            // multiple tests run in parallel within the same process.
-            let seq = HOOK_OUTPUT_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let dir = std::env::temp_dir().join(format!(
-                "macra-hook-output-{}-{}-{}",
-                std::process::id(),
-                seq,
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0)
-            ));
-            let _ = std::fs::create_dir_all(&dir);
-            cmd.env("MACRA_HOOK_OUTPUT_DIR", &dir);
-            Some(dir)
+            // On Windows, direct hook output to per-process files in a temp
+            // directory.  The RUSTC_WRAPPER approach on Windows cannot easily
+            // share a stderr pipe, so file-based output is required.
+            // On Linux/macOS, the hook writes to stderr (via LD_PRELOAD /
+            // DYLD_INSERT_LIBRARIES) which the parent captures directly.
+            // Using file-based output on Linux was found to interfere with
+            // proc macro capture reliability.
+            let dir = if cfg!(target_os = "windows") {
+                let seq = HOOK_OUTPUT_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let d = std::env::temp_dir().join(format!(
+                    "macra-hook-output-{}-{}-{}",
+                    std::process::id(),
+                    seq,
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0)
+                ));
+                let _ = std::fs::create_dir_all(&d);
+                cmd.env("MACRA_HOOK_OUTPUT_DIR", &d);
+                Some(d)
+            } else {
+                None
+            };
+            dir
         } else {
             None
         };
@@ -293,32 +300,20 @@ impl TraceMacros {
             // Read hook output from the per-process files written by the hook
             // library.  Each rustc process writes to {pid}.jsonl.
             if let Some(ref dir) = hook_output_dir {
-                let mut hook_file_count = 0u32;
-                let mut hook_line_count = 0u32;
-                let mut hook_expansion_count = 0u32;
                 if let Ok(entries) = std::fs::read_dir(dir) {
                     for entry in entries.flatten() {
                         let path = entry.path();
                         if path.extension().is_some_and(|e| e == "jsonl") {
-                            hook_file_count += 1;
                             if let Ok(contents) = std::fs::read_to_string(&path) {
                                 for line in contents.lines() {
-                                    hook_line_count += 1;
                                     if let Some(expansion) = parse_hook_json(line) {
-                                        hook_expansion_count += 1;
                                         let _ = tx.send(Ok(expansion));
                                     }
                                 }
                             }
                         }
                     }
-                } else {
-                    eprintln!("[macra-debug] read_dir({}) failed", dir.display());
                 }
-                eprintln!(
-                    "[macra-debug] hook_output_dir={} files={} lines={} expansions={}",
-                    dir.display(), hook_file_count, hook_line_count, hook_expansion_count,
-                );
                 let _ = std::fs::remove_dir_all(dir);
             }
 
