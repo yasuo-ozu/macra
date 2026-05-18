@@ -31,11 +31,11 @@ fn run_trace_for_repo(repo: &str, test: Option<&str>) -> Vec<MacroExpansion> {
         check_result.stderr
     );
     // Debug: show expansion summary
-    let attr_count = expansions.iter().filter(|e| e.kind == MacroExpansionKind::Attribute).count();
-    let derive_count = expansions.iter().filter(|e| e.kind == MacroExpansionKind::Derive).count();
+    let attr_names: Vec<_> = expansions.iter().filter(|e| e.kind == MacroExpansionKind::Attribute).map(|e| e.name.as_str()).collect();
+    let derive_names: Vec<_> = expansions.iter().filter(|e| e.kind == MacroExpansionKind::Derive).map(|e| e.name.as_str()).collect();
     let bang_count = expansions.iter().filter(|e| e.kind == MacroExpansionKind::Bang).count();
     eprintln!(
-        "[test-debug] repo={repo} test={test:?} total={} attr={attr_count} derive={derive_count} bang={bang_count} hook_lib={} stderr_len={}",
+        "[test-debug] repo={repo} test={test:?} total={} attr={attr_names:?} derive={derive_names:?} bang={bang_count} hook_lib={} stderr_len={}",
         expansions.len(), tm_args.hook_lib.display(), check_result.stderr.len()
     );
     assert!(!expansions.is_empty());
