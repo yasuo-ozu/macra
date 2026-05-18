@@ -293,20 +293,32 @@ impl TraceMacros {
             // Read hook output from the per-process files written by the hook
             // library.  Each rustc process writes to {pid}.jsonl.
             if let Some(ref dir) = hook_output_dir {
+                let mut hook_file_count = 0u32;
+                let mut hook_line_count = 0u32;
+                let mut hook_expansion_count = 0u32;
                 if let Ok(entries) = std::fs::read_dir(dir) {
                     for entry in entries.flatten() {
                         let path = entry.path();
                         if path.extension().is_some_and(|e| e == "jsonl") {
+                            hook_file_count += 1;
                             if let Ok(contents) = std::fs::read_to_string(&path) {
                                 for line in contents.lines() {
+                                    hook_line_count += 1;
                                     if let Some(expansion) = parse_hook_json(line) {
+                                        hook_expansion_count += 1;
                                         let _ = tx.send(Ok(expansion));
                                     }
                                 }
                             }
                         }
                     }
+                } else {
+                    eprintln!("[macra-debug] read_dir({}) failed", dir.display());
                 }
+                eprintln!(
+                    "[macra-debug] hook_output_dir={} files={} lines={} expansions={}",
+                    dir.display(), hook_file_count, hook_line_count, hook_expansion_count,
+                );
                 let _ = std::fs::remove_dir_all(dir);
             }
 
