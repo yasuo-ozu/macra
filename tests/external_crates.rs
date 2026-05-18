@@ -1112,7 +1112,7 @@ AssociatedConstNewType where BasicType : AssociatedConstTrait <>
             {
                 ((FunctionPointerTrait) struct FunctionPointerNewType(BasicType);) trait
                 FunctionPointerTrait { fn apply_fn(& self, f : fn(i32) -> i32) -> i32; },
-                , :: newer_type, (fn(i32) -> i32, i32), Repeater, "#,
+                , :: newer_type, "#,
     );
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
