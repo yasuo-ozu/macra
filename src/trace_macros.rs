@@ -172,7 +172,7 @@ impl TraceMacros {
         cmd.env("RUSTFLAGS", rustflags);
 
         // Set up macra-hook via LD_PRELOAD if available
-        if !self.args.hook_lib.as_os_str().is_empty() {
+        let hook_output_dir = if !self.args.hook_lib.as_os_str().is_empty() {
             let lib = self
                 .args
                 .hook_lib
@@ -190,10 +190,37 @@ impl TraceMacros {
                     // Also cover toolchains/build scripts that consult CC directly.
                     cmd.env("CC", &wrapper);
                 }
+            } else if cfg!(target_os = "windows") {
+                // On Windows, use RUSTC_WRAPPER to inject the hook DLL into
+                // rustc via CreateRemoteThread + LoadLibraryW.
+                #[cfg(target_os = "windows")]
+                if let Some(wrapper_exe) = crate::find_wrapper_exe(
+                    std::env::current_exe().ok().as_deref(),
+                ) {
+                    cmd.env("RUSTC_WRAPPER", &wrapper_exe);
+                    cmd.env("MACRA_HOOK_DLL_PATH", &lib);
+                }
             } else {
                 cmd.env("LD_PRELOAD", &lib);
             }
-        }
+
+            // Direct hook output to per-process files in a temp directory
+            // instead of stderr, avoiding pipe-buffer atomicity issues when
+            // multiple concurrent rustc processes write large JSON lines.
+            let dir = std::env::temp_dir().join(format!(
+                "macra-hook-output-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+            let _ = std::fs::create_dir_all(&dir);
+            cmd.env("MACRA_HOOK_OUTPUT_DIR", &dir);
+            Some(dir)
+        } else {
+            None
+        };
 
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
@@ -228,8 +255,8 @@ impl TraceMacros {
             collected
         });
 
-        // Read stderr: handle hook lines immediately, collect the rest for
-        // trace-macros parsing after the child exits.
+        // Read stderr: handle hook lines (legacy fallback), collect the rest
+        // for trace-macros parsing after the child exits.
         thread::spawn(move || {
             use std::io::BufRead;
             let reader = io::BufReader::new(stderr);
@@ -243,6 +270,8 @@ impl TraceMacros {
                         break;
                     }
                 };
+                // Legacy path: hook output on stderr (when MACRA_HOOK_OUTPUT_DIR
+                // is not used or the hook falls back to stderr).
                 if let Some(json) = line.strip_prefix(HOOK_LINE_PREFIX) {
                     if let Some(expansion) = parse_hook_json(json) {
                         let _ = tx.send(Ok(expansion));
@@ -256,6 +285,26 @@ impl TraceMacros {
             // Wait for stdout draining and child process to finish
             let stdout_buf = stdout_thread.join().unwrap_or_default();
             let wait_result: io::Result<ExitStatus> = child.wait();
+
+            // Read hook output from the per-process files written by the hook
+            // library.  Each rustc process writes to {pid}.jsonl.
+            if let Some(ref dir) = hook_output_dir {
+                if let Ok(entries) = std::fs::read_dir(dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.extension().is_some_and(|e| e == "jsonl") {
+                            if let Ok(contents) = std::fs::read_to_string(&path) {
+                                for line in contents.lines() {
+                                    if let Some(expansion) = parse_hook_json(line) {
+                                        let _ = tx.send(Ok(expansion));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                let _ = std::fs::remove_dir_all(dir);
+            }
 
             // Parse plain-text trace-macros output from stderr and stdout.
             for group in parse_trace(stderr_buf.as_bytes()) {

@@ -1,3 +1,6 @@
+// Windows support uses RUSTC_WRAPPER + DLL injection + IAT patching.
+// All platforms are now supported.
+
 use std::path::PathBuf;
 
 use cargo_macra::parse_trace::{MacroExpansion, MacroExpansionKind};

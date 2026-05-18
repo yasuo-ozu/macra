@@ -13,6 +13,7 @@ authors = ["Yasuo Ozu <yasuo@ozu.email>"]
 [workspace]
 members = [
   "macra-hook",
+  "macra-rustc-wrapper",
   "tests/test-proc-macros",
   "tests/test-usage",
   "tests/debug_macros",

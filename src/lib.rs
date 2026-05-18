@@ -56,6 +56,10 @@ const HOOK_LIB_BYTES: &[u8] =
 const HOOK_LIB_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/libmacra_hook.so"));
 
+#[cfg(target_os = "windows")]
+const WRAPPER_EXE_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/macra-rustc-wrapper.exe"));
+
 /// Extract the embedded hook library to `~/.cache/cargo-macra/` if needed,
 /// returning the path to the cached file.
 fn ensure_hook_lib() -> Option<PathBuf> {
@@ -111,6 +115,69 @@ fn ensure_hook_lib() -> Option<PathBuf> {
     let _ = std::fs::copy(&dest, cache_dir.join(lib_name));
 
     Some(dest_plain)
+}
+
+/// Extract the embedded RUSTC_WRAPPER executable to the cache directory (Windows only).
+#[cfg(target_os = "windows")]
+fn ensure_wrapper_exe() -> Option<PathBuf> {
+    let version = env!("CARGO_PKG_VERSION");
+    let arch = std::env::consts::ARCH;
+    let file_name = format!("macra-rustc-wrapper-{}-{}.exe", version, arch);
+
+    let cache_dir = dirs_cache()?;
+    let dest = cache_dir.join(&file_name);
+    let dest_plain = cache_dir.join(format!("macra-rustc-wrapper-{}.exe", arch));
+
+    if let Ok(meta) = std::fs::metadata(&dest) {
+        if meta.len() == WRAPPER_EXE_BYTES.len() as u64 {
+            if !dest_plain.exists() {
+                let _ = std::fs::copy(&dest, &dest_plain);
+            }
+            return Some(dest_plain);
+        }
+    }
+
+    if std::fs::create_dir_all(&cache_dir).is_err() {
+        return None;
+    }
+    if std::fs::write(&dest, WRAPPER_EXE_BYTES).is_err() {
+        return None;
+    }
+    let _ = std::fs::copy(&dest, &dest_plain);
+
+    Some(dest_plain)
+}
+
+/// Find the macra-rustc-wrapper executable (Windows only).
+#[cfg(target_os = "windows")]
+pub fn find_wrapper_exe(current_exe: Option<&Path>) -> Option<PathBuf> {
+    let exe_name = "macra-rustc-wrapper.exe";
+    let arch = std::env::consts::ARCH;
+    let arch_name = format!("macra-rustc-wrapper-{}.exe", arch);
+
+    if let Some(exe) = current_exe {
+        if let Some(dir) = exe.parent() {
+            let wrapper = dir.join(exe_name);
+            if wrapper.exists() {
+                return Some(wrapper);
+            }
+        }
+    }
+
+    let paths = [
+        PathBuf::from(format!("./target/debug/{}", arch_name)),
+        PathBuf::from(format!("./target/release/{}", arch_name)),
+        PathBuf::from(format!("./target/debug/{}", exe_name)),
+        PathBuf::from(format!("./target/release/{}", exe_name)),
+    ];
+
+    for path in paths {
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    ensure_wrapper_exe()
 }
 
 /// Return `~/.cache/cargo-macra/` (or platform equivalent).
