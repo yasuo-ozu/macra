@@ -4,10 +4,13 @@ version = "0.1.3"
 edition = "2024"
 rust-version = "1.86"
 description = "CLI for working with macro expansion and diagnostics in Rust projects."
-keywords = ["cargo", "macros", "rust", "tooling"]
+keywords = ["cargo", "macros", "rust", "tooling", "cli", "diagnostics"]
 categories = ["command-line-utilities", "development-tools"]
 license = "MIT"
 repository = "https://github.com/yasuo-ozu/macra"
+homepage = "https://github.com/yasuo-ozu/macra"
+documentation = "https://docs.rs/cargo-macra"
+readme = "README.md"
 authors = ["Yasuo Ozu <yasuo@ozu.email>"]
 
 [workspace]
