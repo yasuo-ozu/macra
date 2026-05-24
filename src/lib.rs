@@ -26,8 +26,8 @@ pub fn normalize_tokens(s: &str) -> String {
                 i += 1;
             }
             let next = chars.get(i).copied();
-            let prev_is_punct = prev.map_or(true, is_punct);
-            let next_is_punct = next.map_or(true, is_punct);
+            let prev_is_punct = prev.is_none_or(is_punct);
+            let next_is_punct = next.is_none_or(is_punct);
             if !prev_is_punct && !next_is_punct {
                 result.push(' ');
             }
@@ -45,16 +45,13 @@ pub fn normalize_tokens(s: &str) -> String {
 }
 
 #[cfg(target_os = "macos")]
-const HOOK_LIB_BYTES: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/libmacra_hook.dylib"));
+const HOOK_LIB_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libmacra_hook.dylib"));
 
 #[cfg(target_os = "windows")]
-const HOOK_LIB_BYTES: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/macra_hook.dll"));
+const HOOK_LIB_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/macra_hook.dll"));
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-const HOOK_LIB_BYTES: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/libmacra_hook.so"));
+const HOOK_LIB_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libmacra_hook.so"));
 
 #[cfg(target_os = "windows")]
 const WRAPPER_EXE_BYTES: &[u8] =

@@ -46,7 +46,10 @@ mod windows_inject {
 
     /// Build a null-terminated UTF-16 string from an `&str`.
     fn to_wide(s: &str) -> Vec<u16> {
-        OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+        OsStr::new(s)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
     }
 
     /// Build the command line string for CreateProcessW.
@@ -117,10 +120,9 @@ mod windows_inject {
         };
 
         if ok == 0 {
-            eprintln!(
-                "[macra-rustc-wrapper] CreateProcessW failed: {}",
-                unsafe { GetLastError() }
-            );
+            eprintln!("[macra-rustc-wrapper] CreateProcessW failed: {}", unsafe {
+                GetLastError()
+            });
             return run_passthrough(rustc, rustc_args);
         }
 
@@ -164,10 +166,9 @@ mod windows_inject {
         };
 
         if remote_mem.is_null() {
-            eprintln!(
-                "[macra-rustc-wrapper] VirtualAllocEx failed: {}",
-                unsafe { GetLastError() }
-            );
+            eprintln!("[macra-rustc-wrapper] VirtualAllocEx failed: {}", unsafe {
+                GetLastError()
+            });
             return false;
         }
 

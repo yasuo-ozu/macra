@@ -12,10 +12,7 @@ use std::ffi::CStr;
 /// We use `dlvsym` with a specific GLIBC version to avoid recursion:
 /// our `dlsym` replaces the default one, so calling `dlsym(RTLD_NEXT, "dlsym")`
 /// would recurse. Using `dlvsym` with a version string bypasses our hook.
-unsafe fn real_dlsym(
-    handle: *mut libc::c_void,
-    symbol: *const libc::c_char,
-) -> *mut libc::c_void {
+unsafe fn real_dlsym(handle: *mut libc::c_void, symbol: *const libc::c_char) -> *mut libc::c_void {
     unsafe extern "C" {
         fn dlvsym(
             handle: *mut libc::c_void,
@@ -25,11 +22,11 @@ unsafe fn real_dlsym(
     }
 
     // First get the real dlsym via dlvsym
-    let dlsym_name = b"dlsym\0".as_ptr() as *const libc::c_char;
-    let glibc_version = b"GLIBC_2.2.5\0".as_ptr() as *const libc::c_char;
+    let dlsym_name = c"dlsym".as_ptr();
+    let glibc_version = c"GLIBC_2.2.5".as_ptr();
 
     let real_dlsym_ptr = unsafe {
-        dlvsym(libc::RTLD_NEXT as *mut libc::c_void, dlsym_name, glibc_version)
+        dlvsym(libc::RTLD_NEXT, dlsym_name, glibc_version)
     };
 
     if real_dlsym_ptr.is_null() {
@@ -37,8 +34,10 @@ unsafe fn real_dlsym(
     }
 
     // Call the real dlsym
-    let real_dlsym: unsafe extern "C" fn(*mut libc::c_void, *const libc::c_char) -> *mut libc::c_void =
-        unsafe { std::mem::transmute(real_dlsym_ptr) };
+    let real_dlsym: unsafe extern "C" fn(
+        *mut libc::c_void,
+        *const libc::c_char,
+    ) -> *mut libc::c_void = unsafe { std::mem::transmute(real_dlsym_ptr) };
 
     unsafe { real_dlsym(handle, symbol) }
 }

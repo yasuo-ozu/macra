@@ -1,18 +1,18 @@
 mod macro_finder;
 
 use std::io::{self, stdout};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
+use cargo_macra::parse_trace::{MacroExpansion, MacroExpansionKind};
+use cargo_macra::trace_macros::{MacroExpansionIter, TraceMacros};
 use clap::Parser;
 use crossterm::{
     ExecutableCommand,
     event::{self, Event, KeyCode, KeyEventKind},
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use cargo_macra::parse_trace::{MacroExpansion, MacroExpansionKind};
-use cargo_macra::trace_macros::{MacroExpansionIter, TraceMacros};
 use macro_finder::{MacroCall, MacroKind, find_macros, is_builtin_attribute};
 use ratatui::{
     prelude::*,
@@ -200,8 +200,7 @@ impl ExpansionCache {
             // truncate very large macro invocations and emit only `name!`
             // without arguments (fallback).
             input.is_empty()
-                || (exp.kind == MacroExpansionKind::Bang
-                    && exp.expanding.trim_end().ends_with('!'))
+                || (exp.kind == MacroExpansionKind::Bang && exp.expanding.trim_end().ends_with('!'))
         } else {
             cargo_macra::normalize_tokens(&exp.input) == cargo_macra::normalize_tokens(input)
         };
@@ -253,9 +252,7 @@ impl ExpansionCache {
         let mut inner = mutex.lock().unwrap();
 
         loop {
-            if let Some(idx) =
-                Self::search_expansions(&inner, input, arguments, name, kind)
-            {
+            if let Some(idx) = Self::search_expansions(&inner, input, arguments, name, kind) {
                 let result = inner.expansions[idx].to.clone();
                 inner.current_idx = idx + 1;
                 return Some(result);
@@ -424,7 +421,7 @@ impl App {
         trace_macros: TraceMacros,
     ) -> Self {
         let source_lines: Vec<String> = source.lines().map(|s| s.to_string()).collect();
-        let line_origins: Vec<Option<usize>> = (1..=source_lines.len()).map(|n| Some(n)).collect();
+        let line_origins: Vec<Option<usize>> = (1..=source_lines.len()).map(Some).collect();
         let macros = find_macros(&source);
 
         let mut nodes = Vec::new();
@@ -657,10 +654,11 @@ impl App {
                         _ => node.call.line_end,
                     }
                 };
-                if self.cursor_line >= start && self.cursor_line <= end {
-                    if best.map_or(true, |(_, d)| node.depth > d) {
-                        best = Some((i, node.depth));
-                    }
+                if self.cursor_line >= start
+                    && self.cursor_line <= end
+                    && best.is_none_or(|(_, d)| node.depth > d)
+                {
+                    best = Some((i, node.depth));
                 }
             }
         }
@@ -832,21 +830,19 @@ impl App {
                         "Build Error: cargo check failed, so '{}' was not expanded.\n\n\
                          {}\n\n\
                          Press Enter to dismiss.",
-                        name,
-                        build_err,
+                        name, build_err,
                     ));
                     return;
                 }
 
                 // Write diagnostic log file
-                let log_info =
-                    match self
-                        .expansion_cache
-                        .write_error_log(&name, kind, &input, &arguments)
-                    {
-                        Some(path) => format!("Log: {}", path.display()),
-                        None => "Failed to write log file.".to_string(),
-                    };
+                let log_info = match self
+                    .expansion_cache
+                    .write_error_log(&name, kind, &input, &arguments)
+                {
+                    Some(path) => format!("Log: {}", path.display()),
+                    None => "Failed to write log file.".to_string(),
+                };
                 self.error_message = Some(format!(
                     "Expansion Error: No trace found for '{}' (type: {})\n\n\
                      {}\n\n\
@@ -1174,9 +1170,7 @@ impl App {
                     col_end: child_mac.col_end,
                     line_end: adjusted_line + (child_mac.line_end - child_mac.line),
                     item_line_end: adjusted_line + (child_mac.item_line_end - child_mac.line),
-                    input: child_mac
-                        .input
-                        .replace(DOLLAR_CRATE_PLACEHOLDER, "$crate"),
+                    input: child_mac.input.replace(DOLLAR_CRATE_PLACEHOLDER, "$crate"),
                     arguments: child_mac
                         .arguments
                         .replace(DOLLAR_CRATE_PLACEHOLDER, "$crate"),
@@ -1503,7 +1497,7 @@ impl App {
 
         // Set up new module state
         let source_lines: Vec<String> = source.lines().map(|s| s.to_string()).collect();
-        let line_origins: Vec<Option<usize>> = (1..=source_lines.len()).map(|n| Some(n)).collect();
+        let line_origins: Vec<Option<usize>> = (1..=source_lines.len()).map(Some).collect();
         let macros = find_macros(&source);
 
         let mut nodes = Vec::new();
@@ -1512,10 +1506,10 @@ impl App {
             std::collections::HashSet::new();
 
         for mac in macros {
-            if matches!(mac.kind, MacroKind::Attribute | MacroKind::Derive) {
-                if !item_first_attr.insert(mac.item_line_end) {
-                    continue;
-                }
+            if matches!(mac.kind, MacroKind::Attribute | MacroKind::Derive)
+                && !item_first_attr.insert(mac.item_line_end)
+            {
+                continue;
             }
             let line_idx = mac.line.saturating_sub(1);
             let effective_end = match mac.kind {
@@ -1605,12 +1599,9 @@ fn find_source_file(args: &Args) -> io::Result<PathBuf> {
     if let Some(ref manifest_path) = args.manifest_path {
         cmd.manifest_path(manifest_path);
     }
-    let metadata = cmd.exec().map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::Other,
-            format!("cargo metadata failed: {}", e),
-        )
-    })?;
+    let metadata = cmd
+        .exec()
+        .map_err(|e| io::Error::other(format!("cargo metadata failed: {}", e)))?;
 
     // Determine the package name to look up.
     // If -p/--package is set, use that; otherwise use workspace_default_members.
@@ -1712,7 +1703,8 @@ fn build_trace_macros(args: &Args) -> TraceMacros {
         example: args.example.clone(),
         manifest_path: args.manifest_path.clone(),
         cargo_args: args.cargo_args.clone(),
-        hook_lib: cargo_macra::find_hook_lib(std::env::current_exe().ok().as_deref()).unwrap_or_default(),
+        hook_lib: cargo_macra::find_hook_lib(std::env::current_exe().ok().as_deref())
+            .unwrap_or_default(),
     };
     TraceMacros::new(std::path::Path::new(&cargo), &tm_args)
 }
@@ -2085,16 +2077,13 @@ fn is_mod_declaration(trimmed: &str) -> bool {
 
 /// Resolve a module path (e.g., "foo::bar") relative to the top-level source file.
 /// Returns the resolved file path and the full module path segments including "crate".
-fn resolve_module_path(
-    top_level: &PathBuf,
-    module_str: &str,
-) -> io::Result<(PathBuf, Vec<String>)> {
+fn resolve_module_path(top_level: &Path, module_str: &str) -> io::Result<(PathBuf, Vec<String>)> {
     let segments: Vec<&str> = module_str.split("::").filter(|s| !s.is_empty()).collect();
     if segments.is_empty() {
-        return Ok((top_level.clone(), vec!["crate".to_string()]));
+        return Ok((top_level.to_path_buf(), vec!["crate".to_string()]));
     }
 
-    let mut current_file = top_level.clone();
+    let mut current_file = top_level.to_path_buf();
     let mut module_path = vec!["crate".to_string()];
 
     for segment in &segments {

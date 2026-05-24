@@ -2,10 +2,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
 #[cfg(target_os = "macos")]
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::thread;
 
 use crate::parse_trace::{MacroExpansion, MacroExpansionKind, parse_trace};
 
@@ -57,6 +57,7 @@ impl MacroExpansionIter {
     /// Returns `Ok(Some(exp))` if an item was ready, `Ok(None)` if the channel
     /// is still open but nothing is available yet, or `Err(())` if the channel
     /// has been closed (the background thread finished).
+    #[allow(clippy::result_unit_err)]
     pub fn try_next(&mut self) -> Result<Option<io::Result<MacroExpansion>>, ()> {
         match self.rx.try_recv() {
             Ok(item) => Ok(Some(item)),
@@ -193,9 +194,9 @@ impl TraceMacros {
                 // On Windows, use RUSTC_WRAPPER to inject the hook DLL into
                 // rustc via CreateRemoteThread + LoadLibraryW.
                 #[cfg(target_os = "windows")]
-                if let Some(wrapper_exe) = crate::find_wrapper_exe(
-                    std::env::current_exe().ok().as_deref(),
-                ) {
+                if let Some(wrapper_exe) =
+                    crate::find_wrapper_exe(std::env::current_exe().ok().as_deref())
+                {
                     cmd.env("RUSTC_WRAPPER", &wrapper_exe);
                     cmd.env("MACRA_HOOK_DLL_PATH", &lib);
                 }
@@ -232,11 +233,11 @@ impl TraceMacros {
         let stdout = child
             .stdout
             .take()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "failed to capture stdout"))?;
+            .ok_or_else(|| io::Error::other("failed to capture stdout"))?;
         let stderr = child
             .stderr
             .take()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "failed to capture stderr"))?;
+            .ok_or_else(|| io::Error::other("failed to capture stderr"))?;
 
         let (tx, rx) = mpsc::channel();
         let (status_tx, status_rx) = mpsc::channel();

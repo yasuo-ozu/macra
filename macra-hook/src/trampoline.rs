@@ -115,7 +115,8 @@ fn trampoline_impl(idx: usize, config: BridgeConfig<'_>) -> Buffer {
         let result_data = result.as_slice();
         let output_from_handle = if result_data.len() >= 6
             && result_data[0] == 0x00  // Result::Ok
-            && result_data[1] == 0x00  // Option::Some
+            && result_data[1] == 0x00
+        // Option::Some
         {
             let handle = u32::from_le_bytes(result_data[2..6].try_into().unwrap());
             unsafe { dispatch::call_to_string_on_handle(handle) }
@@ -220,7 +221,12 @@ pub unsafe fn intercept_proc_macro_table(dlsym_result: *mut libc::c_void) -> *mu
                 // The Attr client has type Client<(TokenStream, TokenStream), TokenStream>
                 // but at the ABI level, `run` has the same signature: fn(BridgeConfig) -> Buffer
                 slots[slot_idx] = Some(TrampolineSlot {
-                    original_run: unsafe { std::mem::transmute(client.run) },
+                    original_run: unsafe {
+                        std::mem::transmute::<
+                            for<'a> extern "C" fn(crate::types::BridgeConfig<'a>) -> crate::types::Buffer,
+                            for<'a> extern "C" fn(crate::types::BridgeConfig<'a>) -> crate::types::Buffer,
+                        >(client.run)
+                    },
                     name: name.to_string(),
                     kind: "Attr".to_string(),
                 });

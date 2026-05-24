@@ -8,10 +8,7 @@ use std::ffi::CStr;
 
 unsafe extern "C" {
     /// The real dlsym from libdl. We reference it so DYLD_INTERPOSE can redirect.
-    fn dlsym(
-        handle: *mut libc::c_void,
-        symbol: *const libc::c_char,
-    ) -> *mut libc::c_void;
+    fn dlsym(handle: *mut libc::c_void, symbol: *const libc::c_char) -> *mut libc::c_void;
 }
 
 /// Our hooked dlsym implementation.

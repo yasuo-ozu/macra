@@ -135,9 +135,7 @@ impl MacroVisitor {
     fn process_attributes(&mut self, attrs: &[Attribute], item: &Item) {
         // Get the end line of the full item (attribute + body)
         let item_span = item.to_token_stream().into_iter().last();
-        let item_line_end = item_span
-            .map(|t| t.span().end().line)
-            .unwrap_or(0);
+        let item_line_end = item_span.map(|t| t.span().end().line).unwrap_or(0);
 
         for (attr_idx, attr) in attrs.iter().enumerate() {
             let name = attr
@@ -413,9 +411,18 @@ fn linted() {}
 "#;
         let macros2 = find_macros(source2);
         let names2: Vec<_> = macros2.iter().map(|m| m.name.as_str()).collect();
-        assert!(!names2.contains(&"cfg"), "cfg should be filtered as built-in");
-        assert!(!names2.contains(&"doc"), "doc should be filtered as built-in");
-        assert!(!names2.contains(&"allow"), "allow should be filtered as built-in");
+        assert!(
+            !names2.contains(&"cfg"),
+            "cfg should be filtered as built-in"
+        );
+        assert!(
+            !names2.contains(&"doc"),
+            "doc should be filtered as built-in"
+        );
+        assert!(
+            !names2.contains(&"allow"),
+            "allow should be filtered as built-in"
+        );
     }
 
     #[test]
@@ -428,7 +435,10 @@ struct Foo {
 "#;
         let macros = find_macros(source);
         let names: Vec<_> = macros.iter().map(|m| m.name.as_str()).collect();
-        assert!(!names.contains(&"derive"), "derive attribute itself should be skipped");
+        assert!(
+            !names.contains(&"derive"),
+            "derive attribute itself should be skipped"
+        );
         assert!(names.contains(&"Debug"));
         assert!(names.contains(&"Clone"));
         assert!(names.contains(&"PartialEq"));

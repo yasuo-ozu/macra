@@ -97,3 +97,9 @@ pub struct MultiDeriveOneAttr;
 #[derive(Greet)]
 #[derive(Describe)]
 pub struct MultiDeriveTwoAttr;
+
+#[allow(dead_code)]
+pub fn call_generated_path_macros() {
+    pathstruct_hello!();
+    multiattrstruct_hello!();
+}

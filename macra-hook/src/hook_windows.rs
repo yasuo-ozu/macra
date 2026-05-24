@@ -47,7 +47,8 @@ type GetProcAddressFn = unsafe extern "system" fn(
     *const u8,
 ) -> Option<unsafe extern "system" fn()>;
 
-type LoadLibraryWFn = unsafe extern "system" fn(*const u16) -> windows_sys::Win32::Foundation::HMODULE;
+type LoadLibraryWFn =
+    unsafe extern "system" fn(*const u16) -> windows_sys::Win32::Foundation::HMODULE;
 
 type LoadLibraryExWFn = unsafe extern "system" fn(
     *const u16,
@@ -73,9 +74,8 @@ unsafe fn read_usize(base: *const u8, offset: usize) -> usize {
 /// Called from DllMain(DLL_PROCESS_ATTACH) to install the IAT hook.
 pub(crate) fn install_hook() {
     unsafe {
-        let kernel32 = windows_sys::Win32::System::LibraryLoader::GetModuleHandleA(
-            b"kernel32.dll\0".as_ptr(),
-        );
+        let kernel32 =
+            windows_sys::Win32::System::LibraryLoader::GetModuleHandleA(b"kernel32.dll\0".as_ptr());
         if kernel32.is_null() {
             return;
         }
@@ -183,9 +183,12 @@ unsafe fn patch_module_iat(base: *const u8) {
     }
 
     // Read NumberOfRvaAndSizes
-    let num_dirs =
-        unsafe { read_u32(optional_header, OPTIONAL_HEADER_NUMBER_OF_RVA_AND_SIZES_OFFSET) }
-            as usize;
+    let num_dirs = unsafe {
+        read_u32(
+            optional_header,
+            OPTIONAL_HEADER_NUMBER_OF_RVA_AND_SIZES_OFFSET,
+        )
+    } as usize;
     if num_dirs <= IMAGE_DIRECTORY_ENTRY_IMPORT {
         return;
     }
@@ -222,9 +225,7 @@ unsafe fn patch_module_iat(base: *const u8) {
             let dll_name_ptr = unsafe { base.add(name_rva) } as *const i8;
             if let Ok(dll_name) = unsafe { CStr::from_ptr(dll_name_ptr) }.to_str() {
                 let lower = dll_name.to_ascii_lowercase();
-                if lower == "kernel32.dll"
-                    || lower.starts_with("api-ms-win-core-libraryloader")
-                {
+                if lower == "kernel32.dll" || lower.starts_with("api-ms-win-core-libraryloader") {
                     unsafe {
                         patch_import_thunks(
                             base,
@@ -278,9 +279,7 @@ unsafe fn patch_import_thunks(
             let name_ptr = unsafe { base.add(thunk_data + 2) } as *const i8;
             if let Ok(name) = unsafe { CStr::from_ptr(name_ptr) }.to_str() {
                 let (real_addr, hook_addr) = match name {
-                    "GetProcAddress" => {
-                        (real_gpa_addr, hooked_get_proc_address as usize)
-                    }
+                    "GetProcAddress" => (real_gpa_addr, hooked_get_proc_address as usize),
                     "LoadLibraryW" if real_llw_addr != 0 => {
                         (real_llw_addr, hooked_load_library_w as usize)
                     }
@@ -354,8 +353,9 @@ unsafe extern "system" fn hooked_load_library_ex_w(
     const LOAD_LIBRARY_AS_DATAFILE: u32 = 0x00000002;
     const LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE: u32 = 0x00000040;
     const LOAD_LIBRARY_AS_IMAGE_RESOURCE: u32 = 0x00000020;
-    const PSEUDO_HANDLE_FLAGS: u32 =
-        LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE | LOAD_LIBRARY_AS_IMAGE_RESOURCE;
+    const PSEUDO_HANDLE_FLAGS: u32 = LOAD_LIBRARY_AS_DATAFILE
+        | LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE
+        | LOAD_LIBRARY_AS_IMAGE_RESOURCE;
 
     let real_fn_ptr = REAL_LOAD_LIBRARY_EX_W.load(Ordering::Acquire);
     let real: LoadLibraryExWFn = unsafe { std::mem::transmute(real_fn_ptr) };

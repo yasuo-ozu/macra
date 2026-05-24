@@ -27,8 +27,7 @@ static OUTPUT_FILE: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
 fn output_file_path() -> &'static Option<std::path::PathBuf> {
     OUTPUT_FILE.get_or_init(|| {
         let dir = std::env::var_os("MACRA_HOOK_OUTPUT_DIR")?;
-        let path = std::path::PathBuf::from(dir)
-            .join(format!("{}.jsonl", std::process::id()));
+        let path = std::path::PathBuf::from(dir).join(format!("{}.jsonl", std::process::id()));
         Some(path)
     })
 }

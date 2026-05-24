@@ -186,11 +186,8 @@ impl<R: Read> TraceParser<R> {
     fn parse_trace_group(&mut self) -> Option<TraceGroup> {
         let mut expansions = Vec::new();
 
-        loop {
-            let line = match self.peek_line() {
-                Some(l) => l.to_string(),
-                None => break,
-            };
+        while let Some(l) = self.peek_line() {
+            let line = l.to_string();
 
             if line.starts_with("note: trace_macro") {
                 // Next trace group starts
@@ -338,7 +335,10 @@ mod tests {
         let groups: Vec<_> = parse_trace(input.as_bytes()).collect();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].expansions.len(), 2);
-        assert_eq!(groups[0].expansions[0].expanding, "abort! { segment, \"message\" }");
+        assert_eq!(
+            groups[0].expansions[0].expanding,
+            "abort! { segment, \"message\" }"
+        );
         assert_eq!(
             groups[0].expansions[0].to,
             "diagnostic!(segment, Error, \"message\").abort()"

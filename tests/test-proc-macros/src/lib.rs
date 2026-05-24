@@ -1,6 +1,6 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, DeriveInput, Ident, Item, ItemStruct};
+use syn::{DeriveInput, Ident, Item, ItemStruct, parse_macro_input};
 
 /// Attribute macro that emits the original struct, an `impl` block with a method
 /// whose body calls `println!()`, and a `macro_rules!` definition.

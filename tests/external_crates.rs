@@ -9,12 +9,11 @@ use cargo_macra::trace_macros::{Args as TraceArgs, TraceMacros};
 
 /// Return the (major, minor) version of the active rustc.
 fn rustc_minor_version() -> u32 {
-    let output = std::process::Command::new(
-        std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into()),
-    )
-    .arg("--version")
-    .output()
-    .expect("failed to run rustc --version");
+    let output =
+        std::process::Command::new(std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
+            .arg("--version")
+            .output()
+            .expect("failed to run rustc --version");
     let version = String::from_utf8_lossy(&output.stdout);
     // "rustc 1.86.0 (hash date)"
     version
@@ -32,7 +31,9 @@ fn rustc_minor_version() -> u32 {
 mod repo_locks {
     use std::sync::Mutex;
     macro_rules! repo_lock {
-        ($name:ident) => { pub static $name: Mutex<()> = Mutex::new(()); };
+        ($name:ident) => {
+            pub static $name: Mutex<()> = Mutex::new(());
+        };
     }
     repo_lock!(ADDR_OF_ENUM);
     repo_lock!(COINDUCTION);
@@ -59,7 +60,10 @@ fn repo_lock(repo: &str) -> &'static Mutex<()> {
 }
 
 fn repo_manifest(repo: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/external_crates").join(repo).join("Cargo.toml")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/external_crates")
+        .join(repo)
+        .join("Cargo.toml")
 }
 
 /// Minimum rustc minor version required by external crate dependencies.
@@ -80,14 +84,29 @@ fn run_trace_for_repo(repo: &str, test: Option<&str>) -> Vec<MacroExpansion> {
     assert!(manifest_path.exists());
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     let tm_args = TraceArgs {
-        package: None, bin: None, lib: false, test: test.map(|s| s.to_string()), example: None,
-        manifest_path: Some(manifest_path.to_string_lossy().to_string()), cargo_args: Vec::new(),
-        hook_lib: cargo_macra::find_hook_lib(std::env::current_exe().ok().as_deref()).unwrap_or_default(),
+        package: None,
+        bin: None,
+        lib: false,
+        test: test.map(|s| s.to_string()),
+        example: None,
+        manifest_path: Some(manifest_path.to_string_lossy().to_string()),
+        cargo_args: Vec::new(),
+        hook_lib: cargo_macra::find_hook_lib(std::env::current_exe().ok().as_deref())
+            .unwrap_or_default(),
     };
     let tm = TraceMacros::new(std::path::Path::new(&cargo), &tm_args);
-    let run = tm.run().unwrap_or_else(|e| panic!("TraceMacros::run() failed for {}: {}", repo, e));
-    let expansions = run.iter.collect::<std::io::Result<Vec<_>>>().unwrap_or_else(|e| panic!("failed to collect expansions for {}: {}", repo, e));
-    let check_result = run.check_result.recv().expect("failed to receive cargo check status").unwrap_or_else(|e| panic!("failed waiting cargo check for {}: {}", repo, e));
+    let run = tm
+        .run()
+        .unwrap_or_else(|e| panic!("TraceMacros::run() failed for {}: {}", repo, e));
+    let expansions = run
+        .iter
+        .collect::<std::io::Result<Vec<_>>>()
+        .unwrap_or_else(|e| panic!("failed to collect expansions for {}: {}", repo, e));
+    let check_result = run
+        .check_result
+        .recv()
+        .expect("failed to receive cargo check status")
+        .unwrap_or_else(|e| panic!("failed waiting cargo check for {}: {}", repo, e));
     if !check_result.success {
         let min = min_rustc_for_crate(repo);
         if rustc_minor_version() < min {
@@ -118,13 +137,16 @@ fn assert_has(expansions: &[MacroExpansion], kind: MacroExpansionKind, name: &st
 
 fn assert_has_prefix(expansions: &[MacroExpansion], kind: MacroExpansionKind, prefix: &str) {
     assert!(
-        expansions.iter().any(|e| e.kind == kind && e.name.starts_with(prefix)),
+        expansions
+            .iter()
+            .any(|e| e.kind == kind && e.name.starts_with(prefix)),
         "missing expansion kind={kind:?} prefix={prefix}"
     );
 }
 
 fn starts_with_normalized(actual: &str, expected_prefix: &str) -> bool {
-    cargo_macra::normalize_tokens(actual).starts_with(&cargo_macra::normalize_tokens(expected_prefix))
+    cargo_macra::normalize_tokens(actual)
+        .starts_with(&cargo_macra::normalize_tokens(expected_prefix))
 }
 
 fn equals_normalized(actual: &str, expected: &str) -> bool {
@@ -232,44 +254,70 @@ fn assert_expansion(
 #[test]
 fn external_crate_coinduction_test_coinduction_integration_test() {
     let expansions = run_trace_for_repo("coinduction", Some("coinduction_integration_test"));
-    if expansions.is_empty() { return; }
+    if expansions.is_empty() {
+        return;
+    }
     assert_has(&expansions, MacroExpansionKind::Attribute, "traitdef");
     assert_has(&expansions, MacroExpansionKind::Attribute, "typedef");
     assert_has(&expansions, MacroExpansionKind::Bang, "__next_step");
-    assert_has_prefix(&expansions, MacroExpansionKind::Bang, "__CircularTrait_temporal_");
-    assert_has_prefix(&expansions, MacroExpansionKind::Bang, "__ConstrainedStruct_temporal_");
+    assert_has_prefix(
+        &expansions,
+        MacroExpansionKind::Bang,
+        "__CircularTrait_temporal_",
+    );
+    assert_has_prefix(
+        &expansions,
+        MacroExpansionKind::Bang,
+        "__ConstrainedStruct_temporal_",
+    );
 }
 
 #[test]
 fn external_crate_coinduction_test_complex() {
     let expansions = run_trace_for_repo("coinduction", Some("complex"));
-    if expansions.is_empty() { return; }
+    if expansions.is_empty() {
+        return;
+    }
     assert_has(&expansions, MacroExpansionKind::Attribute, "coinduction");
     assert_has(&expansions, MacroExpansionKind::Attribute, "traitdef");
     assert_has(&expansions, MacroExpansionKind::Attribute, "typedef");
     assert_has_prefix(&expansions, MacroExpansionKind::Bang, "__TraitA_temporal_");
     assert_has_prefix(&expansions, MacroExpansionKind::Bang, "__TraitB_temporal_");
-    assert_has_prefix(&expansions, MacroExpansionKind::Bang, "__Wrapper2_temporal_");
+    assert_has_prefix(
+        &expansions,
+        MacroExpansionKind::Bang,
+        "__Wrapper2_temporal_",
+    );
     assert_has(&expansions, MacroExpansionKind::Bang, "__next_step");
 }
 
 #[test]
 fn external_crate_coinduction_test_complex_coinduction() {
     let expansions = run_trace_for_repo("coinduction", Some("complex_coinduction"));
-    if expansions.is_empty() { return; }
+    if expansions.is_empty() {
+        return;
+    }
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "traitdef"
-            && equals_normalized(&e.input, r#"pub trait LocalTrait { fn local_method(&self) -> usize; }"#)
-            && starts_with_normalized(&e.to, r#"pub trait LocalTrait { fn local_method(& self) -> usize; }
+            && equals_normalized(
+                &e.input,
+                r#"pub trait LocalTrait { fn local_method(&self) -> usize; }"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"pub trait LocalTrait { fn local_method(& self) -> usize; }
 #[allow(unused_macros, unused_imports, dead_code, non_local_definitions)]
 #[doc(hidden)] #[macro_export] macro_rules!
-__LocalTrait_temporal_"#)
+__LocalTrait_temporal_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "typedef"
-            && starts_with_normalized(&e.input, r#"pub mod generic_types
+            && starts_with_normalized(
+                &e.input,
+                r#"pub mod generic_types
 {
     use super::*; use std::fmt::Debug; use std::hash::Hash; pub struct
     Container<T, U> { pub first: T, pub second: U, } pub struct Wrapper<T>
@@ -283,8 +331,11 @@ __LocalTrait_temporal_"#)
     impl<T> TestTrait for Wrapper<T> where T: Clone + Debug + ToString,
     {
         fn test_method(&self) -> String
-        { format!("{}: {}", self.value.to_string(), self.count) }"#)
-            && starts_with_normalized(&e.to, r#"pub mod generic_types
+        { format!("{}: {}", self.value.to_string(), self.count) }"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"pub mod generic_types
 {
     use super :: * ; use std :: fmt :: Debug; use std :: hash :: Hash; pub
     struct Container < T, U > { pub first : T, pub second : U, } pub struct
@@ -298,18 +349,23 @@ __LocalTrait_temporal_"#)
     { fn test_method(& self) -> String { format! ("{:?}", self.first) } } impl
     < T > TestTrait for Wrapper < T > where T : Clone + Debug + ToString,
     {
-        fn test_method(& self) -> String"#)
+        fn test_method(& self) -> String"#,
+            )
     }));
 }
 
 #[test]
 fn external_crate_coinduction_test_min_calculator() {
     let expansions = run_trace_for_repo("coinduction", Some("min_calculator"));
-    if expansions.is_empty() { return; }
+    if expansions.is_empty() {
+        return;
+    }
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "coinduction"
-            && starts_with_normalized(&e.input, r#"mod calculator
+            && starts_with_normalized(
+                &e.input,
+                r#"mod calculator
 {
     use super::Evaluate; pub struct Expr; pub struct Term; impl Evaluate for
     Expr where Term: Evaluate,
@@ -323,8 +379,11 @@ fn external_crate_coinduction_test_min_calculator() {
                 "+" => left_val + right_val, "-" => left_val - right_val, _ =>
                 left_val,
             }
-        }"#)
-            && starts_with_normalized(&e.to, r#"mod calculator
+        }"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"mod calculator
 {
     use super :: Evaluate; pub struct Expr; pub struct Term; impl Evaluate for
     Expr
@@ -338,21 +397,30 @@ fn external_crate_coinduction_test_min_calculator() {
             {
                 "+" => left_val + right_val, "-" => left_val - right_val, _ =>
                 left_val,
-            }"#)
+            }"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "traitdef"
-            && equals_normalized(&e.input, r#"pub trait LocalTrait { fn local_method(&self) -> usize; }"#)
-            && starts_with_normalized(&e.to, r#"pub trait LocalTrait { fn local_method(& self) -> usize; }
+            && equals_normalized(
+                &e.input,
+                r#"pub trait LocalTrait { fn local_method(&self) -> usize; }"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"pub trait LocalTrait { fn local_method(& self) -> usize; }
 #[allow(unused_macros, unused_imports, dead_code, non_local_definitions)]
 #[doc(hidden)] #[macro_export] macro_rules!
-__LocalTrait_temporal_"#)
+__LocalTrait_temporal_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "typedef"
-            && starts_with_normalized(&e.input, r#"pub mod generic_types
+            && starts_with_normalized(
+                &e.input,
+                r#"pub mod generic_types
 {
     use super::*; use std::fmt::Debug; use std::hash::Hash; pub struct
     Container<T, U> { pub first: T, pub second: U, } pub struct Wrapper<T>
@@ -366,8 +434,11 @@ __LocalTrait_temporal_"#)
     impl<T> TestTrait for Wrapper<T> where T: Clone + Debug + ToString,
     {
         fn test_method(&self) -> String
-        { format!("{}: {}", self.value.to_string(), self.count) }"#)
-            && starts_with_normalized(&e.to, r#"pub mod generic_types
+        { format!("{}: {}", self.value.to_string(), self.count) }"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"pub mod generic_types
 {
     use super :: * ; use std :: fmt :: Debug; use std :: hash :: Hash; pub
     struct Container < T, U > { pub first : T, pub second : U, } pub struct
@@ -381,42 +452,61 @@ __LocalTrait_temporal_"#)
     { fn test_method(& self) -> String { format! ("{:?}", self.first) } } impl
     < T > TestTrait for Wrapper < T > where T : Clone + Debug + ToString,
     {
-        fn test_method(& self) -> String"#)
+        fn test_method(& self) -> String"#,
+            )
     }));
 }
 
 #[test]
 fn external_crate_decycle_test_advanced_cycles() {
     let expansions = run_trace_for_repo("decycle", Some("advanced_cycles"));
-    if expansions.is_empty() { return; }
+    if expansions.is_empty() {
+        return;
+    }
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "decycle"
-            && equals_normalized(&e.input, r#"pub trait LocalTrait { fn local_method(&self) -> usize; }"#)
-            && starts_with_normalized(&e.to, r#"pub trait LocalTrait { fn local_method(& self) -> usize; }
+            && equals_normalized(
+                &e.input,
+                r#"pub trait LocalTrait { fn local_method(&self) -> usize; }"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"pub trait LocalTrait { fn local_method(& self) -> usize; }
 #[allow(unused_macros, unused_imports, dead_code, non_local_definitions)]
 #[doc(hidden)] #[macro_export] macro_rules!
-__LocalTrait_temporal_"#)
+__LocalTrait_temporal_"#,
+            )
     }));
 }
 
 #[test]
 fn external_crate_decycle_test_bug2() {
     let expansions = run_trace_for_repo("decycle", Some("bug2"));
-    if expansions.is_empty() { return; }
+    if expansions.is_empty() {
+        return;
+    }
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "decycle"
-            && equals_normalized(&e.input, r#"pub trait LocalTrait { fn local_method(&self) -> usize; }"#)
-            && starts_with_normalized(&e.to, r#"pub trait LocalTrait { fn local_method(& self) -> usize; }
+            && equals_normalized(
+                &e.input,
+                r#"pub trait LocalTrait { fn local_method(&self) -> usize; }"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"pub trait LocalTrait { fn local_method(& self) -> usize; }
 #[allow(unused_macros, unused_imports, dead_code, non_local_definitions)]
 #[doc(hidden)] #[macro_export] macro_rules!
-__LocalTrait_temporal_"#)
+__LocalTrait_temporal_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name.starts_with("__MyTrait_temporal_")
-            && equals_normalized(&e.input, r#""decycle" "0.3.0" [MyTrait, :: decycle :: __finalize] {}
+            && equals_normalized(
+                &e.input,
+                r#""decycle" "0.3.0" [MyTrait, :: decycle :: __finalize] {}
            {
                impl < 'a, 'b, const N : usize, T > MyTrait < 'a > for MyStruct < 'a, 'b,
                N, T >
@@ -424,19 +514,26 @@ __LocalTrait_temporal_"#)
                    type MyTrait = T; type T = T; fn f < 'c > (& 'a self, i : & 'c [u8])
                    -> usize { 0 }
                }
-           } 10usize true"#)
-            && starts_with_normalized(&e.to, r#":: decycle :: __finalize !
+           } 10usize true"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#":: decycle :: __finalize !
            {
                "decycle" "0.3.0" [:: decycle :: __finalize]
                {
-                   #[allow(dead_code)] pub trait MyTrait < 'a"#)
+                   #[allow(dead_code)] pub trait MyTrait < 'a"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name == "__finalize"
-            && starts_with_normalized(&e.input, r#""decycle" "0.3.0" [:: decycle :: __finalize]
+            && starts_with_normalized(
+                &e.input,
+                r#""decycle" "0.3.0" [:: decycle :: __finalize]
 {
-    #[allow(dead_code)] pub trait MyTrait < 'a"#)
+    #[allow(dead_code)] pub trait MyTrait < 'a"#,
+            )
             && starts_with_normalized(&e.to, r#"#[doc(hidden)] mod shadowing_module"#)
     }));
 }
@@ -444,28 +541,41 @@ __LocalTrait_temporal_"#)
 #[test]
 fn external_crate_decycle_test_bug3() {
     let expansions = run_trace_for_repo("decycle", Some("bug3"));
-    if expansions.is_empty() { return; }
+    if expansions.is_empty() {
+        return;
+    }
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "decycle"
-            && equals_normalized(&e.input, r#"pub trait LocalTrait { fn local_method(&self) -> usize; }"#)
-            && starts_with_normalized(&e.to, r#"pub trait LocalTrait { fn local_method(& self) -> usize; }
+            && equals_normalized(
+                &e.input,
+                r#"pub trait LocalTrait { fn local_method(&self) -> usize; }"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"pub trait LocalTrait { fn local_method(& self) -> usize; }
 #[allow(unused_macros, unused_imports, dead_code, non_local_definitions)]
 #[doc(hidden)] #[macro_export] macro_rules!
-__LocalTrait_temporal_"#)
+__LocalTrait_temporal_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name.starts_with("__Unparse_temporal_")
-            && equals_normalized(&e.input, r#""decycle" "0.3.0" [Unparse, :: decycle :: __finalize] {}
+            && equals_normalized(
+                &e.input,
+                r#""decycle" "0.3.0" [Unparse, :: decycle :: __finalize] {}
           {
               impl Unparse for S
               {
                   fn unparse(& self, i : usize)
                   { if i == 0 { return; } < _ as Unparse > :: unparse(self, i - 1); }
               }
-          } 10usize true"#)
-            && equals_normalized(&e.to, r#":: decycle :: __finalize !
+          } 10usize true"#,
+            )
+            && equals_normalized(
+                &e.to,
+                r#":: decycle :: __finalize !
           {
               "decycle" "0.3.0" [:: decycle :: __finalize]
               { #[allow(unused)] trait Unparse { fn unparse(& self, _ : usize); }, }
@@ -479,12 +589,15 @@ __LocalTrait_temporal_"#)
                       }
                   }
               } 10usize true
-          }"#)
+          }"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name == "__finalize"
-            && equals_normalized(&e.input, r#""decycle" "0.3.0" [:: decycle :: __finalize]
+            && equals_normalized(
+                &e.input,
+                r#""decycle" "0.3.0" [:: decycle :: __finalize]
 { #[allow(unused)] trait Unparse { fn unparse(& self, _ : usize); }, }
 {
     impl Unparse for S
@@ -492,7 +605,8 @@ __LocalTrait_temporal_"#)
         fn unparse(& self, i : usize)
         { if i == 0 { return; } < _ as Unparse > :: unparse(self, i - 1); }
     }
-} 10usize true"#)
+} 10usize true"#,
+            )
             && starts_with_normalized(&e.to, r#"#[doc(hidden)] mod shadowing_module"#)
     }));
 }
@@ -500,39 +614,56 @@ __LocalTrait_temporal_"#)
 #[test]
 fn external_crate_decycle_test_bug4() {
     let expansions = run_trace_for_repo("decycle", Some("bug4"));
-    if expansions.is_empty() { return; }
+    if expansions.is_empty() {
+        return;
+    }
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "decycle"
-            && equals_normalized(&e.input, r#"pub trait LocalTrait { fn local_method(&self) -> usize; }"#)
-            && starts_with_normalized(&e.to, r#"pub trait LocalTrait { fn local_method(& self) -> usize; }
+            && equals_normalized(
+                &e.input,
+                r#"pub trait LocalTrait { fn local_method(&self) -> usize; }"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"pub trait LocalTrait { fn local_method(& self) -> usize; }
 #[allow(unused_macros, unused_imports, dead_code, non_local_definitions)]
 #[doc(hidden)] #[macro_export] macro_rules!
-__LocalTrait_temporal_"#)
+__LocalTrait_temporal_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name.starts_with("__Unparse_temporal_")
-            && equals_normalized(&e.input, r#""decycle" "0.3.0" [Unparse, :: decycle :: __finalize] {}
+            && equals_normalized(
+                &e.input,
+                r#""decycle" "0.3.0" [Unparse, :: decycle :: __finalize] {}
            {
                impl < __A > Unparse < __A > for ItemMod
                {
                    fn unparse < B : crate :: TraitA < __A, S = B > > (_ : & mut B) {} fn
                    f(_sink : impl TraitA < __A, S = __A >) {}
                }
-           } 10usize true"#)
-            && starts_with_normalized(&e.to, r#":: decycle :: __finalize !
+           } 10usize true"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#":: decycle :: __finalize !
            {
                "decycle" "0.3.0" [:: decycle :: __finalize]
                {
-                   pub trait Unparse < A"#)
+                   pub trait Unparse < A"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name == "__finalize"
-            && starts_with_normalized(&e.input, r#""decycle" "0.3.0" [:: decycle :: __finalize]
+            && starts_with_normalized(
+                &e.input,
+                r#""decycle" "0.3.0" [:: decycle :: __finalize]
 {
-    pub trait Unparse < A"#)
+    pub trait Unparse < A"#,
+            )
             && starts_with_normalized(&e.to, r#"#[doc(hidden)] mod shadowing_module"#)
     }));
 }
@@ -540,39 +671,56 @@ __LocalTrait_temporal_"#)
 #[test]
 fn external_crate_decycle_test_bug5() {
     let expansions = run_trace_for_repo("decycle", Some("bug5"));
-    if expansions.is_empty() { return; }
+    if expansions.is_empty() {
+        return;
+    }
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "decycle"
-            && equals_normalized(&e.input, r#"pub trait LocalTrait { fn local_method(&self) -> usize; }"#)
-            && starts_with_normalized(&e.to, r#"pub trait LocalTrait { fn local_method(& self) -> usize; }
+            && equals_normalized(
+                &e.input,
+                r#"pub trait LocalTrait { fn local_method(&self) -> usize; }"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"pub trait LocalTrait { fn local_method(& self) -> usize; }
 #[allow(unused_macros, unused_imports, dead_code, non_local_definitions)]
 #[doc(hidden)] #[macro_export] macro_rules!
-__LocalTrait_temporal_"#)
+__LocalTrait_temporal_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name.starts_with("__Parse_temporal_")
-            && equals_normalized(&e.input, r#""decycle" "0.3.0" [Parse, :: decycle :: __finalize] {}
+            && equals_normalized(
+                &e.input,
+                r#""decycle" "0.3.0" [Parse, :: decycle :: __finalize] {}
           {
               impl < Item > Parse < Item > for S
               {
                   fn parse < I : :: core :: iter :: Iterator < Item = Item > > (_ : I)
                   { todo! () }
               }
-          } 10usize true"#)
-            && starts_with_normalized(&e.to, r#":: decycle :: __finalize !
+          } 10usize true"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#":: decycle :: __finalize !
           {
               "decycle" "0.3.0" [:: decycle :: __finalize]
               {
-                  pub trait Parse < Item"#)
+                  pub trait Parse < Item"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name == "__finalize"
-            && starts_with_normalized(&e.input, r#""decycle" "0.3.0" [:: decycle :: __finalize]
+            && starts_with_normalized(
+                &e.input,
+                r#""decycle" "0.3.0" [:: decycle :: __finalize]
 {
-    pub trait Parse < Item"#)
+    pub trait Parse < Item"#,
+            )
             && starts_with_normalized(&e.to, r#"#[doc(hidden)] mod shadowing_module"#)
     }));
 }
@@ -580,35 +728,53 @@ __LocalTrait_temporal_"#)
 #[test]
 fn external_crate_decycle_test_bug6() {
     let expansions = run_trace_for_repo("decycle", Some("bug6"));
-    if expansions.is_empty() { return; }
+    if expansions.is_empty() {
+        return;
+    }
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "decycle"
-            && equals_normalized(&e.input, r#"pub trait LocalTrait { fn local_method(&self) -> usize; }"#)
-            && starts_with_normalized(&e.to, r#"pub trait LocalTrait { fn local_method(& self) -> usize; }
+            && equals_normalized(
+                &e.input,
+                r#"pub trait LocalTrait { fn local_method(&self) -> usize; }"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"pub trait LocalTrait { fn local_method(& self) -> usize; }
 #[allow(unused_macros, unused_imports, dead_code, non_local_definitions)]
 #[doc(hidden)] #[macro_export] macro_rules!
-__LocalTrait_temporal_"#)
+__LocalTrait_temporal_"#,
+            )
     }));
 }
 
 #[test]
 fn external_crate_decycle_test_coinduction_integration_test() {
     let expansions = run_trace_for_repo("decycle", Some("coinduction_integration_test"));
-    if expansions.is_empty() { return; }
+    if expansions.is_empty() {
+        return;
+    }
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "decycle"
-            && equals_normalized(&e.input, r#"pub trait LocalTrait { fn local_method(&self) -> usize; }"#)
-            && starts_with_normalized(&e.to, r#"pub trait LocalTrait { fn local_method(& self) -> usize; }
+            && equals_normalized(
+                &e.input,
+                r#"pub trait LocalTrait { fn local_method(&self) -> usize; }"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"pub trait LocalTrait { fn local_method(& self) -> usize; }
 #[allow(unused_macros, unused_imports, dead_code, non_local_definitions)]
 #[doc(hidden)] #[macro_export] macro_rules!
-__LocalTrait_temporal_"#)
+__LocalTrait_temporal_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name.starts_with("__LocalTrait_temporal_")
-            && starts_with_normalized(&e.input, r#""decycle" "0.3.0" [LocalTrait, :: decycle :: __finalize]
+            && starts_with_normalized(
+                &e.input,
+                r#""decycle" "0.3.0" [LocalTrait, :: decycle :: __finalize]
           { pub trait TestTrait { fn test_method(& self) -> String; } }
           {
               impl TestTrait for NodeA where NodeB : LocalTrait,
@@ -622,8 +788,11 @@ __LocalTrait_temporal_"#)
               }, impl LocalTrait for NodeB where NodeA : TestTrait,
               {
                   fn local_method(& self) -> usize
-                  {"#)
-            && starts_with_normalized(&e.to, r#":: decycle :: __finalize !
+                  {"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#":: decycle :: __finalize !
           {
               "decycle" "0.3.0" [:: decycle :: __finalize]
               {
@@ -637,12 +806,15 @@ __LocalTrait_temporal_"#)
                       {
                           let child_count =
                           self.child_b.as_ref().map_or(0, | b | b.local_method());
-                          format! ("NodeA:{}:{}", self.name, child_count)"#)
+                          format! ("NodeA:{}:{}", self.name, child_count)"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name == "__finalize"
-            && starts_with_normalized(&e.input, r#""decycle" "0.3.0" [:: decycle :: __finalize]
+            && starts_with_normalized(
+                &e.input,
+                r#""decycle" "0.3.0" [:: decycle :: __finalize]
 {
     pub trait LocalTrait { fn local_method(& self) -> usize; }, pub trait
     TestTrait { fn test_method(& self) -> String; }
@@ -656,7 +828,8 @@ __LocalTrait_temporal_"#)
             self.child_b.as_ref().map_or(0, | b | b.local_method()); format!
             ("NodeA:{}:{}", self.name, child_count)
         }
-    }, impl LocalTrait for NodeB where NodeA : TestTrait,"#)
+    }, impl LocalTrait for NodeB where NodeA : TestTrait,"#,
+            )
             && starts_with_normalized(&e.to, r#"#[doc(hidden)] mod shadowing_module"#)
     }));
 }
@@ -664,75 +837,115 @@ __LocalTrait_temporal_"#)
 #[test]
 fn external_crate_decycle_test_complex() {
     let expansions = run_trace_for_repo("decycle", Some("complex"));
-    if expansions.is_empty() { return; }
+    if expansions.is_empty() {
+        return;
+    }
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "decycle"
-            && equals_normalized(&e.input, r#"pub trait LocalTrait { fn local_method(&self) -> usize; }"#)
-            && starts_with_normalized(&e.to, r#"pub trait LocalTrait { fn local_method(& self) -> usize; }
+            && equals_normalized(
+                &e.input,
+                r#"pub trait LocalTrait { fn local_method(&self) -> usize; }"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"pub trait LocalTrait { fn local_method(& self) -> usize; }
 #[allow(unused_macros, unused_imports, dead_code, non_local_definitions)]
 #[doc(hidden)] #[macro_export] macro_rules!
-__LocalTrait_temporal_"#)
+__LocalTrait_temporal_"#,
+            )
     }));
 }
 
 #[test]
 fn external_crate_decycle_test_complex_coinduction() {
     let expansions = run_trace_for_repo("decycle", Some("complex_coinduction"));
-    if expansions.is_empty() { return; }
+    if expansions.is_empty() {
+        return;
+    }
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "decycle"
-            && equals_normalized(&e.input, r#"pub trait LocalTrait { fn local_method(&self) -> usize; }"#)
-            && starts_with_normalized(&e.to, r#"pub trait LocalTrait { fn local_method(& self) -> usize; }
+            && equals_normalized(
+                &e.input,
+                r#"pub trait LocalTrait { fn local_method(&self) -> usize; }"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"pub trait LocalTrait { fn local_method(& self) -> usize; }
 #[allow(unused_macros, unused_imports, dead_code, non_local_definitions)]
 #[doc(hidden)] #[macro_export] macro_rules!
-__LocalTrait_temporal_"#)
+__LocalTrait_temporal_"#,
+            )
     }));
 }
 
 #[test]
 fn external_crate_decycle_test_min_calculator() {
     let expansions = run_trace_for_repo("decycle", Some("min_calculator"));
-    if expansions.is_empty() { return; }
+    if expansions.is_empty() {
+        return;
+    }
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "decycle"
-            && equals_normalized(&e.input, r#"pub trait LocalTrait { fn local_method(&self) -> usize; }"#)
-            && starts_with_normalized(&e.to, r#"pub trait LocalTrait { fn local_method(& self) -> usize; }
+            && equals_normalized(
+                &e.input,
+                r#"pub trait LocalTrait { fn local_method(&self) -> usize; }"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"pub trait LocalTrait { fn local_method(& self) -> usize; }
 #[allow(unused_macros, unused_imports, dead_code, non_local_definitions)]
 #[doc(hidden)] #[macro_export] macro_rules!
-__LocalTrait_temporal_"#)
+__LocalTrait_temporal_"#,
+            )
     }));
 }
 
 #[test]
 fn external_crate_decycle_test_more_cycles() {
     let expansions = run_trace_for_repo("decycle", Some("more_cycles"));
-    if expansions.is_empty() { return; }
+    if expansions.is_empty() {
+        return;
+    }
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "decycle"
-            && equals_normalized(&e.input, r#"pub trait LocalTrait { fn local_method(&self) -> usize; }"#)
-            && starts_with_normalized(&e.to, r#"pub trait LocalTrait { fn local_method(& self) -> usize; }
+            && equals_normalized(
+                &e.input,
+                r#"pub trait LocalTrait { fn local_method(&self) -> usize; }"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"pub trait LocalTrait { fn local_method(& self) -> usize; }
 #[allow(unused_macros, unused_imports, dead_code, non_local_definitions)]
 #[doc(hidden)] #[macro_export] macro_rules!
-__LocalTrait_temporal_"#)
+__LocalTrait_temporal_"#,
+            )
     }));
 }
 
 #[test]
 fn external_crate_decycle_test_trybuild() {
     let expansions = run_trace_for_repo("decycle", Some("trybuild"));
-    if expansions.is_empty() { return; }
+    if expansions.is_empty() {
+        return;
+    }
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "decycle"
-            && equals_normalized(&e.input, r#"pub trait LocalTrait { fn local_method(&self) -> usize; }"#)
-            && starts_with_normalized(&e.to, r#"pub trait LocalTrait { fn local_method(& self) -> usize; }
+            && equals_normalized(
+                &e.input,
+                r#"pub trait LocalTrait { fn local_method(&self) -> usize; }"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"pub trait LocalTrait { fn local_method(& self) -> usize; }
 #[allow(unused_macros, unused_imports, dead_code, non_local_definitions)]
 #[doc(hidden)] #[macro_export] macro_rules!
-__LocalTrait_temporal_"#)
+__LocalTrait_temporal_"#,
+            )
     }));
 }
 
@@ -742,14 +955,20 @@ fn external_crate_addr_of_enum_show_expansion() {
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name == "chars"
-            && equals_normalized(&e.input, r#"_A _B _C _D _E _F _G _H _I _J _K _L _M _N _O _P _Q _R _S _T _U _V _W _X _Y _Z
+            && equals_normalized(
+                &e.input,
+                r#"_A _B _C _D _E _F _G _H _I _J _K _L _M _N _O _P _Q _R _S _T _U _V _W _X _Y _Z
            _a _b _c _d _e _f _g _h _i _j _k _l _m _n _o _p _q _r _s _t _u _v _w _x _y _z
-           _0 _1 _2 _3 _4 _5 _6 _7 _8 _9 __"#)
-            && equals_normalized(&e.to, r#"#[allow(non_camel_case_types)] pub struct _A
+           _0 _1 _2 _3 _4 _5 _6 _7 _8 _9 __"#,
+            )
+            && equals_normalized(
+                &e.to,
+                r#"#[allow(non_camel_case_types)] pub struct _A
            (:: core :: convert :: Infallible); chars!
            (_B _C _D _E _F _G _H _I _J _K _L _M _N _O _P _Q _R _S _T _U _V _W _X _Y _Z _a
            _b _c _d _e _f _g _h _i _j _k _l _m _n _o _p _q _r _s _t _u _v _w _x _y _z _0
-           _1 _2 _3 _4 _5 _6 _7 _8 _9 __);"#)
+           _1 _2 _3 _4 _5 _6 _7 _8 _9 __);"#,
+            )
     }));
 }
 
@@ -760,28 +979,40 @@ fn external_crate_addr_of_enum_test_test() {
         e.kind == MacroExpansionKind::Bang
             && e.name == "addr_of_enum"
             && equals_normalized(&e.input, r#"&e1, E1, 0"#)
-            && equals_normalized(&e.to, r#"< _ as $crate :: EnumHasTagAndField < $crate :: macro_def :: get_tstr!
+            && equals_normalized(
+                &e.to,
+                r#"< _ as $crate :: EnumHasTagAndField < $crate :: macro_def :: get_tstr!
            ($crate, E1), $crate :: macro_def :: get_tstr! ($crate, 0), >> ::
-           addr_of(&e1 as * const _)"#)
+           addr_of(&e1 as * const _)"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name == "chars"
-            && equals_normalized(&e.input, r#"_A _B _C _D _E _F _G _H _I _J _K _L _M _N _O _P _Q _R _S _T _U _V _W _X _Y _Z
+            && equals_normalized(
+                &e.input,
+                r#"_A _B _C _D _E _F _G _H _I _J _K _L _M _N _O _P _Q _R _S _T _U _V _W _X _Y _Z
            _a _b _c _d _e _f _g _h _i _j _k _l _m _n _o _p _q _r _s _t _u _v _w _x _y _z
-           _0 _1 _2 _3 _4 _5 _6 _7 _8 _9 __"#)
-            && equals_normalized(&e.to, r#"#[allow(non_camel_case_types)] pub struct _A
+           _0 _1 _2 _3 _4 _5 _6 _7 _8 _9 __"#,
+            )
+            && equals_normalized(
+                &e.to,
+                r#"#[allow(non_camel_case_types)] pub struct _A
            (:: core :: convert :: Infallible); chars!
            (_B _C _D _E _F _G _H _I _J _K _L _M _N _O _P _Q _R _S _T _U _V _W _X _Y _Z _a
            _b _c _d _e _f _g _h _i _j _k _l _m _n _o _p _q _r _s _t _u _v _w _x _y _z _0
-           _1 _2 _3 _4 _5 _6 _7 _8 _9 __);"#)
+           _1 _2 _3 _4 _5 _6 _7 _8 _9 __);"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name == "get_discriminant"
             && equals_normalized(&e.input, r#"E<u8>, E1"#)
-            && equals_normalized(&e.to, r#"< E<u8> as $crate :: EnumHasTag < $crate :: macro_def :: get_tstr!
-           ($crate, E1)>> :: discriminant()"#)
+            && equals_normalized(
+                &e.to,
+                r#"< E<u8> as $crate :: EnumHasTag < $crate :: macro_def :: get_tstr!
+           ($crate, E1)>> :: discriminant()"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
@@ -792,9 +1023,14 @@ fn external_crate_addr_of_enum_test_test() {
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Derive
             && e.name == "AddrOfEnum"
-            && equals_normalized(&e.input, r#"#[repr(C)] #[derive(PartialEq, Eq)] enum E<T>
-{ E1(usize, u8, u16), E2 { item1: u32, item2: T, }, #[allow(unused)] E3, }"#)
-            && starts_with_normalized(&e.to, r#"const _ : () =
+            && equals_normalized(
+                &e.input,
+                r#"#[repr(C)] #[derive(PartialEq, Eq)] enum E<T>
+{ E1(usize, u8, u16), E2 { item1: u32, item2: T, }, #[allow(unused)] E3, }"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"const _ : () =
 {
     #[automatically_derived] unsafe impl < T > :: addr_of_enum :: AddrOfEnum
     for E < T > {} unsafe impl < T > :: addr_of_enum :: EnumHasTag <
@@ -808,7 +1044,8 @@ fn external_crate_addr_of_enum_test_test() {
             MaybeUninit :: uninit(), :: core :: mem :: MaybeUninit ::
             uninit(),); #[doc = " SAFETY: both has same memory layout"] unsafe
             {
-                :: core :: mem ::"#)
+                :: core :: mem ::"#,
+            )
     }));
 }
 
@@ -824,137 +1061,191 @@ fn external_crate_newer_type_test_enum() {
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "implement"
-            && equals_normalized(&e.input, r#"enum BasicEnum
+            && equals_normalized(
+                &e.input,
+                r#"enum BasicEnum
 {
     VariantA(#[implement(BasicEnumTrait)] i32),
     VariantB(#[implement(BasicEnumTrait)] i32),
-}"#)
-            && equals_normalized(&e.to, r#"enum BasicEnum { VariantA(i32), VariantB(i32), } BasicEnumTrait!
+}"#,
+            )
+            && equals_normalized(
+                &e.to,
+                r#"enum BasicEnum { VariantA(i32), VariantB(i32), } BasicEnumTrait!
 {
     (BasicEnumTrait) enum BasicEnum
     {
         VariantA(#[implement(BasicEnumTrait)] i32),
         VariantB(#[implement(BasicEnumTrait)] i32),
     }
-}"#)
+}"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "target"
-            && equals_normalized(&e.input, r#"trait BasicEnumTrait { fn value(&self) -> i32; }"#)
-            && starts_with_normalized(&e.to, r#"#[doc(hidden)] #[macro_export] macro_rules!
-__newer_type_macro__"#)
+            && equals_normalized(
+                &e.input,
+                r#"trait BasicEnumTrait { fn value(&self) -> i32; }"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"#[doc(hidden)] #[macro_export] macro_rules!
+__newer_type_macro__"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name == "__implement_internal"
-            && starts_with_normalized(&e.input, r#"((MultiImplementTrait) enum MultiImplementEnum
+            && starts_with_normalized(
+                &e.input,
+                r#"((MultiImplementTrait) enum MultiImplementEnum
 {
     VariantOne(#[implement(MultiImplementTrait)] i32),
     VariantTwo(#[implement(MultiImplementTrait)] i32, i32),
 }) trait MultiImplementTrait { fn double(& self) -> i32; }, , :: newer_type,
-(i32), Repeater, "#)
-            && starts_with_normalized(&e.to, r#"#[automatically_derived] impl < > MultiImplementTrait for MultiImplementEnum
+(i32), Repeater, "#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"#[automatically_derived] impl < > MultiImplementTrait for MultiImplementEnum
 where i32 : MultiImplementTrait <> , i32 : MultiImplementTrait <>
 {
-    fn double(& self) -> < Self as Repeater < "#)
+    fn double(& self) -> < Self as Repeater < "#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name.starts_with("__newer_type_macro__")
-            && equals_normalized(&e.input, r#"(MultiImplementTrait) enum MultiImplementEnum
+            && equals_normalized(
+                &e.input,
+                r#"(MultiImplementTrait) enum MultiImplementEnum
             {
                 VariantOne(#[implement(MultiImplementTrait)] i32),
                 VariantTwo(#[implement(MultiImplementTrait)] i32, i32),
-            }"#)
-            && starts_with_normalized(&e.to, r#":: newer_type :: __implement_internal!
+            }"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#":: newer_type :: __implement_internal!
             {
                 ((MultiImplementTrait) enum MultiImplementEnum
                 {
                     VariantOne(#[implement(MultiImplementTrait)] i32),
                     VariantTwo(#[implement(MultiImplementTrait)] i32, i32),
                 }) trait MultiImplementTrait { fn double(& self) -> i32; }, , ::
-                newer_type, (i32), Repeater, "#)
+                newer_type, (i32), Repeater, "#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name.starts_with("__newer_type_macro__")
-            && equals_normalized(&e.input, r#"(NestedEnumTrait) enum NestedEnum
-            { Variant(#[implement(NestedEnumTrait)] Box < i32 >), }"#)
-            && starts_with_normalized(&e.to, r#":: newer_type :: __implement_internal!
+            && equals_normalized(
+                &e.input,
+                r#"(NestedEnumTrait) enum NestedEnum
+            { Variant(#[implement(NestedEnumTrait)] Box < i32 >), }"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#":: newer_type :: __implement_internal!
             {
                 ((NestedEnumTrait) enum NestedEnum
                 { Variant(#[implement(NestedEnumTrait)] Box < i32 >), }) trait
                 NestedEnumTrait { fn nested_value(& self) -> i32; }, , :: newer_type,
-                (i32), Repeater, "#)
+                (i32), Repeater, "#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name.starts_with("__newer_type_macro__")
-            && equals_normalized(&e.input, r#"(ComplexEnumTrait) enum ComplexEnum
+            && equals_normalized(
+                &e.input,
+                r#"(ComplexEnumTrait) enum ComplexEnum
             {
                 Named { id : u32, #[implement(ComplexEnumTrait)] data : (i32, i32), },
                 Tuple(u32, #[implement(ComplexEnumTrait)] (i32, i32)),
-            }"#)
-            && starts_with_normalized(&e.to, r#":: newer_type :: __implement_internal!
+            }"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#":: newer_type :: __implement_internal!
             {
                 ((ComplexEnumTrait) enum ComplexEnum
                 {
                     Named { id : u32, #[implement(ComplexEnumTrait)] data : (i32, i32), },
                     Tuple(u32, #[implement(ComplexEnumTrait)] (i32, i32)),
                 }) trait ComplexEnumTrait { fn compute(& self) -> i32; }, , :: newer_type,
-                (i32), Repeater, "#)
+                (i32), Repeater, "#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name.starts_with("__newer_type_macro__")
-            && equals_normalized(&e.input, r#"(GenericEnumTrait < U >) enum GenericEnum < U : Clone + Debug >
+            && equals_normalized(
+                &e.input,
+                r#"(GenericEnumTrait < U >) enum GenericEnum < U : Clone + Debug >
            {
                First(#[implement(GenericEnumTrait<U>)] U),
                Second(#[implement(GenericEnumTrait<U>)] U),
-           }"#)
-            && starts_with_normalized(&e.to, r#":: newer_type :: __implement_internal!
+           }"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#":: newer_type :: __implement_internal!
            {
                ((GenericEnumTrait < U >) enum GenericEnum < U : Clone + Debug >
                {
                    First(#[implement(GenericEnumTrait<U>)] U),
                    Second(#[implement(GenericEnumTrait<U>)] U),
                }) trait GenericEnumTrait < T > { fn describe(& self) -> String; }, , ::
-               newer_type, (String), Repeater, "#)
+               newer_type, (String), Repeater, "#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name.starts_with("__newer_type_macro__")
-            && equals_normalized(&e.input, r#"(NamedEnumTrait) enum NamedEnum
+            && equals_normalized(
+                &e.input,
+                r#"(NamedEnumTrait) enum NamedEnum
            {
                Named { a : i32, #[implement(NamedEnumTrait)] b : i32, },
                Tuple(#[implement(NamedEnumTrait)] i32, i32),
-           }"#)
-            && starts_with_normalized(&e.to, r#":: newer_type :: __implement_internal!
+           }"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#":: newer_type :: __implement_internal!
            {
                ((NamedEnumTrait) enum NamedEnum
                {
                    Named { a : i32, #[implement(NamedEnumTrait)] b : i32, },
                    Tuple(#[implement(NamedEnumTrait)] i32, i32),
                }) trait NamedEnumTrait { fn sum(& self) -> i32; }, , :: newer_type,
-               (i32), Repeater, "#)
+               (i32), Repeater, "#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name.starts_with("__newer_type_macro__")
-            && equals_normalized(&e.input, r#"(BasicEnumTrait) enum BasicEnum
+            && equals_normalized(
+                &e.input,
+                r#"(BasicEnumTrait) enum BasicEnum
            {
                VariantA(#[implement(BasicEnumTrait)] i32),
                VariantB(#[implement(BasicEnumTrait)] i32),
-           }"#)
-            && starts_with_normalized(&e.to, r#":: newer_type :: __implement_internal!
+           }"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#":: newer_type :: __implement_internal!
            {
                ((BasicEnumTrait) enum BasicEnum
                {
                    VariantA(#[implement(BasicEnumTrait)] i32),
                    VariantB(#[implement(BasicEnumTrait)] i32),
                }) trait BasicEnumTrait { fn value(& self) -> i32; }, , :: newer_type,
-               (i32), Repeater, "#)
+               (i32), Repeater, "#,
+            )
     }));
 }
 
@@ -963,8 +1254,16 @@ fn external_crate_newer_type_test_multi_self() {
     let expansions = run_trace_for_repo("newer-type", Some("multi_self"));
     assert_has(&expansions, MacroExpansionKind::Attribute, "implement");
     assert_has(&expansions, MacroExpansionKind::Attribute, "target");
-    assert_has(&expansions, MacroExpansionKind::Bang, "__implement_internal");
-    assert_has_prefix(&expansions, MacroExpansionKind::Bang, "__newer_type_macro__");
+    assert_has(
+        &expansions,
+        MacroExpansionKind::Bang,
+        "__implement_internal",
+    );
+    assert_has_prefix(
+        &expansions,
+        MacroExpansionKind::Bang,
+        "__newer_type_macro__",
+    );
 }
 
 #[test]
@@ -973,37 +1272,61 @@ fn external_crate_newer_type_test_string() {
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "implement"
-            && equals_normalized(&e.input, r#"#[allow(unused)] struct MyStruct { slot: u8, }"#)
-            && equals_normalized(&e.to, r#"#[allow(unused)] struct MyStruct { slot : u8, } ToString!
-{ (ToString) #[allow(unused)] struct MyStruct { slot : u8, } }"#)
+            && equals_normalized(
+                &e.input,
+                r#"#[allow(unused)] struct MyStruct { slot: u8, }"#,
+            )
+            && equals_normalized(
+                &e.to,
+                r#"#[allow(unused)] struct MyStruct { slot : u8, } ToString!
+{ (ToString) #[allow(unused)] struct MyStruct { slot : u8, } }"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "target"
-            && equals_normalized(&e.input, r#"pub trait ToString { fn to_string(&self) -> String; }"#)
-            && starts_with_normalized(&e.to, r#"#[doc(hidden)] #[macro_export] macro_rules!
-__newer_type_macro__"#)
+            && equals_normalized(
+                &e.input,
+                r#"pub trait ToString { fn to_string(&self) -> String; }"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"#[doc(hidden)] #[macro_export] macro_rules!
+__newer_type_macro__"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name == "__implement_internal"
-            && starts_with_normalized(&e.input, r#"((ToString) #[allow(unused)] struct MyStruct { slot : u8, }) pub trait
+            && starts_with_normalized(
+                &e.input,
+                r#"((ToString) #[allow(unused)] struct MyStruct { slot : u8, }) pub trait
 ToString { fn to_string(& self) -> String; }, :: std :: string :: ToString, ::
-newer_type, (String), Repeater, "#)
-            && starts_with_normalized(&e.to, r#"#[automatically_derived] impl < > :: std :: string :: ToString for MyStruct
+newer_type, (String), Repeater, "#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"#[automatically_derived] impl < > :: std :: string :: ToString for MyStruct
 where u8 : :: std :: string :: ToString <>
 {
-    fn to_string(& self) -> < Self as Repeater < "#)
+    fn to_string(& self) -> < Self as Repeater < "#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name.starts_with("__newer_type_macro__")
-            && equals_normalized(&e.input, r#"(ToString) #[allow(unused)] struct MyStruct { slot : u8, }"#)
-            && starts_with_normalized(&e.to, r#":: newer_type :: __implement_internal!
+            && equals_normalized(
+                &e.input,
+                r#"(ToString) #[allow(unused)] struct MyStruct { slot : u8, }"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#":: newer_type :: __implement_internal!
            {
                ((ToString) #[allow(unused)] struct MyStruct { slot : u8, }) pub trait
                ToString { fn to_string(& self) -> String; }, :: std :: string ::
-               ToString, :: newer_type, (String), Repeater, "#)
+               ToString, :: newer_type, (String), Repeater, "#,
+            )
     }));
 }
 
@@ -1014,66 +1337,99 @@ fn external_crate_newer_type_test_test2() {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "implement"
             && equals_normalized(&e.input, r#"struct MyNewType(MyExistingType);"#)
-            && equals_normalized(&e.to, r#"struct MyNewType(MyExistingType); MyTrait!
-{ (MyTrait) struct MyNewType(MyExistingType); }"#)
+            && equals_normalized(
+                &e.to,
+                r#"struct MyNewType(MyExistingType); MyTrait!
+{ (MyTrait) struct MyNewType(MyExistingType); }"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "target"
             && equals_normalized(&e.input, r#"trait MyTrait { fn value(&self) -> i32; }"#)
-            && starts_with_normalized(&e.to, r#"#[doc(hidden)] #[macro_export] macro_rules!
-__newer_type_macro__"#)
+            && starts_with_normalized(
+                &e.to,
+                r#"#[doc(hidden)] #[macro_export] macro_rules!
+__newer_type_macro__"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name == "__implement_internal"
-            && starts_with_normalized(&e.input, r#"((DefaultTrait) struct DefaultNewType(MyExistingType);) trait DefaultTrait
+            && starts_with_normalized(
+                &e.input,
+                r#"((DefaultTrait) struct DefaultNewType(MyExistingType);) trait DefaultTrait
 { fn default_value(& self) -> i32 { 999 } }, , :: newer_type, (i32), Repeater,
-"#)
-            && starts_with_normalized(&e.to, r#"#[automatically_derived] impl < > DefaultTrait for DefaultNewType where
+"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"#[automatically_derived] impl < > DefaultTrait for DefaultNewType where
 MyExistingType : DefaultTrait <>
 {
-    fn default_value(& self) -> < Self as Repeater < "#)
+    fn default_value(& self) -> < Self as Repeater < "#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name.starts_with("__newer_type_macro__")
-            && equals_normalized(&e.input, r#"(DefaultTrait) struct DefaultNewType(MyExistingType);"#)
-            && starts_with_normalized(&e.to, r#":: newer_type :: __implement_internal!
+            && equals_normalized(
+                &e.input,
+                r#"(DefaultTrait) struct DefaultNewType(MyExistingType);"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#":: newer_type :: __implement_internal!
             {
                 ((DefaultTrait) struct DefaultNewType(MyExistingType);) trait DefaultTrait
                 { fn default_value(& self) -> i32 { 999 } }, , :: newer_type, (i32),
-                Repeater, "#)
+                Repeater, "#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name.starts_with("__newer_type_macro__")
             && equals_normalized(&e.input, r#"(MyTrait) struct CopyNewType(MyExistingType);"#)
-            && starts_with_normalized(&e.to, r#":: newer_type :: __implement_internal!
+            && starts_with_normalized(
+                &e.to,
+                r#":: newer_type :: __implement_internal!
             {
                 ((MyTrait) struct CopyNewType(MyExistingType);) trait MyTrait
                 { fn value(& self) -> i32; }, , :: newer_type, (i32), Repeater,
-                "#)
+                "#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name.starts_with("__newer_type_macro__")
-            && equals_normalized(&e.input, r#"(GenericTrait < T >) struct GenericNewType < T > (Option < T >);"#)
-            && starts_with_normalized(&e.to, r#":: newer_type :: __implement_internal!
+            && equals_normalized(
+                &e.input,
+                r#"(GenericTrait < T >) struct GenericNewType < T > (Option < T >);"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#":: newer_type :: __implement_internal!
            {
                ((GenericTrait < T >) struct GenericNewType < T > (Option < T >);) trait
                GenericTrait < T > { fn get_value(& self) -> & T; }, , :: newer_type, (),
-               Repeater, "#)
+               Repeater, "#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name.starts_with("__newer_type_macro__")
-            && equals_normalized(&e.input, r#"(AnotherTrait) struct DualTraitNewType(MyExistingType);"#)
-            && starts_with_normalized(&e.to, r#":: newer_type :: __implement_internal!
+            && equals_normalized(
+                &e.input,
+                r#"(AnotherTrait) struct DualTraitNewType(MyExistingType);"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#":: newer_type :: __implement_internal!
            {
                ((AnotherTrait) struct DualTraitNewType(MyExistingType);) trait
                AnotherTrait { fn double_value(& self) -> i32; }, , :: newer_type, (i32),
-               Repeater, "#)
+               Repeater, "#,
+            )
     }));
 }
 
@@ -1167,7 +1523,10 @@ AssociatedConstNewType where BasicType : AssociatedConstTrait <>
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name.starts_with("__newer_type_macro__")
-            && equals_normalized(&e.input, r#"(MutatingTrait) struct MutatingNewType(BasicType);"#)
+            && equals_normalized(
+                &e.input,
+                r#"(MutatingTrait) struct MutatingNewType(BasicType);"#,
+            )
             && starts_with_normalized(
                 &e.to,
                 r#":: newer_type :: __implement_internal!
@@ -1337,39 +1696,56 @@ fn external_crate_newer_type_test_test4() {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "implement"
             && equals_normalized(&e.input, r#"struct ComplexNewType(AdvancedType);"#)
-            && equals_normalized(&e.to, r#"struct ComplexNewType(AdvancedType); ComplexTrait!
-{ (ComplexTrait) struct ComplexNewType(AdvancedType); }"#)
+            && equals_normalized(
+                &e.to,
+                r#"struct ComplexNewType(AdvancedType); ComplexTrait!
+{ (ComplexTrait) struct ComplexNewType(AdvancedType); }"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "target"
-            && equals_normalized(&e.input, r#"trait ComplexTrait
+            && equals_normalized(
+                &e.input,
+                r#"trait ComplexTrait
 {
     const SCALE: i32; type Output; fn compute(&self, input: i32) ->
     Self::Output;
-}"#)
-            && starts_with_normalized(&e.to, r#"#[doc(hidden)] #[macro_export] macro_rules!
-__newer_type_macro__"#)
+}"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"#[doc(hidden)] #[macro_export] macro_rules!
+__newer_type_macro__"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name == "__implement_internal"
-            && starts_with_normalized(&e.input, r#"((for < 'a, A > FreeParamComplex < 'a, A, String > where A : Debug + Clone)
+            && starts_with_normalized(
+                &e.input,
+                r#"((for < 'a, A > FreeParamComplex < 'a, A, String > where A : Debug + Clone)
 struct FreeParamComplexNewType(AdvancedType);) trait FreeParamComplex < 'a, A,
 B > where A : :: core :: fmt :: Debug + :: core :: clone :: Clone, B : :: core
 :: default :: Default,
 {
     const MULTIPLIER : i32; type Output; fn perform(& self, input : & 'a A) ->
     (Self :: Output, B);
-}, , :: newer_type, (i32), Repeater, "#)
+}, , :: newer_type, (i32), Repeater, "#,
+            )
             && starts_with_normalized(&e.to, r#"#[automatically_derived] impl < 'a_newer_type_"#)
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name.starts_with("__newer_type_macro__")
-            && equals_normalized(&e.input, r#"(for < 'a, A > FreeParamComplex < 'a, A, String > where A : Debug + Clone)
-            struct FreeParamComplexNewType(AdvancedType);"#)
-            && starts_with_normalized(&e.to, r#":: newer_type :: __implement_internal!
+            && equals_normalized(
+                &e.input,
+                r#"(for < 'a, A > FreeParamComplex < 'a, A, String > where A : Debug + Clone)
+            struct FreeParamComplexNewType(AdvancedType);"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#":: newer_type :: __implement_internal!
             {
                 ((for < 'a, A > FreeParamComplex < 'a, A, String > where A : Debug +
                 Clone) struct FreeParamComplexNewType(AdvancedType);) trait
@@ -1378,13 +1754,19 @@ B > where A : :: core :: fmt :: Debug + :: core :: clone :: Clone, B : :: core
                 {
                     const MULTIPLIER : i32; type Output; fn
                     perform(& self, input : & 'a A) -> (Self :: Output, B);
-                }, , :: newer_type, (i32), Repeater, "#)
+                }, , :: newer_type, (i32), Repeater, "#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name.starts_with("__newer_type_macro__")
-            && equals_normalized(&e.input, r#"(ConstrainedTrait < String >) struct ConstrainedNewType(AdvancedType);"#)
-            && starts_with_normalized(&e.to, r#":: newer_type :: __implement_internal!
+            && equals_normalized(
+                &e.input,
+                r#"(ConstrainedTrait < String >) struct ConstrainedNewType(AdvancedType);"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#":: newer_type :: __implement_internal!
            {
                ((ConstrainedTrait < String >) struct ConstrainedNewType(AdvancedType);)
                trait ConstrainedTrait < T > where T : :: core :: fmt :: Debug + :: core
@@ -1392,32 +1774,45 @@ B > where A : :: core :: fmt :: Debug + :: core :: clone :: Clone, B : :: core
                {
                    const LIMIT : usize; type Item; fn process(& self, input : T) -> Self
                    :: Item;
-               }, , :: newer_type, (usize), Repeater, "#)
+               }, , :: newer_type, (usize), Repeater, "#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name.starts_with("__newer_type_macro__")
-            && equals_normalized(&e.input, r#"(MultiAssocTrait < i32 >) struct MultiAssocNewType(AdvancedType);"#)
-            && starts_with_normalized(&e.to, r#":: newer_type :: __implement_internal!
+            && equals_normalized(
+                &e.input,
+                r#"(MultiAssocTrait < i32 >) struct MultiAssocNewType(AdvancedType);"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#":: newer_type :: __implement_internal!
            {
                ((MultiAssocTrait < i32 >) struct MultiAssocNewType(AdvancedType);) trait
                MultiAssocTrait < T >
                {
                    const FACTOR : T; type Result; fn transform(& self, input : T) -> Self
                    :: Result;
-               }, , :: newer_type, (), Repeater, "#)
+               }, , :: newer_type, (), Repeater, "#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name.starts_with("__newer_type_macro__")
-            && equals_normalized(&e.input, r#"(ComplexTrait) struct ComplexNewType(AdvancedType);"#)
-            && starts_with_normalized(&e.to, r#":: newer_type :: __implement_internal!
+            && equals_normalized(
+                &e.input,
+                r#"(ComplexTrait) struct ComplexNewType(AdvancedType);"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#":: newer_type :: __implement_internal!
            {
                ((ComplexTrait) struct ComplexNewType(AdvancedType);) trait ComplexTrait
                {
                    const SCALE : i32; type Output; fn compute(& self, input : i32) ->
                    Self :: Output;
-               }, , :: newer_type, (i32), Repeater, "#)
+               }, , :: newer_type, (i32), Repeater, "#,
+            )
     }));
 }
 
@@ -1428,77 +1823,108 @@ fn external_crate_newer_type_test_test5() {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "implement"
             && equals_normalized(&e.input, r#"#[allow(unused)] struct MyWrapper(String);"#)
-            && equals_normalized(&e.to, r#"#[allow(unused)] struct MyWrapper(String); m :: MyNewTrait!
-{ (m :: MyNewTrait) #[allow(unused)] struct MyWrapper(String); }"#)
+            && equals_normalized(
+                &e.to,
+                r#"#[allow(unused)] struct MyWrapper(String); m :: MyNewTrait!
+{ (m :: MyNewTrait) #[allow(unused)] struct MyWrapper(String); }"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "target"
-            && equals_normalized(&e.input, r#"pub trait MyNewTrait
+            && equals_normalized(
+                &e.input,
+                r#"pub trait MyNewTrait
 {
     type MyType<'a> where Self: 'a; fn get<'a>(&'a self, a: T) ->
     Self::MyType<'a>;
-}"#)
-            && starts_with_normalized(&e.to, r#"#[doc(hidden)] #[macro_export] macro_rules!
-__newer_type_macro__"#)
+}"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"#[doc(hidden)] #[macro_export] macro_rules!
+__newer_type_macro__"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name == "__implement_internal"
-            && starts_with_normalized(&e.input, r#"((m :: MyNewTrait) #[allow(unused)] struct MyWrapper(String);) pub trait
+            && starts_with_normalized(
+                &e.input,
+                r#"((m :: MyNewTrait) #[allow(unused)] struct MyWrapper(String);) pub trait
 MyNewTrait
 {
     type MyType < 'a > where Self : 'a; fn get < 'a > (& 'a self, a : T) ->
     Self :: MyType < 'a > ;
-}, , :: newer_type, (T), crate :: Repeater, "#)
-            && starts_with_normalized(&e.to, r#"#[automatically_derived] impl < > m :: MyNewTrait for MyWrapper where String :
+}, , :: newer_type, (T), crate :: Repeater, "#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"#[automatically_derived] impl < > m :: MyNewTrait for MyWrapper where String :
 m :: MyNewTrait <>
 {
     type MyType < 'a > = <String as m :: MyNewTrait >::MyType < 'a > where
     Self : 'a; fn get < 'a >
-    (& 'a self, a : < Self as crate :: Repeater < "#)
+    (& 'a self, a : < Self as crate :: Repeater < "#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name.starts_with("__newer_type_macro__")
-            && equals_normalized(&e.input, r#"(m :: MyNewTrait) #[allow(unused)] struct MyWrapper(String);"#)
-            && starts_with_normalized(&e.to, r#":: newer_type :: __implement_internal!
+            && equals_normalized(
+                &e.input,
+                r#"(m :: MyNewTrait) #[allow(unused)] struct MyWrapper(String);"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#":: newer_type :: __implement_internal!
            {
                ((m :: MyNewTrait) #[allow(unused)] struct MyWrapper(String);) pub trait
                MyNewTrait
                {
                    type MyType < 'a > where Self : 'a; fn get < 'a > (& 'a self, a : T)
                    -> Self :: MyType < 'a > ;
-               }, , :: newer_type, (T), crate :: Repeater, "#)
+               }, , :: newer_type, (T), crate :: Repeater, "#,
+            )
     }));
 }
 
 #[test]
 fn external_crate_parametrized_show_expansion() {
     let expansions = run_trace_for_repo("parametrized", None);
-    if expansions.is_empty() { return; }
+    if expansions.is_empty() {
+        return;
+    }
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "sumtrait"
-            && equals_normalized(&e.input, r#"/// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
+            && equals_normalized(
+                &e.input,
+                r#"/// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
 #[allow(private_bounds)] pub trait Read
 {
     fn read(& mut self, buf : & mut [:: core :: primitive :: u8]) -> :: std ::
     io :: Result < :: core :: primitive :: usize > ;
-}"#)
-            && starts_with_normalized(&e.to, r#"#[doc =
+}"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"#[doc =
 " Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`]."]
 #[allow(private_bounds)] pub trait Read
 {
     fn read(& mut self, buf : & mut [:: core :: primitive :: u8]) -> :: std ::
     io :: Result < :: core :: primitive :: usize > ;
 } #[doc(hidden)] #[macro_export] macro_rules!
-__sumtype_macro_"#)
+__sumtype_macro_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name == "emit_impl_trait"
-            && starts_with_normalized(&e.input, r#"[map, into_iter, iter_mut,] impl_generics = [T], PARAM = 0, Self = Vec<T>,
+            && starts_with_normalized(
+                &e.input,
+                r#"[map, into_iter, iter_mut,] impl_generics = [T], PARAM = 0, Self = Vec<T>,
             self = self,
             {
                 Item = < Self as IntoIterator > :: Item, MIN_LEN = 0, MAX_LEN = None,
@@ -1512,8 +1938,11 @@ __sumtype_macro_"#)
                 IterMut = < & 'a mut Self as IntoIterator > :: IntoIter, param_iter_mut =
                 {< & 'a mut Self as IntoIterator > :: into_iter(self)},
             }
-            {"#)
-            && starts_with_normalized(&e.to, r#"impl < T, M > ParametrizedMap < 0, M > for Vec<T>
+            {"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"impl < T, M > ParametrizedMap < 0, M > for Vec<T>
             {
                 type Mapped = Vec<M>; fn
                 param_map(self, f : impl FnMut(Self :: Item) -> M) -> Self :: Mapped
@@ -1527,19 +1956,25 @@ __sumtype_macro_"#)
             }
             {
                 lt = 'a, Iter = < & 'a Self as IntoIterator > :: IntoIter, param_iter =
-                {< & 'a Self as IntoIterator > :: into_iter(self)},"#)
+                {< & 'a Self as IntoIterator > :: into_iter(self)},"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name == "impl_all"
-            && equals_normalized(&e.input, r#"[T] map, into_iter, iter_mut for Vec<T>, T = M, Mapped = Vec<M>; [T] into_iter
+            && equals_normalized(
+                &e.input,
+                r#"[T] map, into_iter, iter_mut for Vec<T>, T = M, Mapped = Vec<M>; [T] into_iter
             for std::collections::BTreeSet<T>; [T] into_iter for
             std::collections::HashSet<T>; [T] into_iter for
             std::collections::BinaryHeap<T>; [T] map, into_iter, iter_mut for
             std::collections::LinkedList<T>, T = M, Mapped =
             std::collections::LinkedList<M>; [T] map, into_iter, iter_mut for
-            std::collections::VecDeque<T>, T = M, Mapped = std::collections::VecDeque<M>;"#)
-            && starts_with_normalized(&e.to, r#"emit_impl_trait!
+            std::collections::VecDeque<T>, T = M, Mapped = std::collections::VecDeque<M>;"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"emit_impl_trait!
             ([map, into_iter, iter_mut,] impl_generics = [T], PARAM = 0, Self = Vec<T>,
             self = self,
             {
@@ -1553,13 +1988,16 @@ __sumtype_macro_"#)
             {
                 IterMut = < & 'a mut Self as IntoIterator > :: IntoIter, param_iter_mut =
                 {< & 'a mut Self as IntoIterator > :: into_iter(self)},
-            }"#)
+            }"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name == "impl_for_tuple"
             && equals_normalized(&e.input, r#"[] T []"#)
-            && starts_with_normalized(&e.to, r#"impl < T > Parametrized < {impl_for_tuple! (@ count)}> for (T,)
+            && starts_with_normalized(
+                &e.to,
+                r#"impl < T > Parametrized < {impl_for_tuple! (@ count)}> for (T,)
             {
                 type Item = T; const MIN_LEN : usize = 1; const MAX_LEN : Option < usize >
                 = Some(1); fn param_len(& self) -> usize { 1 } type Iter < 'a > = :: core
@@ -1573,14 +2011,17 @@ __sumtype_macro_"#)
                     [& self.0, & self.1, & self.2, & self.3, & self.4, & self.5, & self.6,
                     & self.7, & self.8, & self.9, & self.10, & self.11]))
                 }
-            } impl < T > ParametrizedIterMut < {impl_for_tuple! (@ count)}> for (T,)"#)
+            } impl < T > ParametrizedIterMut < {impl_for_tuple! (@ count)}> for (T,)"#,
+            )
     }));
 }
 
 #[test]
 fn external_crate_parametrized_test_flatten_bug() {
     let expansions = run_trace_for_repo("parametrized", Some("flatten_bug"));
-    if expansions.is_empty() { return; }
+    if expansions.is_empty() {
+        return;
+    }
     assert_expansion(
         &expansions,
         MacroExpansionKind::Attribute,
@@ -1693,7 +2134,9 @@ __Sumtype_ConstraintExprTrait_0_"#,
 #[test]
 fn external_crate_parametrized_test_recursive() {
     let expansions = run_trace_for_repo("parametrized", Some("recursive"));
-    if expansions.is_empty() { return; }
+    if expansions.is_empty() {
+        return;
+    }
     assert_has(&expansions, MacroExpansionKind::Attribute, "parametrized");
     assert_has(&expansions, MacroExpansionKind::Attribute, "sumtrait");
     assert_has(&expansions, MacroExpansionKind::Attribute, "sumtype");
@@ -1707,7 +2150,9 @@ fn external_crate_parametrized_test_recursive() {
 #[test]
 fn external_crate_parametrized_test_test() {
     let expansions = run_trace_for_repo("parametrized", Some("test"));
-    if expansions.is_empty() { return; }
+    if expansions.is_empty() {
+        return;
+    }
     assert_has(&expansions, MacroExpansionKind::Attribute, "parametrized");
     assert_has(&expansions, MacroExpansionKind::Attribute, "sumtrait");
     assert_has(&expansions, MacroExpansionKind::Bang, "emit_impl_trait");
@@ -1718,7 +2163,9 @@ fn external_crate_parametrized_test_test() {
 #[test]
 fn external_crate_parametrized_test_test_enum() {
     let expansions = run_trace_for_repo("parametrized", Some("test_enum"));
-    if expansions.is_empty() { return; }
+    if expansions.is_empty() {
+        return;
+    }
     assert_has(&expansions, MacroExpansionKind::Attribute, "parametrized");
     assert_has(&expansions, MacroExpansionKind::Attribute, "sumtrait");
     assert_has(&expansions, MacroExpansionKind::Attribute, "sumtype");
@@ -1732,7 +2179,9 @@ fn external_crate_parametrized_test_test_enum() {
 #[test]
 fn external_crate_parametrized_test_tuple() {
     let expansions = run_trace_for_repo("parametrized", Some("tuple"));
-    if expansions.is_empty() { return; }
+    if expansions.is_empty() {
+        return;
+    }
     assert_has(&expansions, MacroExpansionKind::Attribute, "parametrized");
     assert_has(&expansions, MacroExpansionKind::Attribute, "sumtrait");
     assert_has(&expansions, MacroExpansionKind::Bang, "emit_impl_trait");
@@ -1743,30 +2192,40 @@ fn external_crate_parametrized_test_tuple() {
 #[test]
 fn external_crate_sumtype_show_expansion() {
     let expansions = run_trace_for_repo("sumtype", None);
-    if expansions.is_empty() { return; }
+    if expansions.is_empty() {
+        return;
+    }
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "sumtrait"
-            && equals_normalized(&e.input, r#"/// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
+            && equals_normalized(
+                &e.input,
+                r#"/// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
 #[allow(private_bounds)] pub trait Read
 {
     fn read(& mut self, buf : & mut [:: core :: primitive :: u8]) -> :: std ::
     io :: Result < :: core :: primitive :: usize > ;
-}"#)
-            && starts_with_normalized(&e.to, r#"#[doc =
+}"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"#[doc =
 " Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`]."]
 #[allow(private_bounds)] pub trait Read
 {
     fn read(& mut self, buf : & mut [:: core :: primitive :: u8]) -> :: std ::
     io :: Result < :: core :: primitive :: usize > ;
 } #[doc(hidden)] #[macro_export] macro_rules!
-__sumtype_macro_"#)
+__sumtype_macro_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name == "emit_traits"
             && equals_normalized(&e.input, "")
-            && starts_with_normalized(&e.to, r#"#[doc(hidden)] pub struct Marker(:: core :: convert :: Infallible);
+            && starts_with_normalized(
+                &e.to,
+                r#"#[doc(hidden)] pub struct Marker(:: core :: convert :: Infallible);
             /// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
             #[sumtrait(implement = :: std :: io :: Read, krate = $crate, marker = $crate
             :: traits :: Marker)] #[allow(private_bounds)] pub trait Read
@@ -1780,36 +2239,47 @@ __sumtype_macro_"#)
             }
             /// Target of [`sumtype::sumtype`] macro, which implements [`std::iter::Iterator`].
             #[sumtrait(implement = :: core :: iter :: Iterator, krate = $crate, marker =
-            $crate :: traits :: Marker)] #[allow(private_bounds)] pub trait Iterator"#)
+            $crate :: traits :: Marker)] #[allow(private_bounds)] pub trait Iterator"#,
+            )
     }));
 }
 
 #[test]
 fn external_crate_sumtype_test_bug() {
     let expansions = run_trace_for_repo("sumtype", Some("bug"));
-    if expansions.is_empty() { return; }
+    if expansions.is_empty() {
+        return;
+    }
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "sumtrait"
-            && equals_normalized(&e.input, r#"/// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
+            && equals_normalized(
+                &e.input,
+                r#"/// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
 #[allow(private_bounds)] pub trait Read
 {
     fn read(& mut self, buf : & mut [:: core :: primitive :: u8]) -> :: std ::
     io :: Result < :: core :: primitive :: usize > ;
-}"#)
-            && starts_with_normalized(&e.to, r#"#[doc =
+}"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"#[doc =
 " Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`]."]
 #[allow(private_bounds)] pub trait Read
 {
     fn read(& mut self, buf : & mut [:: core :: primitive :: u8]) -> :: std ::
     io :: Result < :: core :: primitive :: usize > ;
 } #[doc(hidden)] #[macro_export] macro_rules!
-__sumtype_macro_"#)
+__sumtype_macro_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "sumtype"
-            && starts_with_normalized(&e.input, r#"impl<T> Parametrized<0usize> for E<T>
+            && starts_with_normalized(
+                &e.input,
+                r#"impl<T> Parametrized<0usize> for E<T>
 {
     type Item = T; type Iter <'__parametrized_lt > = sumtype!
     ['__parametrized_lt] where (Self, Self :: Item) : '__parametrized_lt; fn
@@ -1823,31 +2293,46 @@ __sumtype_macro_"#)
                 sumtype!
                 ({
                     let __parametrized_fn : fn(& '__parametrized_lt T) -> _ = |
-                    __parametrized_arg |"#)
-            && starts_with_normalized(&e.to, r#"#[doc(hidden)] #[allow(non_camel_case_types)] #[allow(non_camel_case_types)]
-struct __SumType_RefType_"#)
+                    __parametrized_arg |"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"#[doc(hidden)] #[allow(non_camel_case_types)] #[allow(non_camel_case_types)]
+struct __SumType_RefType_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name.starts_with("__sumtype_macro_")
             && starts_with_normalized(&e.input, r#"__Sumtype_ConstraintExprTrait_0_"#)
-            && starts_with_normalized(&e.to, r#"$crate :: _sumtrait_internal!
+            && starts_with_normalized(
+                &e.to,
+                r#"$crate :: _sumtrait_internal!
            ({
-               __Sumtype_ConstraintExprTrait_0_"#)
+               __Sumtype_ConstraintExprTrait_0_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name == "_sumtrait_internal"
-            && starts_with_normalized(&e.input, r#"{
-    __Sumtype_ConstraintExprTrait_0_"#)
-            && starts_with_normalized(&e.to, r#"#[allow(non_camel_case_types)] trait
-__Sumtype_ConstraintExprTrait_0_"#)
+            && starts_with_normalized(
+                &e.input,
+                r#"{
+    __Sumtype_ConstraintExprTrait_0_"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"#[allow(non_camel_case_types)] trait
+__Sumtype_ConstraintExprTrait_0_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name == "emit_traits"
             && equals_normalized(&e.input, "")
-            && starts_with_normalized(&e.to, r#"#[doc(hidden)] pub struct Marker(:: core :: convert :: Infallible);
+            && starts_with_normalized(
+                &e.to,
+                r#"#[doc(hidden)] pub struct Marker(:: core :: convert :: Infallible);
             /// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
             #[sumtrait(implement = :: std :: io :: Read, krate = $crate, marker = $crate
             :: traits :: Marker)] #[allow(private_bounds)] pub trait Read
@@ -1861,72 +2346,101 @@ __Sumtype_ConstraintExprTrait_0_"#)
             }
             /// Target of [`sumtype::sumtype`] macro, which implements [`std::iter::Iterator`].
             #[sumtrait(implement = :: core :: iter :: Iterator, krate = $crate, marker =
-            $crate :: traits :: Marker)] #[allow(private_bounds)] pub trait Iterator"#)
+            $crate :: traits :: Marker)] #[allow(private_bounds)] pub trait Iterator"#,
+            )
     }));
 }
 
 #[test]
 fn external_crate_sumtype_test_debug_display_test() {
     let expansions = run_trace_for_repo("sumtype", Some("debug_display_test"));
-    if expansions.is_empty() { return; }
+    if expansions.is_empty() {
+        return;
+    }
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "sumtrait"
-            && equals_normalized(&e.input, r#"/// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
+            && equals_normalized(
+                &e.input,
+                r#"/// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
 #[allow(private_bounds)] pub trait Read
 {
     fn read(& mut self, buf : & mut [:: core :: primitive :: u8]) -> :: std ::
     io :: Result < :: core :: primitive :: usize > ;
-}"#)
-            && starts_with_normalized(&e.to, r#"#[doc =
+}"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"#[doc =
 " Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`]."]
 #[allow(private_bounds)] pub trait Read
 {
     fn read(& mut self, buf : & mut [:: core :: primitive :: u8]) -> :: std ::
     io :: Result < :: core :: primitive :: usize > ;
 } #[doc(hidden)] #[macro_export] macro_rules!
-__sumtype_macro_"#)
+__sumtype_macro_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "sumtype"
-            && equals_normalized(&e.input, r#"fn get_debug(use_a: bool) -> impl std::fmt::Debug
+            && equals_normalized(
+                &e.input,
+                r#"fn get_debug(use_a: bool) -> impl std::fmt::Debug
 {
     if use_a { sumtype!(TestStructA(42)) } else
     { sumtype!(TestStructB("hello".to_string())) }
-}"#)
-            && starts_with_normalized(&e.to, r#"#[doc(hidden)] #[allow(non_camel_case_types)] trait
-__Sumtype_TypeRef_Trait_"#)
+}"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"#[doc(hidden)] #[allow(non_camel_case_types)] trait
+__Sumtype_TypeRef_Trait_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name.starts_with("__sumtype_macro_")
             && starts_with_normalized(&e.input, r#"__Sumtype_ConstraintExprTrait_0_"#)
-            && starts_with_normalized(&e.to, r#"$crate :: _sumtrait_internal!
+            && starts_with_normalized(
+                &e.to,
+                r#"$crate :: _sumtrait_internal!
            ({
-               __Sumtype_ConstraintExprTrait_0_"#)
+               __Sumtype_ConstraintExprTrait_0_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name.starts_with("__sumtype_macro_")
             && starts_with_normalized(&e.input, r#"__Sumtype_ConstraintExprTrait_0_"#)
-            && starts_with_normalized(&e.to, r#"$crate :: _sumtrait_internal!
+            && starts_with_normalized(
+                &e.to,
+                r#"$crate :: _sumtrait_internal!
            ({
-               __Sumtype_ConstraintExprTrait_0_"#)
+               __Sumtype_ConstraintExprTrait_0_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name == "_sumtrait_internal"
-            && starts_with_normalized(&e.input, r#"{
-    __Sumtype_ConstraintExprTrait_0_"#)
-            && starts_with_normalized(&e.to, r#"#[allow(non_camel_case_types)] trait
-__Sumtype_ConstraintExprTrait_0_"#)
+            && starts_with_normalized(
+                &e.input,
+                r#"{
+    __Sumtype_ConstraintExprTrait_0_"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"#[allow(non_camel_case_types)] trait
+__Sumtype_ConstraintExprTrait_0_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name == "emit_traits"
             && equals_normalized(&e.input, "")
-            && starts_with_normalized(&e.to, r#"#[doc(hidden)] pub struct Marker(:: core :: convert :: Infallible);
+            && starts_with_normalized(
+                &e.to,
+                r#"#[doc(hidden)] pub struct Marker(:: core :: convert :: Infallible);
             /// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
             #[sumtrait(implement = :: std :: io :: Read, krate = $crate, marker = $crate
             :: traits :: Marker)] #[allow(private_bounds)] pub trait Read
@@ -1940,36 +2454,47 @@ __Sumtype_ConstraintExprTrait_0_"#)
             }
             /// Target of [`sumtype::sumtype`] macro, which implements [`std::iter::Iterator`].
             #[sumtrait(implement = :: core :: iter :: Iterator, krate = $crate, marker =
-            $crate :: traits :: Marker)] #[allow(private_bounds)] pub trait Iterator"#)
+            $crate :: traits :: Marker)] #[allow(private_bounds)] pub trait Iterator"#,
+            )
     }));
 }
 
 #[test]
 fn external_crate_sumtype_test_error_test() {
     let expansions = run_trace_for_repo("sumtype", Some("error_test"));
-    if expansions.is_empty() { return; }
+    if expansions.is_empty() {
+        return;
+    }
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "sumtrait"
-            && equals_normalized(&e.input, r#"/// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
+            && equals_normalized(
+                &e.input,
+                r#"/// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
 #[allow(private_bounds)] pub trait Read
 {
     fn read(& mut self, buf : & mut [:: core :: primitive :: u8]) -> :: std ::
     io :: Result < :: core :: primitive :: usize > ;
-}"#)
-            && starts_with_normalized(&e.to, r#"#[doc =
+}"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"#[doc =
 " Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`]."]
 #[allow(private_bounds)] pub trait Read
 {
     fn read(& mut self, buf : & mut [:: core :: primitive :: u8]) -> :: std ::
     io :: Result < :: core :: primitive :: usize > ;
 } #[doc(hidden)] #[macro_export] macro_rules!
-__sumtype_macro_"#)
+__sumtype_macro_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "sumtype"
-            && equals_normalized(&e.input, r#"fn get_error(error_type: &str) -> impl std::error::Error
+            && equals_normalized(
+                &e.input,
+                r#"fn get_error(error_type: &str) -> impl std::error::Error
 {
     match error_type
     {
@@ -1980,47 +2505,68 @@ __sumtype_macro_"#)
         { code: 404, message: "Not Found".to_string() }), _ =>
         sumtype!(IoError("Unknown error".to_string())),
     }
-}"#)
-            && starts_with_normalized(&e.to, r#"#[doc(hidden)] #[allow(non_camel_case_types)] trait
-__Sumtype_TypeRef_Trait_"#)
+}"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"#[doc(hidden)] #[allow(non_camel_case_types)] trait
+__Sumtype_TypeRef_Trait_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name.starts_with("__sumtype_macro_")
             && starts_with_normalized(&e.input, r#"__Sumtype_ConstraintExprTrait_0_"#)
-            && starts_with_normalized(&e.to, r#"$crate :: _sumtrait_internal!
+            && starts_with_normalized(
+                &e.to,
+                r#"$crate :: _sumtrait_internal!
            ({
-               __Sumtype_ConstraintExprTrait_0_"#)
+               __Sumtype_ConstraintExprTrait_0_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name.starts_with("__sumtype_macro_")
             && starts_with_normalized(&e.input, r#"__SumTrait_ConstraintTrait_0_"#)
-            && starts_with_normalized(&e.to, r#"$crate :: _sumtrait_internal!
+            && starts_with_normalized(
+                &e.to,
+                r#"$crate :: _sumtrait_internal!
            ({
-               __SumTrait_ConstraintTrait_0_"#)
+               __SumTrait_ConstraintTrait_0_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name.starts_with("__sumtype_macro_")
             && starts_with_normalized(&e.input, r#"__SumTrait_ConstraintTrait_1_"#)
-            && starts_with_normalized(&e.to, r#"$crate :: _sumtrait_internal!
+            && starts_with_normalized(
+                &e.to,
+                r#"$crate :: _sumtrait_internal!
            ({
-               __SumTrait_ConstraintTrait_1_"#)
+               __SumTrait_ConstraintTrait_1_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name == "_sumtrait_internal"
-            && starts_with_normalized(&e.input, r#"{
-    __Sumtype_ConstraintExprTrait_0_"#)
-            && starts_with_normalized(&e.to, r#"$crate :: traits :: Debug!
-(__SumTrait_ConstraintTrait_0_"#)
+            && starts_with_normalized(
+                &e.input,
+                r#"{
+    __Sumtype_ConstraintExprTrait_0_"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"$crate :: traits :: Debug!
+(__SumTrait_ConstraintTrait_0_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name == "emit_traits"
             && equals_normalized(&e.input, "")
-            && starts_with_normalized(&e.to, r#"#[doc(hidden)] pub struct Marker(:: core :: convert :: Infallible);
+            && starts_with_normalized(
+                &e.to,
+                r#"#[doc(hidden)] pub struct Marker(:: core :: convert :: Infallible);
             /// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
             #[sumtrait(implement = :: std :: io :: Read, krate = $crate, marker = $crate
             :: traits :: Marker)] #[allow(private_bounds)] pub trait Read
@@ -2034,36 +2580,47 @@ __Sumtype_TypeRef_Trait_"#)
             }
             /// Target of [`sumtype::sumtype`] macro, which implements [`std::iter::Iterator`].
             #[sumtrait(implement = :: core :: iter :: Iterator, krate = $crate, marker =
-            $crate :: traits :: Marker)] #[allow(private_bounds)] pub trait Iterator"#)
+            $crate :: traits :: Marker)] #[allow(private_bounds)] pub trait Iterator"#,
+            )
     }));
 }
 
 #[test]
 fn external_crate_sumtype_test_large() {
     let expansions = run_trace_for_repo("sumtype", Some("large"));
-    if expansions.is_empty() { return; }
+    if expansions.is_empty() {
+        return;
+    }
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "sumtrait"
-            && equals_normalized(&e.input, r#"/// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
+            && equals_normalized(
+                &e.input,
+                r#"/// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
 #[allow(private_bounds)] pub trait Read
 {
     fn read(& mut self, buf : & mut [:: core :: primitive :: u8]) -> :: std ::
     io :: Result < :: core :: primitive :: usize > ;
-}"#)
-            && starts_with_normalized(&e.to, r#"#[doc =
+}"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"#[doc =
 " Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`]."]
 #[allow(private_bounds)] pub trait Read
 {
     fn read(& mut self, buf : & mut [:: core :: primitive :: u8]) -> :: std ::
     io :: Result < :: core :: primitive :: usize > ;
 } #[doc(hidden)] #[macro_export] macro_rules!
-__sumtype_macro_"#)
+__sumtype_macro_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "sumtype"
-            && equals_normalized(&e.input, r#"impl MyTrait for ()
+            && equals_normalized(
+                &e.input,
+                r#"impl MyTrait for ()
 {
     type Ty<'a, T> = sumtype!['a, T] where T: 'a; fn f<'a,
     T>(i: usize, t: &'a T) -> Self::Ty<'a, T>
@@ -2078,31 +2635,46 @@ __sumtype_macro_"#)
             std::iter::Take<std::iter::Repeat<&'a T>>)
         }
     }
-}"#)
-            && starts_with_normalized(&e.to, r#"#[doc(hidden)] #[allow(non_camel_case_types)] #[allow(non_camel_case_types)]
-struct __SumType_RefType_"#)
+}"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"#[doc(hidden)] #[allow(non_camel_case_types)] #[allow(non_camel_case_types)]
+struct __SumType_RefType_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name.starts_with("__sumtype_macro_")
             && starts_with_normalized(&e.input, r#"__Sumtype_ConstraintExprTrait_0_"#)
-            && starts_with_normalized(&e.to, r#"$crate :: _sumtrait_internal!
+            && starts_with_normalized(
+                &e.to,
+                r#"$crate :: _sumtrait_internal!
            ({
-               __Sumtype_ConstraintExprTrait_0_"#)
+               __Sumtype_ConstraintExprTrait_0_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name == "_sumtrait_internal"
-            && starts_with_normalized(&e.input, r#"{
-    __Sumtype_ConstraintExprTrait_0_"#)
-            && starts_with_normalized(&e.to, r#"#[allow(non_camel_case_types)] trait
-__Sumtype_ConstraintExprTrait_0_"#)
+            && starts_with_normalized(
+                &e.input,
+                r#"{
+    __Sumtype_ConstraintExprTrait_0_"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"#[allow(non_camel_case_types)] trait
+__Sumtype_ConstraintExprTrait_0_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name == "emit_traits"
             && equals_normalized(&e.input, "")
-            && starts_with_normalized(&e.to, r#"#[doc(hidden)] pub struct Marker(:: core :: convert :: Infallible);
+            && starts_with_normalized(
+                &e.to,
+                r#"#[doc(hidden)] pub struct Marker(:: core :: convert :: Infallible);
             /// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
             #[sumtrait(implement = :: std :: io :: Read, krate = $crate, marker = $crate
             :: traits :: Marker)] #[allow(private_bounds)] pub trait Read
@@ -2116,36 +2688,47 @@ __Sumtype_ConstraintExprTrait_0_"#)
             }
             /// Target of [`sumtype::sumtype`] macro, which implements [`std::iter::Iterator`].
             #[sumtrait(implement = :: core :: iter :: Iterator, krate = $crate, marker =
-            $crate :: traits :: Marker)] #[allow(private_bounds)] pub trait Iterator"#)
+            $crate :: traits :: Marker)] #[allow(private_bounds)] pub trait Iterator"#,
+            )
     }));
 }
 
 #[test]
 fn external_crate_sumtype_test_module() {
     let expansions = run_trace_for_repo("sumtype", Some("module"));
-    if expansions.is_empty() { return; }
+    if expansions.is_empty() {
+        return;
+    }
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "sumtrait"
-            && equals_normalized(&e.input, r#"/// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
+            && equals_normalized(
+                &e.input,
+                r#"/// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
 #[allow(private_bounds)] pub trait Read
 {
     fn read(& mut self, buf : & mut [:: core :: primitive :: u8]) -> :: std ::
     io :: Result < :: core :: primitive :: usize > ;
-}"#)
-            && starts_with_normalized(&e.to, r#"#[doc =
+}"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"#[doc =
 " Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`]."]
 #[allow(private_bounds)] pub trait Read
 {
     fn read(& mut self, buf : & mut [:: core :: primitive :: u8]) -> :: std ::
     io :: Result < :: core :: primitive :: usize > ;
 } #[doc(hidden)] #[macro_export] macro_rules!
-__sumtype_macro_"#)
+__sumtype_macro_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "sumtype"
-            && equals_normalized(&e.input, r#"mod my_module
+            && equals_normalized(
+                &e.input,
+                r#"mod my_module
 {
     #[allow(unused)] pub struct MyStruct { iter: sumtype!(), } impl MyStruct
     {
@@ -2159,31 +2742,46 @@ __sumtype_macro_"#)
         } #[allow(unused)] pub fn iterate(self)
         { for value in self.iter { println!("{}", value); } }
     }
-}"#)
-            && starts_with_normalized(&e.to, r#"#[doc(hidden)] #[allow(non_camel_case_types)] #[allow(non_camel_case_types)]
-struct __SumType_RefType_"#)
+}"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"#[doc(hidden)] #[allow(non_camel_case_types)] #[allow(non_camel_case_types)]
+struct __SumType_RefType_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name.starts_with("__sumtype_macro_")
             && starts_with_normalized(&e.input, r#"__Sumtype_ConstraintExprTrait_0_"#)
-            && starts_with_normalized(&e.to, r#"$crate :: _sumtrait_internal!
+            && starts_with_normalized(
+                &e.to,
+                r#"$crate :: _sumtrait_internal!
           ({
-              __Sumtype_ConstraintExprTrait_0_"#)
+              __Sumtype_ConstraintExprTrait_0_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name == "_sumtrait_internal"
-            && starts_with_normalized(&e.input, r#"{
-    __Sumtype_ConstraintExprTrait_0_"#)
-            && starts_with_normalized(&e.to, r#"#[allow(non_camel_case_types)] trait
-__Sumtype_ConstraintExprTrait_0_"#)
+            && starts_with_normalized(
+                &e.input,
+                r#"{
+    __Sumtype_ConstraintExprTrait_0_"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"#[allow(non_camel_case_types)] trait
+__Sumtype_ConstraintExprTrait_0_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name == "emit_traits"
             && equals_normalized(&e.input, "")
-            && starts_with_normalized(&e.to, r#"#[doc(hidden)] pub struct Marker(:: core :: convert :: Infallible);
+            && starts_with_normalized(
+                &e.to,
+                r#"#[doc(hidden)] pub struct Marker(:: core :: convert :: Infallible);
             /// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
             #[sumtrait(implement = :: std :: io :: Read, krate = $crate, marker = $crate
             :: traits :: Marker)] #[allow(private_bounds)] pub trait Read
@@ -2197,36 +2795,47 @@ __Sumtype_ConstraintExprTrait_0_"#)
             }
             /// Target of [`sumtype::sumtype`] macro, which implements [`std::iter::Iterator`].
             #[sumtrait(implement = :: core :: iter :: Iterator, krate = $crate, marker =
-            $crate :: traits :: Marker)] #[allow(private_bounds)] pub trait Iterator"#)
+            $crate :: traits :: Marker)] #[allow(private_bounds)] pub trait Iterator"#,
+            )
     }));
 }
 
 #[test]
 fn external_crate_sumtype_test_multi() {
     let expansions = run_trace_for_repo("sumtype", Some("multi"));
-    if expansions.is_empty() { return; }
+    if expansions.is_empty() {
+        return;
+    }
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "sumtrait"
-            && equals_normalized(&e.input, r#"/// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
+            && equals_normalized(
+                &e.input,
+                r#"/// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
 #[allow(private_bounds)] pub trait Read
 {
     fn read(& mut self, buf : & mut [:: core :: primitive :: u8]) -> :: std ::
     io :: Result < :: core :: primitive :: usize > ;
-}"#)
-            && starts_with_normalized(&e.to, r#"#[doc =
+}"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"#[doc =
 " Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`]."]
 #[allow(private_bounds)] pub trait Read
 {
     fn read(& mut self, buf : & mut [:: core :: primitive :: u8]) -> :: std ::
     io :: Result < :: core :: primitive :: usize > ;
 } #[doc(hidden)] #[macro_export] macro_rules!
-__sumtype_macro_"#)
+__sumtype_macro_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "sumtype"
-            && equals_normalized(&e.input, r#"#[allow(unused)] fn f(a: usize) -> impl Iterator<Item = usize> + Clone
+            && equals_normalized(
+                &e.input,
+                r#"#[allow(unused)] fn f(a: usize) -> impl Iterator<Item = usize> + Clone
 {
     match a
     {
@@ -2234,39 +2843,57 @@ __sumtype_macro_"#)
         sumtype!(std::iter::once(a)), _ =>
         sumtype!(std::iter::repeat(a).take(a)),
     }
-}"#)
-            && starts_with_normalized(&e.to, r#"#[doc(hidden)] #[allow(non_camel_case_types)] trait
-__Sumtype_TypeRef_Trait_"#)
+}"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"#[doc(hidden)] #[allow(non_camel_case_types)] trait
+__Sumtype_TypeRef_Trait_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name.starts_with("__sumtype_macro_")
             && starts_with_normalized(&e.input, r#"__Sumtype_ConstraintExprTrait_0_"#)
-            && starts_with_normalized(&e.to, r#"$crate :: _sumtrait_internal!
+            && starts_with_normalized(
+                &e.to,
+                r#"$crate :: _sumtrait_internal!
           ({
-              __Sumtype_ConstraintExprTrait_0_"#)
+              __Sumtype_ConstraintExprTrait_0_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name.starts_with("__sumtype_macro_")
             && starts_with_normalized(&e.input, r#"__Sumtype_ConstraintExprTrait_1_"#)
-            && starts_with_normalized(&e.to, r#"$crate :: _sumtrait_internal!
+            && starts_with_normalized(
+                &e.to,
+                r#"$crate :: _sumtrait_internal!
           ({
-              __Sumtype_ConstraintExprTrait_1_"#)
+              __Sumtype_ConstraintExprTrait_1_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name == "_sumtrait_internal"
-            && starts_with_normalized(&e.input, r#"{
-    __Sumtype_ConstraintExprTrait_0_"#)
-            && starts_with_normalized(&e.to, r#"#[allow(non_camel_case_types)] trait
-__Sumtype_ConstraintExprTrait_0_"#)
+            && starts_with_normalized(
+                &e.input,
+                r#"{
+    __Sumtype_ConstraintExprTrait_0_"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"#[allow(non_camel_case_types)] trait
+__Sumtype_ConstraintExprTrait_0_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name == "emit_traits"
             && equals_normalized(&e.input, "")
-            && starts_with_normalized(&e.to, r#"#[doc(hidden)] pub struct Marker(:: core :: convert :: Infallible);
+            && starts_with_normalized(
+                &e.to,
+                r#"#[doc(hidden)] pub struct Marker(:: core :: convert :: Infallible);
             /// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
             #[sumtrait(implement = :: std :: io :: Read, krate = $crate, marker = $crate
             :: traits :: Marker)] #[allow(private_bounds)] pub trait Read
@@ -2280,64 +2907,90 @@ __Sumtype_ConstraintExprTrait_0_"#)
             }
             /// Target of [`sumtype::sumtype`] macro, which implements [`std::iter::Iterator`].
             #[sumtrait(implement = :: core :: iter :: Iterator, krate = $crate, marker =
-            $crate :: traits :: Marker)] #[allow(private_bounds)] pub trait Iterator"#)
+            $crate :: traits :: Marker)] #[allow(private_bounds)] pub trait Iterator"#,
+            )
     }));
 }
 
 #[test]
 fn external_crate_sumtype_test_read() {
     let expansions = run_trace_for_repo("sumtype", Some("read"));
-    if expansions.is_empty() { return; }
+    if expansions.is_empty() {
+        return;
+    }
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "sumtrait"
-            && equals_normalized(&e.input, r#"/// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
+            && equals_normalized(
+                &e.input,
+                r#"/// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
 #[allow(private_bounds)] pub trait Read
 {
     fn read(& mut self, buf : & mut [:: core :: primitive :: u8]) -> :: std ::
     io :: Result < :: core :: primitive :: usize > ;
-}"#)
-            && starts_with_normalized(&e.to, r#"#[doc =
+}"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"#[doc =
 " Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`]."]
 #[allow(private_bounds)] pub trait Read
 {
     fn read(& mut self, buf : & mut [:: core :: primitive :: u8]) -> :: std ::
     io :: Result < :: core :: primitive :: usize > ;
 } #[doc(hidden)] #[macro_export] macro_rules!
-__sumtype_macro_"#)
+__sumtype_macro_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "sumtype"
-            && equals_normalized(&e.input, r#"#[allow(unused)] fn f1(a: bool) -> impl Read
+            && equals_normalized(
+                &e.input,
+                r#"#[allow(unused)] fn f1(a: bool) -> impl Read
 {
     if a { sumtype!(std::io::empty()) } else
     { sumtype!(std::io::Cursor::new([1, 2, 3])) }
-}"#)
-            && starts_with_normalized(&e.to, r#"#[doc(hidden)] #[allow(non_camel_case_types)] trait
-__Sumtype_TypeRef_Trait_"#)
+}"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"#[doc(hidden)] #[allow(non_camel_case_types)] trait
+__Sumtype_TypeRef_Trait_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name.starts_with("__sumtype_macro_")
             && starts_with_normalized(&e.input, r#"__Sumtype_ConstraintExprTrait_0_"#)
-            && starts_with_normalized(&e.to, r#"$crate :: _sumtrait_internal!
+            && starts_with_normalized(
+                &e.to,
+                r#"$crate :: _sumtrait_internal!
           ({
-              __Sumtype_ConstraintExprTrait_0_"#)
+              __Sumtype_ConstraintExprTrait_0_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name == "_sumtrait_internal"
-            && starts_with_normalized(&e.input, r#"{
-    __Sumtype_ConstraintExprTrait_0_"#)
-            && starts_with_normalized(&e.to, r#"#[allow(non_camel_case_types)] trait
-__Sumtype_ConstraintExprTrait_0_"#)
+            && starts_with_normalized(
+                &e.input,
+                r#"{
+    __Sumtype_ConstraintExprTrait_0_"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"#[allow(non_camel_case_types)] trait
+__Sumtype_ConstraintExprTrait_0_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name == "emit_traits"
             && equals_normalized(&e.input, "")
-            && starts_with_normalized(&e.to, r#"#[doc(hidden)] pub struct Marker(:: core :: convert :: Infallible);
+            && starts_with_normalized(
+                &e.to,
+                r#"#[doc(hidden)] pub struct Marker(:: core :: convert :: Infallible);
             /// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
             #[sumtrait(implement = :: std :: io :: Read, krate = $crate, marker = $crate
             :: traits :: Marker)] #[allow(private_bounds)] pub trait Read
@@ -2351,89 +3004,124 @@ __Sumtype_ConstraintExprTrait_0_"#)
             }
             /// Target of [`sumtype::sumtype`] macro, which implements [`std::iter::Iterator`].
             #[sumtrait(implement = :: core :: iter :: Iterator, krate = $crate, marker =
-            $crate :: traits :: Marker)] #[allow(private_bounds)] pub trait Iterator"#)
+            $crate :: traits :: Marker)] #[allow(private_bounds)] pub trait Iterator"#,
+            )
     }));
 }
 
 #[test]
 fn external_crate_sumtype_test_sumtrait() {
     let expansions = run_trace_for_repo("sumtype", Some("sumtrait"));
-    if expansions.is_empty() { return; }
+    if expansions.is_empty() {
+        return;
+    }
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "sumtrait"
-            && equals_normalized(&e.input, r#"/// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
+            && equals_normalized(
+                &e.input,
+                r#"/// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
 #[allow(private_bounds)] pub trait Read
 {
     fn read(& mut self, buf : & mut [:: core :: primitive :: u8]) -> :: std ::
     io :: Result < :: core :: primitive :: usize > ;
-}"#)
-            && starts_with_normalized(&e.to, r#"#[doc =
+}"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"#[doc =
 " Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`]."]
 #[allow(private_bounds)] pub trait Read
 {
     fn read(& mut self, buf : & mut [:: core :: primitive :: u8]) -> :: std ::
     io :: Result < :: core :: primitive :: usize > ;
 } #[doc(hidden)] #[macro_export] macro_rules!
-__sumtype_macro_"#)
+__sumtype_macro_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "sumtype"
-            && equals_normalized(&e.input, r#"#[allow(unused)] fn f1(a: bool) -> impl MySumTrait + Clone
+            && equals_normalized(
+                &e.input,
+                r#"#[allow(unused)] fn f1(a: bool) -> impl MySumTrait + Clone
 {
     #[derive(Clone)] struct S1; #[derive(Clone)] struct S2; impl MySumTrait
     for S1 {} impl MySumTrait for S2 {} if a { sumtype!(S1) } else
     { sumtype!(S2) }
-}"#)
-            && starts_with_normalized(&e.to, r#"#[doc(hidden)] #[allow(non_camel_case_types)] trait
-__Sumtype_TypeRef_Trait_"#)
+}"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"#[doc(hidden)] #[allow(non_camel_case_types)] trait
+__Sumtype_TypeRef_Trait_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name.starts_with("__sumtype_macro_")
             && starts_with_normalized(&e.input, r#"__Sumtype_ConstraintExprTrait_0_"#)
-            && starts_with_normalized(&e.to, r#":: sumtype :: _sumtrait_internal!
+            && starts_with_normalized(
+                &e.to,
+                r#":: sumtype :: _sumtrait_internal!
            ({
-               __Sumtype_ConstraintExprTrait_0_"#)
+               __Sumtype_ConstraintExprTrait_0_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name.starts_with("__sumtype_macro_")
             && starts_with_normalized(&e.input, r#"__SumTrait_ConstraintTrait_0_"#)
-            && starts_with_normalized(&e.to, r#"$crate :: _sumtrait_internal!
+            && starts_with_normalized(
+                &e.to,
+                r#"$crate :: _sumtrait_internal!
            ({
-               __SumTrait_ConstraintTrait_0_"#)
+               __SumTrait_ConstraintTrait_0_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name.starts_with("__sumtype_macro_")
             && starts_with_normalized(&e.input, r#"__SumTrait_ConstraintTrait_0_"#)
-            && starts_with_normalized(&e.to, r#"$crate :: _sumtrait_internal!
+            && starts_with_normalized(
+                &e.to,
+                r#"$crate :: _sumtrait_internal!
            ({
-               __SumTrait_ConstraintTrait_0_"#)
+               __SumTrait_ConstraintTrait_0_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name.starts_with("__sumtype_macro_")
             && starts_with_normalized(&e.input, r#"__Sumtype_ConstraintExprTrait_0_"#)
-            && starts_with_normalized(&e.to, r#":: sumtype :: _sumtrait_internal!
+            && starts_with_normalized(
+                &e.to,
+                r#":: sumtype :: _sumtrait_internal!
            ({
-               __Sumtype_ConstraintExprTrait_0_"#)
+               __Sumtype_ConstraintExprTrait_0_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name == "_sumtrait_internal"
-            && starts_with_normalized(&e.input, r#"{
-    __Sumtype_ConstraintExprTrait_0_"#)
-            && starts_with_normalized(&e.to, r#"sumtype :: traits :: Copy!
-(__SumTrait_ConstraintTrait_0_"#)
+            && starts_with_normalized(
+                &e.input,
+                r#"{
+    __Sumtype_ConstraintExprTrait_0_"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"sumtype :: traits :: Copy!
+(__SumTrait_ConstraintTrait_0_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name == "emit_traits"
             && equals_normalized(&e.input, "")
-            && starts_with_normalized(&e.to, r#"#[doc(hidden)] pub struct Marker(:: core :: convert :: Infallible);
+            && starts_with_normalized(
+                &e.to,
+                r#"#[doc(hidden)] pub struct Marker(:: core :: convert :: Infallible);
             /// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
             #[sumtrait(implement = :: std :: io :: Read, krate = $crate, marker = $crate
             :: traits :: Marker)] #[allow(private_bounds)] pub trait Read
@@ -2447,67 +3135,93 @@ __Sumtype_TypeRef_Trait_"#)
             }
             /// Target of [`sumtype::sumtype`] macro, which implements [`std::iter::Iterator`].
             #[sumtrait(implement = :: core :: iter :: Iterator, krate = $crate, marker =
-            $crate :: traits :: Marker)] #[allow(private_bounds)] pub trait Iterator"#)
+            $crate :: traits :: Marker)] #[allow(private_bounds)] pub trait Iterator"#,
+            )
     }));
 }
 
 #[test]
 fn external_crate_sumtype_test_test() {
     let expansions = run_trace_for_repo("sumtype", Some("test"));
-    if expansions.is_empty() { return; }
+    if expansions.is_empty() {
+        return;
+    }
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "sumtrait"
-            && equals_normalized(&e.input, r#"/// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
+            && equals_normalized(
+                &e.input,
+                r#"/// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
 #[allow(private_bounds)] pub trait Read
 {
     fn read(& mut self, buf : & mut [:: core :: primitive :: u8]) -> :: std ::
     io :: Result < :: core :: primitive :: usize > ;
-}"#)
-            && starts_with_normalized(&e.to, r#"#[doc =
+}"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"#[doc =
 " Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`]."]
 #[allow(private_bounds)] pub trait Read
 {
     fn read(& mut self, buf : & mut [:: core :: primitive :: u8]) -> :: std ::
     io :: Result < :: core :: primitive :: usize > ;
 } #[doc(hidden)] #[macro_export] macro_rules!
-__sumtype_macro_"#)
+__sumtype_macro_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "sumtype"
-            && equals_normalized(&e.input, r#"fn generate_iter<'a, T>(t: &'a T, count: usize) -> impl Iterator<Item = &'a T>
+            && equals_normalized(
+                &e.input,
+                r#"fn generate_iter<'a, T>(t: &'a T, count: usize) -> impl Iterator<Item = &'a T>
 {
     match count
     {
         0 => sumtype!(std::iter::empty()), 1 => sumtype!(std::iter::once(t)),
         n => sumtype!(std::iter::repeat(t).take(n)),
     }
-}"#)
-            && starts_with_normalized(&e.to, r#"#[doc(hidden)] #[allow(non_camel_case_types)] trait
-__Sumtype_TypeRef_Trait_"#)
+}"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"#[doc(hidden)] #[allow(non_camel_case_types)] trait
+__Sumtype_TypeRef_Trait_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name.starts_with("__sumtype_macro_")
             && starts_with_normalized(&e.input, r#"__Sumtype_ConstraintExprTrait_0_"#)
-            && starts_with_normalized(&e.to, r#"$crate :: _sumtrait_internal!
+            && starts_with_normalized(
+                &e.to,
+                r#"$crate :: _sumtrait_internal!
           ({
-              __Sumtype_ConstraintExprTrait_0_"#)
+              __Sumtype_ConstraintExprTrait_0_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name == "_sumtrait_internal"
-            && starts_with_normalized(&e.input, r#"{
-    __Sumtype_ConstraintExprTrait_0_"#)
-            && starts_with_normalized(&e.to, r#"#[allow(non_camel_case_types)] trait
-__Sumtype_ConstraintExprTrait_0_"#)
+            && starts_with_normalized(
+                &e.input,
+                r#"{
+    __Sumtype_ConstraintExprTrait_0_"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"#[allow(non_camel_case_types)] trait
+__Sumtype_ConstraintExprTrait_0_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name == "emit_traits"
             && equals_normalized(&e.input, "")
-            && starts_with_normalized(&e.to, r#"#[doc(hidden)] pub struct Marker(:: core :: convert :: Infallible);
+            && starts_with_normalized(
+                &e.to,
+                r#"#[doc(hidden)] pub struct Marker(:: core :: convert :: Infallible);
             /// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
             #[sumtrait(implement = :: std :: io :: Read, krate = $crate, marker = $crate
             :: traits :: Marker)] #[allow(private_bounds)] pub trait Read
@@ -2521,36 +3235,47 @@ __Sumtype_ConstraintExprTrait_0_"#)
             }
             /// Target of [`sumtype::sumtype`] macro, which implements [`std::iter::Iterator`].
             #[sumtrait(implement = :: core :: iter :: Iterator, krate = $crate, marker =
-            $crate :: traits :: Marker)] #[allow(private_bounds)] pub trait Iterator"#)
+            $crate :: traits :: Marker)] #[allow(private_bounds)] pub trait Iterator"#,
+            )
     }));
 }
 
 #[test]
 fn external_crate_sumtype_test_test_gparams() {
     let expansions = run_trace_for_repo("sumtype", Some("test_gparams"));
-    if expansions.is_empty() { return; }
+    if expansions.is_empty() {
+        return;
+    }
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "sumtrait"
-            && equals_normalized(&e.input, r#"/// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
+            && equals_normalized(
+                &e.input,
+                r#"/// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
 #[allow(private_bounds)] pub trait Read
 {
     fn read(& mut self, buf : & mut [:: core :: primitive :: u8]) -> :: std ::
     io :: Result < :: core :: primitive :: usize > ;
-}"#)
-            && starts_with_normalized(&e.to, r#"#[doc =
+}"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"#[doc =
 " Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`]."]
 #[allow(private_bounds)] pub trait Read
 {
     fn read(& mut self, buf : & mut [:: core :: primitive :: u8]) -> :: std ::
     io :: Result < :: core :: primitive :: usize > ;
 } #[doc(hidden)] #[macro_export] macro_rules!
-__sumtype_macro_"#)
+__sumtype_macro_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "sumtype"
-            && equals_normalized(&e.input, r#"#[allow(unused)] fn with_generics<'a, T>(t: &'a T, count: usize) -> sumtype!()
+            && equals_normalized(
+                &e.input,
+                r#"#[allow(unused)] fn with_generics<'a, T>(t: &'a T, count: usize) -> sumtype!()
 {
     match count
     {
@@ -2559,31 +3284,46 @@ __sumtype_macro_"#)
         sumtype!(std::iter::repeat(t).take(n),
         std::iter::Take<std::iter::Repeat<&'a T>>),
     }
-}"#)
-            && starts_with_normalized(&e.to, r#"#[doc(hidden)] #[allow(non_camel_case_types)] #[allow(non_camel_case_types)]
-struct __SumType_RefType_"#)
+}"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"#[doc(hidden)] #[allow(non_camel_case_types)] #[allow(non_camel_case_types)]
+struct __SumType_RefType_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name.starts_with("__sumtype_macro_")
             && starts_with_normalized(&e.input, r#"__Sumtype_ConstraintExprTrait_0_"#)
-            && starts_with_normalized(&e.to, r#"$crate :: _sumtrait_internal!
+            && starts_with_normalized(
+                &e.to,
+                r#"$crate :: _sumtrait_internal!
           ({
-              __Sumtype_ConstraintExprTrait_0_"#)
+              __Sumtype_ConstraintExprTrait_0_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name == "_sumtrait_internal"
-            && starts_with_normalized(&e.input, r#"{
-    __Sumtype_ConstraintExprTrait_0_"#)
-            && starts_with_normalized(&e.to, r#"#[allow(non_camel_case_types)] trait
-__Sumtype_ConstraintExprTrait_0_"#)
+            && starts_with_normalized(
+                &e.input,
+                r#"{
+    __Sumtype_ConstraintExprTrait_0_"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"#[allow(non_camel_case_types)] trait
+__Sumtype_ConstraintExprTrait_0_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name == "emit_traits"
             && equals_normalized(&e.input, "")
-            && starts_with_normalized(&e.to, r#"#[doc(hidden)] pub struct Marker(:: core :: convert :: Infallible);
+            && starts_with_normalized(
+                &e.to,
+                r#"#[doc(hidden)] pub struct Marker(:: core :: convert :: Infallible);
             /// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
             #[sumtrait(implement = :: std :: io :: Read, krate = $crate, marker = $crate
             :: traits :: Marker)] #[allow(private_bounds)] pub trait Read
@@ -2597,36 +3337,47 @@ __Sumtype_ConstraintExprTrait_0_"#)
             }
             /// Target of [`sumtype::sumtype`] macro, which implements [`std::iter::Iterator`].
             #[sumtrait(implement = :: core :: iter :: Iterator, krate = $crate, marker =
-            $crate :: traits :: Marker)] #[allow(private_bounds)] pub trait Iterator"#)
+            $crate :: traits :: Marker)] #[allow(private_bounds)] pub trait Iterator"#,
+            )
     }));
 }
 
 #[test]
 fn external_crate_sumtype_test_test_mod() {
     let expansions = run_trace_for_repo("sumtype", Some("test_mod"));
-    if expansions.is_empty() { return; }
+    if expansions.is_empty() {
+        return;
+    }
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "sumtrait"
-            && equals_normalized(&e.input, r#"/// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
+            && equals_normalized(
+                &e.input,
+                r#"/// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
 #[allow(private_bounds)] pub trait Read
 {
     fn read(& mut self, buf : & mut [:: core :: primitive :: u8]) -> :: std ::
     io :: Result < :: core :: primitive :: usize > ;
-}"#)
-            && starts_with_normalized(&e.to, r#"#[doc =
+}"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"#[doc =
 " Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`]."]
 #[allow(private_bounds)] pub trait Read
 {
     fn read(& mut self, buf : & mut [:: core :: primitive :: u8]) -> :: std ::
     io :: Result < :: core :: primitive :: usize > ;
 } #[doc(hidden)] #[macro_export] macro_rules!
-__sumtype_macro_"#)
+__sumtype_macro_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "sumtype"
-            && equals_normalized(&e.input, r#"mod my_module
+            && equals_normalized(
+                &e.input,
+                r#"mod my_module
 {
     #[allow(unused)] pub struct MyStruct { iter: sumtype!(), } impl MyStruct
     {
@@ -2640,31 +3391,46 @@ __sumtype_macro_"#)
         } #[allow(unused)] pub fn iterate(self)
         { for value in self.iter { println!("{}", value); } }
     }
-}"#)
-            && starts_with_normalized(&e.to, r#"#[doc(hidden)] #[allow(non_camel_case_types)] #[allow(non_camel_case_types)]
-struct __SumType_RefType_"#)
+}"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"#[doc(hidden)] #[allow(non_camel_case_types)] #[allow(non_camel_case_types)]
+struct __SumType_RefType_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name.starts_with("__sumtype_macro_")
             && starts_with_normalized(&e.input, r#"__Sumtype_ConstraintExprTrait_0_"#)
-            && starts_with_normalized(&e.to, r#"$crate :: _sumtrait_internal!
+            && starts_with_normalized(
+                &e.to,
+                r#"$crate :: _sumtrait_internal!
           ({
-              __Sumtype_ConstraintExprTrait_0_"#)
+              __Sumtype_ConstraintExprTrait_0_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name == "_sumtrait_internal"
-            && starts_with_normalized(&e.input, r#"{
-    __Sumtype_ConstraintExprTrait_0_"#)
-            && starts_with_normalized(&e.to, r#"#[allow(non_camel_case_types)] trait
-__Sumtype_ConstraintExprTrait_0_"#)
+            && starts_with_normalized(
+                &e.input,
+                r#"{
+    __Sumtype_ConstraintExprTrait_0_"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"#[allow(non_camel_case_types)] trait
+__Sumtype_ConstraintExprTrait_0_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name == "emit_traits"
             && equals_normalized(&e.input, "")
-            && starts_with_normalized(&e.to, r#"#[doc(hidden)] pub struct Marker(:: core :: convert :: Infallible);
+            && starts_with_normalized(
+                &e.to,
+                r#"#[doc(hidden)] pub struct Marker(:: core :: convert :: Infallible);
             /// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
             #[sumtrait(implement = :: std :: io :: Read, krate = $crate, marker = $crate
             :: traits :: Marker)] #[allow(private_bounds)] pub trait Read
@@ -2678,37 +3444,48 @@ __Sumtype_ConstraintExprTrait_0_"#)
             }
             /// Target of [`sumtype::sumtype`] macro, which implements [`std::iter::Iterator`].
             #[sumtrait(implement = :: core :: iter :: Iterator, krate = $crate, marker =
-            $crate :: traits :: Marker)] #[allow(private_bounds)] pub trait Iterator"#)
+            $crate :: traits :: Marker)] #[allow(private_bounds)] pub trait Iterator"#,
+            )
     }));
 }
 
 #[test]
 fn external_crate_sumtype_test_ui() {
     let expansions = run_trace_for_repo("sumtype", Some("ui"));
-    if expansions.is_empty() { return; }
+    if expansions.is_empty() {
+        return;
+    }
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Attribute
             && e.name == "sumtrait"
-            && equals_normalized(&e.input, r#"/// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
+            && equals_normalized(
+                &e.input,
+                r#"/// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
 #[allow(private_bounds)] pub trait Read
 {
     fn read(& mut self, buf : & mut [:: core :: primitive :: u8]) -> :: std ::
     io :: Result < :: core :: primitive :: usize > ;
-}"#)
-            && starts_with_normalized(&e.to, r#"#[doc =
+}"#,
+            )
+            && starts_with_normalized(
+                &e.to,
+                r#"#[doc =
 " Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`]."]
 #[allow(private_bounds)] pub trait Read
 {
     fn read(& mut self, buf : & mut [:: core :: primitive :: u8]) -> :: std ::
     io :: Result < :: core :: primitive :: usize > ;
 } #[doc(hidden)] #[macro_export] macro_rules!
-__sumtype_macro_"#)
+__sumtype_macro_"#,
+            )
     }));
     assert!(expansions.iter().any(|e| {
         e.kind == MacroExpansionKind::Bang
             && e.name == "emit_traits"
             && equals_normalized(&e.input, "")
-            && starts_with_normalized(&e.to, r#"#[doc(hidden)] pub struct Marker(:: core :: convert :: Infallible);
+            && starts_with_normalized(
+                &e.to,
+                r#"#[doc(hidden)] pub struct Marker(:: core :: convert :: Infallible);
             /// Target of [`sumtype::sumtype`] macro, which implements [`std::io::Read`].
             #[sumtrait(implement = :: std :: io :: Read, krate = $crate, marker = $crate
             :: traits :: Marker)] #[allow(private_bounds)] pub trait Read
@@ -2722,7 +3499,8 @@ __sumtype_macro_"#)
             }
             /// Target of [`sumtype::sumtype`] macro, which implements [`std::iter::Iterator`].
             #[sumtrait(implement = :: core :: iter :: Iterator, krate = $crate, marker =
-            $crate :: traits :: Marker)] #[allow(private_bounds)] pub trait Iterator"#)
+            $crate :: traits :: Marker)] #[allow(private_bounds)] pub trait Iterator"#,
+            )
     }));
 }
 
@@ -2730,15 +3508,23 @@ fn assert_has_macro_name(expansions: &[MacroExpansion], expected_name: &str) {
     assert!(
         expansions.iter().any(|e| e.name == expected_name),
         "expected expansion to contain macro `{expected_name}`, got names: {:?}",
-        expansions.iter().map(|e| e.name.as_str()).collect::<Vec<_>>()
+        expansions
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect::<Vec<_>>()
     );
 }
 
 fn assert_has_macro_name_prefix(expansions: &[MacroExpansion], expected_prefix: &str) {
     assert!(
-        expansions.iter().any(|e| e.name.starts_with(expected_prefix)),
+        expansions
+            .iter()
+            .any(|e| e.name.starts_with(expected_prefix)),
         "expected expansion to contain macro prefix `{expected_prefix}`, got names: {:?}",
-        expansions.iter().map(|e| e.name.as_str()).collect::<Vec<_>>()
+        expansions
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect::<Vec<_>>()
     );
 }
 
@@ -2749,13 +3535,17 @@ fn external_crates_expansion_contains_macros_defined_in_each_crate() {
     assert_has_macro_name(&addr_of_enum, "get_discriminant");
 
     let coinduction = run_trace_for_repo("coinduction", Some("complex"));
-    if coinduction.is_empty() { return; }
+    if coinduction.is_empty() {
+        return;
+    }
     assert_has_macro_name(&coinduction, "coinduction");
     assert_has_macro_name(&coinduction, "traitdef");
     assert_has_macro_name(&coinduction, "typedef");
 
     let decycle = run_trace_for_repo("decycle", Some("bug2"));
-    if decycle.is_empty() { return; }
+    if decycle.is_empty() {
+        return;
+    }
     assert_has_macro_name(&decycle, "decycle");
     assert_has_macro_name(&decycle, "__finalize");
 
@@ -2773,11 +3563,15 @@ fn external_crates_expansion_contains_macros_defined_in_each_crate() {
     assert_has_macro_name(&newer_type, "__implement_internal");
 
     let parametrized = run_trace_for_repo("parametrized", Some("test"));
-    if parametrized.is_empty() { return; }
+    if parametrized.is_empty() {
+        return;
+    }
     assert_has_macro_name(&parametrized, "parametrized");
 
     let sumtype = run_trace_for_repo("sumtype", Some("test"));
-    if sumtype.is_empty() { return; }
+    if sumtype.is_empty() {
+        return;
+    }
     assert_has_macro_name(&sumtype, "sumtype");
     assert_has_macro_name(&sumtype, "sumtrait");
     assert_has_macro_name(&sumtype, "_sumtrait_internal");

@@ -37,7 +37,10 @@ pub fn parse_normal_output(output: &str) -> String {
         }
 
         // Skip cargo status lines
-        if CARGO_STATUS_PREFIXES.iter().any(|prefix| line.starts_with(prefix)) {
+        if CARGO_STATUS_PREFIXES
+            .iter()
+            .any(|prefix| line.starts_with(prefix))
+        {
             continue;
         }
 

@@ -44,7 +44,12 @@ fn find_expansions<'a>(expansions: &'a [MacroExpansion], caller: &str) -> Vec<&'
         .collect()
 }
 
-fn assert_exact(expansions: &[MacroExpansion], caller: &str, expected_input: &str, expected_to: &str) {
+fn assert_exact(
+    expansions: &[MacroExpansion],
+    caller: &str,
+    expected_input: &str,
+    expected_to: &str,
+) {
     let norm_caller = normalize_delimiters(caller);
     let norm_input = normalize_delimiters(expected_input);
     let matching: Vec<_> = expansions
@@ -56,7 +61,8 @@ fn assert_exact(expansions: &[MacroExpansion], caller: &str, expected_input: &st
         .collect();
     assert_eq!(
         matching.len(),
-        1, "Expected exactly 1 expansion for caller={:?}, input={:?}, found {}.",
+        1,
+        "Expected exactly 1 expansion for caller={:?}, input={:?}, found {}.",
         caller,
         expected_input,
         matching.len(),
@@ -101,8 +107,7 @@ fn run_show_expansion_test_usage() -> Vec<MacroExpansion> {
     assert!(
         check_result.success,
         "cargo check failed while collecting macro expansions\nstdout:\n{}\nstderr:\n{}",
-        check_result.stdout,
-        check_result.stderr
+        check_result.stdout, check_result.stderr
     );
     expansions
 }
@@ -110,23 +115,24 @@ fn run_show_expansion_test_usage() -> Vec<MacroExpansion> {
 #[test]
 fn show_expansion() {
     let expansions = run_show_expansion_test_usage();
-    assert!(
-        !expansions.is_empty(),
-        "Expected macro expansions.",
-    );
+    assert!(!expansions.is_empty(), "Expected macro expansions.",);
     // ---------------------------------------------------------------
     // All macro types are trapped
     // ---------------------------------------------------------------
 
     // macro_rules!
     assert!(
-        expansions.iter().any(|e| expansion_caller(e) == "repeat_twice!"),
+        expansions
+            .iter()
+            .any(|e| expansion_caller(e) == "repeat_twice!"),
         "Missing macro_rules! expansion (repeat_twice!).",
     );
 
     // proc_macro (function-like)
     assert!(
-        expansions.iter().any(|e| expansion_caller(e) == "make_answer!"),
+        expansions
+            .iter()
+            .any(|e| expansion_caller(e) == "make_answer!"),
         "Missing proc_macro (bang) expansion (make_answer!).",
     );
 
@@ -298,9 +304,9 @@ fn show_expansion() {
     // Multi-segment path: functional proc macro
     // test_proc_macros::make_answer!(get_answer_path)
     // ---------------------------------------------------------------
-    let path_fn = expansions
-        .iter()
-        .find(|e| expansion_caller(e).contains("make_answer") && e.input.contains("get_answer_path"));
+    let path_fn = expansions.iter().find(|e| {
+        expansion_caller(e).contains("make_answer") && e.input.contains("get_answer_path")
+    });
     assert!(
         path_fn.is_some(),
         "Expected expansion for path-invoked make_answer!(get_answer_path)."
@@ -332,9 +338,9 @@ fn show_expansion() {
     // Multi-segment path: attribute proc macro
     // #[test_proc_macros::add_hello_method] on PathStruct
     // ---------------------------------------------------------------
-    let path_attr = expansions
-        .iter()
-        .find(|e| expansion_caller(e).contains("add_hello_method") && e.input.contains("PathStruct"));
+    let path_attr = expansions.iter().find(|e| {
+        expansion_caller(e).contains("add_hello_method") && e.input.contains("PathStruct")
+    });
     assert!(
         path_attr.is_some(),
         "Expected expansion for path-invoked #[add_hello_method] on PathStruct."
@@ -418,9 +424,7 @@ fn show_expansion() {
     );
     let multi_attr_tag = multi_attr_tag.unwrap();
     assert!(
-        multi_attr_tag
-            .to
-            .contains("__TAG_ARGS_FOR_MultiAttrStruct"),
+        multi_attr_tag.to.contains("__TAG_ARGS_FOR_MultiAttrStruct"),
         "#[tag_item] on MultiAttrStruct should generate const.\nexpansion: {:?}",
         multi_attr_tag
     );
@@ -431,9 +435,9 @@ fn show_expansion() {
         multi_attr_tag
     );
 
-    let multi_attr_hello = expansions
-        .iter()
-        .find(|e| expansion_caller(e).contains("add_hello_method") && e.input.contains("MultiAttrStruct"));
+    let multi_attr_hello = expansions.iter().find(|e| {
+        expansion_caller(e).contains("add_hello_method") && e.input.contains("MultiAttrStruct")
+    });
     assert!(
         multi_attr_hello.is_some(),
         "Expected #[add_hello_method] expansion for MultiAttrStruct."
@@ -451,9 +455,9 @@ fn show_expansion() {
     // Multiple derive macros on one attribute: MultiDeriveOneAttr
     // #[derive(Greet, Describe)]
     // ---------------------------------------------------------------
-    let one_attr_greet = expansions
-        .iter()
-        .find(|e| expansion_caller(e) == "#[derive(Greet)]" && e.input.contains("MultiDeriveOneAttr"));
+    let one_attr_greet = expansions.iter().find(|e| {
+        expansion_caller(e) == "#[derive(Greet)]" && e.input.contains("MultiDeriveOneAttr")
+    });
     assert!(
         one_attr_greet.is_some(),
         "Expected #[derive(Greet)] for MultiDeriveOneAttr."
@@ -464,9 +468,9 @@ fn show_expansion() {
         one_attr_greet.unwrap()
     );
 
-    let one_attr_describe = expansions
-        .iter()
-        .find(|e| expansion_caller(e) == "#[derive(Describe)]" && e.input.contains("MultiDeriveOneAttr"));
+    let one_attr_describe = expansions.iter().find(|e| {
+        expansion_caller(e) == "#[derive(Describe)]" && e.input.contains("MultiDeriveOneAttr")
+    });
     assert!(
         one_attr_describe.is_some(),
         "Expected #[derive(Describe)] for MultiDeriveOneAttr."
@@ -482,9 +486,9 @@ fn show_expansion() {
     // #[derive(Greet)]
     // #[derive(Describe)]
     // ---------------------------------------------------------------
-    let two_attr_greet = expansions
-        .iter()
-        .find(|e| expansion_caller(e) == "#[derive(Greet)]" && e.input.contains("MultiDeriveTwoAttr"));
+    let two_attr_greet = expansions.iter().find(|e| {
+        expansion_caller(e) == "#[derive(Greet)]" && e.input.contains("MultiDeriveTwoAttr")
+    });
     assert!(
         two_attr_greet.is_some(),
         "Expected #[derive(Greet)] for MultiDeriveTwoAttr."
@@ -501,9 +505,9 @@ fn show_expansion() {
         two_attr_greet.unwrap()
     );
 
-    let two_attr_describe = expansions
-        .iter()
-        .find(|e| expansion_caller(e) == "#[derive(Describe)]" && e.input.contains("MultiDeriveTwoAttr"));
+    let two_attr_describe = expansions.iter().find(|e| {
+        expansion_caller(e) == "#[derive(Describe)]" && e.input.contains("MultiDeriveTwoAttr")
+    });
     assert!(
         two_attr_describe.is_some(),
         "Expected #[derive(Describe)] for MultiDeriveTwoAttr."
