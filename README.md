@@ -1,11 +1,16 @@
 # cargo-macra [![Latest Version]][crates.io] [![Documentation]][docs.rs] [![GitHub Actions]][actions]
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/yasuo-ozu/macra/refs/heads/main/logo.png" alt="cargo-macra logo" width="320" />
+</p>
+
 [Latest Version]: https://img.shields.io/crates/v/cargo-macra.svg
 [crates.io]: https://crates.io/crates/cargo-macra
 [Documentation]: https://img.shields.io/docsrs/cargo-macra
 [docs.rs]: https://docs.rs/cargo-macra/latest/cargo_macra/
 [GitHub Actions]: https://github.com/yasuo-ozu/macra/actions/workflows/ci.yml/badge.svg
 [actions]: https://github.com/yasuo-ozu/macra/actions/workflows/ci.yml
+
 
 Interactive Rust macro expansion viewer with a terminal UI.
 
@@ -23,6 +28,13 @@ context, which is useful for:
 ## Screenshot
 
 [![asciicast](https://asciinema.org/a/8ZoXg8XHY8jnC8PW.svg)](https://asciinema.org/a/8ZoXg8XHY8jnC8PW)
+
+## Supported rustc versions and platforms
+
+| Category | Supported |
+| --- | --- |
+| rustc versions (CI) | `1.86.0`, `1.87.0`, `1.88.0`, `1.89.0`, `1.90.0`, `1.91.0` |
+| Platforms (CI) | `ubuntu-latest`, `windows-latest`, `macos-latest` (Apple Silicon), `macos-15-intel` (Intel) |
 
 ## Install
 
@@ -107,4 +119,4 @@ cargo test
 
 ## License
 
-MIT (stub files included in this repository; fill in copyright owner/year).
+MIT
