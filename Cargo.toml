@@ -13,13 +13,13 @@ documentation = "https://docs.rs/cargo-macra"
 readme = "README.md"
 authors = ["Yasuo Ozu <yasuo@ozu.email>"]
 
+[features]
+default = []
+hook = ["dep:libc", "dep:windows-sys"]
+rustc-wrapper = ["dep:windows-sys"]
+
 [workspace]
-members = [
-  "macra-hook",
-  "macra-rustc-wrapper",
-  "tests/test-proc-macros",
-  "tests/test-usage",
-]
+members = ["tests/test-proc-macros", "tests/test-usage"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -32,3 +32,29 @@ proc-macro2 = { version = "1", features = ["span-locations"] }
 quote = "1.0.44"
 filetime = "0.2"
 cargo_metadata = "0.23"
+libc = { version = "0.2", optional = true }
+
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.59"
+features = [
+  "Win32_Foundation",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Memory",
+  "Win32_System_SystemServices",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_Threading",
+  "Win32_System_Diagnostics_Debug",
+  "Win32_Security",
+]
+optional = true
+
+[[example]]
+name = "macra-hook"
+path = "hook/lib.rs"
+crate-type = ["cdylib"]
+required-features = ["hook"]
+
+[[bin]]
+name = "macra-rustc-wrapper"
+path = "rustc-wrapper/main.rs"
+required-features = ["rustc-wrapper"]

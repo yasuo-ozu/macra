@@ -81,12 +81,14 @@ dependencies = [
  "clap",
  "crossterm",
  "filetime",
+ "libc",
  "proc-macro2",
  "quote",
  "ratatui",
  "serde",
  "serde_json",
  "syn",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -397,23 +399,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "234cf4f4a04dc1f57e24b96cc0cd600cf2af460d4161ac5ecdd0af8e1f3b2a38"
 dependencies = [
  "hashbrown",
-]
-
-[[package]]
-name = "macra-hook"
-version = "0.2.0"
-dependencies = [
- "libc",
- "serde",
- "serde_json",
- "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "macra-rustc-wrapper"
-version = "0.2.0"
-dependencies = [
- "windows-sys 0.59.0",
 ]
 
 [[package]]
