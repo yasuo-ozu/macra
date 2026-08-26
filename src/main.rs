@@ -504,7 +504,7 @@ struct ModuleState {
     visible_nodes: Vec<usize>,
     selected_idx: usize,
     list_state: ListState,
-    scroll_offset: u16,
+    scroll_offset: usize,
     cursor_line: usize,
     cursor_col: usize,
     file_path: PathBuf,
@@ -529,7 +529,7 @@ struct App {
     /// Currently selected index in visible_nodes
     selected_idx: usize,
     list_state: ListState,
-    scroll_offset: u16,
+    scroll_offset: usize,
     /// Current cursor line in the source view (1-indexed). This can be on any line,
     /// not just macro lines.
     cursor_line: usize,
@@ -602,6 +602,47 @@ fn keep_outermost<'a>(mut regions: Vec<SplitRegion<'a>>) -> Vec<SplitRegion<'a>>
 fn is_expansion_marker(line: &str) -> bool {
     let t = line.trim();
     t.starts_with("// -- expanded:") || (t.starts_with("// -- end ") && t.ends_with("--"))
+}
+
+/// Tab stop width used when expanding `\t` in loaded source files.
+///
+/// 4 matches the rustfmt default indent, so tab-indented code lines up the way its
+/// author most likely sees it.
+const TAB_WIDTH: usize = 4;
+
+/// Expand tabs to spaces, advancing to the next multiple of [`TAB_WIDTH`].
+///
+/// Must run on the loaded source *before* `find_macros` parses it: macro columns come
+/// from proc-macro2 spans computed over this exact text, and ratatui drops control
+/// characters from the buffer entirely, so the parsed text and the displayed text have
+/// to be one and the same string. Columns are counted in characters (matching
+/// proc-macro2 span columns and `byte_of_col`) and reset on every newline.
+fn expand_tabs(source: &str) -> String {
+    if !source.contains('\t') {
+        return source.to_string();
+    }
+    let mut out = String::with_capacity(source.len());
+    let mut col = 0usize;
+    for ch in source.chars() {
+        match ch {
+            '\t' => {
+                let n = TAB_WIDTH - col % TAB_WIDTH;
+                for _ in 0..n {
+                    out.push(' ');
+                }
+                col += n;
+            }
+            '\n' => {
+                out.push('\n');
+                col = 0;
+            }
+            _ => {
+                out.push(ch);
+                col += 1;
+            }
+        }
+    }
+    out
 }
 
 /// Build the top-level macro nodes for one file.
@@ -863,15 +904,15 @@ impl App {
 
         let cursor_idx = self.cursor_line.saturating_sub(1);
         let cur_disp = display_row_of(cursor_idx);
-        let top_disp = display_row_of(self.scroll_offset as usize);
+        let top_disp = display_row_of(self.scroll_offset);
 
         if cur_disp < top_disp {
-            self.scroll_offset = cursor_idx.min(u16::MAX as usize) as u16;
+            self.scroll_offset = cursor_idx;
         } else if cur_disp >= top_disp + view_h {
             // Scroll down just enough to bring the cursor row into view.
             let want = cur_disp + 1 - view_h;
             let idx = (0..total).find(|&i| display_row_of(i) >= want).unwrap_or(0);
-            self.scroll_offset = idx.min(u16::MAX as usize) as u16;
+            self.scroll_offset = idx;
         }
 
         // Clamp scroll so the viewport doesn't extend past the last row.
@@ -880,8 +921,8 @@ impl App {
         let max_scroll = (0..total)
             .find(|&i| display_row_of(i) >= max_disp)
             .unwrap_or(0);
-        if (self.scroll_offset as usize) > max_scroll {
-            self.scroll_offset = max_scroll.min(u16::MAX as usize) as u16;
+        if self.scroll_offset > max_scroll {
+            self.scroll_offset = max_scroll;
         }
     }
 
@@ -1900,7 +1941,7 @@ impl App {
         // keeping the old lines would leave the display and the fresh traces
         // permanently out of sync, so every expansion would fail to match.
         let source = match std::fs::read_to_string(&self.file_path) {
-            Ok(s) => s,
+            Ok(s) => expand_tabs(&s),
             Err(e) => {
                 self.status = format!("Failed to re-read {}: {}", self.file_path.display(), e);
                 return;
@@ -2018,7 +2059,7 @@ impl App {
         };
 
         let source = match std::fs::read_to_string(&sub_path) {
-            Ok(s) => s,
+            Ok(s) => expand_tabs(&s),
             Err(e) => {
                 self.status = format!("Failed to read {}: {}", sub_path.display(), e);
                 return;
@@ -2510,7 +2551,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
     // viewport starts at — the same value the old `Paragraph::scroll` offset used, so
     // scrolling behaves identically.
     let view_h = main_chunks[1].height.saturating_sub(2) as usize;
-    let top_src = app.scroll_offset as usize;
+    let top_src = app.scroll_offset;
     let top_disp = top_src + extra_before(top_src);
 
     // Start the walk at the beginning of the split region containing the top source
@@ -3041,7 +3082,7 @@ fn main() -> io::Result<()> {
     };
 
     eprintln!("Loading source from {}", src_path.display());
-    let source = std::fs::read_to_string(&src_path)?;
+    let source = expand_tabs(&std::fs::read_to_string(&src_path)?);
 
     // Touch the source file to invalidate cargo's cache and force recompilation.
     // This ensures the macra-hook (LD_PRELOAD) can intercept proc-macro loading,
@@ -3306,6 +3347,46 @@ mod tests {
 
         assert_eq!(cell_of(header, '┬'), Some(bar), "header cap off the bar");
         assert_eq!(cell_of(footer, '┴'), Some(bar), "footer cap off the bar");
+    }
+
+    #[test]
+    fn expand_tabs_expands_leading_indentation() {
+        assert_eq!(expand_tabs("\tfoo!();"), "    foo!();");
+        assert_eq!(expand_tabs("\t\tx"), "        x");
+    }
+
+    #[test]
+    fn expand_tabs_advances_to_tab_stops_mid_line() {
+        // A tab is not a fixed run of spaces: it advances to the next stop.
+        assert_eq!(expand_tabs("a\tb"), "a   b");
+        assert_eq!(expand_tabs("abcd\tb"), "abcd    b");
+    }
+
+    #[test]
+    fn expand_tabs_resets_the_column_at_newlines() {
+        assert_eq!(expand_tabs("ab\n\tx"), "ab\n    x");
+    }
+
+    #[test]
+    fn expand_tabs_counts_columns_in_characters() {
+        // Multibyte chars are one column each, matching proc-macro2 span columns.
+        assert_eq!(expand_tabs("日\tx"), "日   x");
+    }
+
+    #[test]
+    fn expand_tabs_leaves_tabless_source_untouched() {
+        assert_eq!(expand_tabs("fn main() {}\n"), "fn main() {}\n");
+    }
+
+    #[test]
+    fn find_macros_columns_index_the_tab_expanded_text() {
+        // The load path expands tabs and then parses the very same string, so the
+        // span columns must slice the expanded lines correctly.
+        let src = expand_tabs("fn main() {\n\tlet v = vec![1, 2, 3];\n}\n");
+        let macros = find_macros(&src);
+        let m = macros.iter().find(|m| m.name == "vec").unwrap();
+        let line = src.lines().nth(m.line - 1).unwrap();
+        assert_eq!(&line[m.col_start..m.col_end], "vec![1, 2, 3]");
     }
 
     /// `a!(1); b!(2);` — expanding `a!` lifts `b!(2);` onto its own indented line, and
