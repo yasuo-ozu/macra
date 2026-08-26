@@ -16,6 +16,10 @@ pub struct MacroCall {
     pub col_start: usize,
     /// The end column (0-indexed, exclusive)
     pub col_end: usize,
+    /// For derive macros: the line (1-indexed) the derive's own name sits on, which
+    /// differs from `line` when a `#[derive(..)]` list spans several lines. Equal to
+    /// `line` for every other kind. Used to place the cursor on the right derive.
+    pub derive_line: usize,
     /// The end line (1-indexed) of the macro call / attribute itself
     pub line_end: usize,
     /// The end line (1-indexed) of the target item (for attr/derive macros)
@@ -123,6 +127,7 @@ impl MacroVisitor {
                 line,
                 col_start,
                 col_end,
+                derive_line: line,
                 line_end,
                 item_line_end: line_end,
                 input,
@@ -157,19 +162,46 @@ impl MacroVisitor {
                 // Derive macros receive the item without the #[derive(...)] attribute
                 let input = item_without_attr(item, attr_idx);
                 if let syn::Meta::List(list) = &attr.meta {
-                    let tokens_str = list.tokens.to_string();
-                    let all_derive_names: Vec<String> = tokens_str
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                    for derive_name in &all_derive_names {
+                    // Parse the derive list as paths so each derive gets its own span.
+                    // Derives within one `#[derive(..)]` are order-independent, so the
+                    // TUI must be able to address each one individually; that needs a
+                    // distinct column range per derive. Fall back to splitting the
+                    // token text (with the whole attribute's span) if parsing fails.
+                    let parsed = attr.parse_args_with(
+                        syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated,
+                    );
+                    let derives: Vec<(String, usize, usize, usize)> = match &parsed {
+                        Ok(paths) => paths
+                            .iter()
+                            .map(|p| {
+                                let span = p.span();
+                                (
+                                    p.to_token_stream().to_string(),
+                                    span.start().line,
+                                    span.start().column,
+                                    span.end().column,
+                                )
+                            })
+                            .collect(),
+                        Err(_) => list
+                            .tokens
+                            .to_string()
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .map(|n| (n, line, col_start, col_end))
+                            .collect(),
+                    };
+                    let all_derive_names: Vec<String> =
+                        derives.iter().map(|(n, ..)| n.clone()).collect();
+                    for (derive_name, d_line, d_col_start, d_col_end) in derives {
                         self.macros.push(MacroCall {
-                            name: derive_name.clone(),
+                            name: derive_name,
                             kind: MacroKind::Derive,
                             line,
-                            col_start,
-                            col_end,
+                            col_start: d_col_start,
+                            col_end: d_col_end,
+                            derive_line: d_line,
                             line_end,
                             item_line_end,
                             input: input.clone(),
@@ -193,6 +225,7 @@ impl MacroVisitor {
                     line,
                     col_start,
                     col_end,
+                    derive_line: line,
                     line_end,
                     item_line_end,
                     input,
@@ -336,12 +369,15 @@ pub fn find_macros(source: &str) -> Vec<MacroCall> {
         MacroKind::Derive => true, // derive macros are always user-defined
     });
 
-    // Deduplicate based on line and name
+    // Deduplicate based on position and name. The column must be part of the key:
+    // without it, two invocations of the same macro on one line (`m!(1); m!(2);`,
+    // or two derives in one list) collapse into a single entry and become
+    // unreachable in the TUI.
     let mut seen = std::collections::HashSet::new();
     visitor
         .macros
         .into_iter()
-        .filter(|m| seen.insert((m.line, m.name.clone(), m.kind)))
+        .filter(|m| seen.insert((m.line, m.col_start, m.name.clone(), m.kind)))
         .collect()
 }
 
@@ -383,6 +419,69 @@ fn main() {
         let line = source.lines().nth(vec_mac.line - 1).unwrap();
         assert_eq!(&line[..vec_mac.col_start], "    let v = ");
         assert_eq!(&line[vec_mac.col_end..], ";");
+    }
+
+    #[test]
+    fn test_each_derive_gets_its_own_columns() {
+        // Derives in one `#[derive(..)]` are order-independent, so each must be
+        // individually addressable — which requires a distinct column range.
+        let source = "#[derive(Greet, Describe)]\npub struct S;";
+        //             0123456789012345678901234
+        //                      ^     ^ ^      ^
+        //                      9    14 16    24
+        let derives: Vec<_> = find_macros(source)
+            .into_iter()
+            .filter(|m| m.kind == MacroKind::Derive)
+            .collect();
+        assert_eq!(derives.len(), 2);
+
+        let greet = derives.iter().find(|m| m.name == "Greet").unwrap();
+        let describe = derives.iter().find(|m| m.name == "Describe").unwrap();
+
+        assert_eq!((greet.col_start, greet.col_end), (9, 14));
+        assert_eq!((describe.col_start, describe.col_end), (16, 24));
+        assert_ne!(greet.col_start, describe.col_start);
+
+        // The line the attribute starts on is shared (it drives source rewriting),
+        // and each derive knows the line its own name sits on.
+        assert_eq!(greet.line, describe.line);
+        assert_eq!(greet.derive_line, 1);
+        assert_eq!(describe.derive_line, 1);
+
+        // Columns must index the real source text.
+        let line = source.lines().next().unwrap();
+        assert_eq!(&line[greet.col_start..greet.col_end], "Greet");
+        assert_eq!(&line[describe.col_start..describe.col_end], "Describe");
+    }
+
+    #[test]
+    fn test_multiline_derive_list_tracks_its_own_line() {
+        let source = "#[derive(\n    Greet,\n    Describe,\n)]\npub struct S;";
+        let derives: Vec<_> = find_macros(source)
+            .into_iter()
+            .filter(|m| m.kind == MacroKind::Derive)
+            .collect();
+        assert_eq!(derives.len(), 2);
+        let greet = derives.iter().find(|m| m.name == "Greet").unwrap();
+        let describe = derives.iter().find(|m| m.name == "Describe").unwrap();
+        assert_eq!(greet.derive_line, 2);
+        assert_eq!(describe.derive_line, 3);
+        // Both still anchor to the attribute's start line for rewriting.
+        assert_eq!(greet.line, 1);
+        assert_eq!(describe.line, 1);
+    }
+
+    #[test]
+    fn test_same_name_macros_on_one_line_are_both_kept() {
+        // Deduplication used to key on (line, name, kind), silently dropping the
+        // second invocation and making it unreachable in the TUI.
+        let source = "fn main() {\n    foo!(1); foo!(2);\n}";
+        let foos: Vec<_> = find_macros(source)
+            .into_iter()
+            .filter(|m| m.name == "foo")
+            .collect();
+        assert_eq!(foos.len(), 2);
+        assert_ne!(foos[0].col_start, foos[1].col_start);
     }
 
     #[test]

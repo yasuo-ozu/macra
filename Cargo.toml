@@ -33,6 +33,13 @@ quote = "1.0.44"
 filetime = "0.2"
 cargo_metadata = "0.23"
 libc = { version = "0.2", optional = true }
+prettyplease = { version = "0.2", features = ["verbatim"] }
+unicode-width = "0.2"
+
+# Restore the terminal when the process is killed from outside (raw mode swallows
+# Ctrl-C, so only an external signal reaches us here). Already in the tree via crossterm.
+[target.'cfg(unix)'.dependencies]
+signal-hook = "0.3"
 
 [target.'cfg(windows)'.dependencies.windows-sys]
 version = "0.59"

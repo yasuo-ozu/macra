@@ -1,4 +1,5 @@
 mod macro_finder;
+mod pretty;
 
 use std::io::{self, stdout};
 use std::path::{Path, PathBuf};
@@ -10,7 +11,7 @@ use cargo_macra::trace_macros::{MacroExpansionIter, TraceMacros};
 use clap::Parser;
 use crossterm::{
     ExecutableCommand,
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use macro_finder::{MacroCall, MacroKind, find_macros, is_builtin_attribute};
@@ -55,6 +56,10 @@ struct Args {
     #[arg(long)]
     show_expansion: bool,
 
+    /// Coloring of printed expansions
+    #[arg(long, value_name = "WHEN", value_enum, default_value_t = pretty::ColorChoice::Auto)]
+    color: pretty::ColorChoice,
+
     /// Module path to open (e.g., "foo::bar" opens the file for module `crate::foo::bar`)
     module: Option<String>,
 
@@ -88,8 +93,78 @@ struct MacroNode {
     children_visible: bool,
     /// For derive macros: snapshot of sibling derive nodes' state before this expansion,
     /// used to restore their state on undo.
-    /// Vec of (node_id, original_lines, line, line_end, item_line_end)
-    derive_sibling_snapshot: Vec<(usize, Vec<String>, usize, usize, usize)>,
+    /// Vec of (node_id, original_lines, line, line_end, item_line_end, derive_line)
+    derive_sibling_snapshot: Vec<(usize, Vec<String>, usize, usize, usize, usize)>,
+    /// The `line_origins` entries this expansion replaced, restored verbatim on undo.
+    /// Recomputing them from the node's `call.line` gets the gutter wrong as soon as an
+    /// earlier expansion has shifted this node, and stamps real line numbers onto lines
+    /// that are themselves expansion output (they must stay `None`).
+    original_line_origins: Vec<Option<usize>>,
+}
+
+/// Non-blocking poll for a key that cancels a pending expansion lookup.
+///
+/// Called while waiting on the trace stream. Waiting used to be unbounded on the UI
+/// thread, so a trace that never arrived (a hung `cargo check`, or a macro whose
+/// expansion was never captured) froze the TUI completely — no redraw, no input, and
+/// no Ctrl-C because raw mode swallows SIGINT.
+/// Paint a one-line notice on the bottom row while a trace lookup blocks.
+///
+/// The lookup runs on the UI thread and ratatui cannot redraw during it, so without
+/// this the screen simply freezes on the pre-keypress frame for as long as `cargo
+/// check` takes — indistinguishable from a hang. Written straight to the alternate
+/// screen with crossterm; the next `terminal.draw` paints over it.
+fn draw_wait_notice(name: &str) {
+    use crossterm::{
+        QueueableCommand,
+        cursor::MoveTo,
+        style::{Attribute, Print, SetAttribute},
+        terminal::{Clear, ClearType, size},
+    };
+    use std::io::Write;
+
+    let Ok((w, h)) = size() else { return };
+    if h == 0 || w == 0 {
+        return;
+    }
+    let text = fit_to_width(
+        &format!(" Expanding '{}' — waiting for cargo… (Esc cancels) ", name),
+        w as usize,
+    );
+    let mut out = stdout();
+    let _ = out.queue(MoveTo(0, h - 1));
+    let _ = out.queue(Clear(ClearType::CurrentLine));
+    let _ = out.queue(SetAttribute(Attribute::Reverse));
+    let _ = out.queue(Print(text));
+    let _ = out.queue(SetAttribute(Attribute::Reset));
+    let _ = out.flush();
+}
+
+fn wait_cancelled() -> bool {
+    while event::poll(std::time::Duration::ZERO).unwrap_or(false) {
+        if let Ok(Event::Key(key)) = event::read() {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            if key.code == KeyCode::Esc
+                || (key.modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d')))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Outcome of a trace lookup.
+enum TraceLookup {
+    /// A matching expansion was found.
+    Found(String),
+    /// The expansion stream ran to completion without a match.
+    Exhausted,
+    /// The user cancelled while waiting.
+    Aborted,
 }
 
 struct CacheInner {
@@ -103,12 +178,16 @@ struct CacheInner {
 
 struct ExpansionCache {
     inner: Arc<(Mutex<CacheInner>, Condvar)>,
+    /// This run's `cargo check`. Killed explicitly on reload and by `Drop` on exit,
+    /// so repeated `r` presses cannot stack concurrent cargo processes.
+    child: Arc<Mutex<std::process::Child>>,
 }
 
 impl ExpansionCache {
     fn new(
         iter: MacroExpansionIter,
         check_result: std::sync::mpsc::Receiver<io::Result<cargo_macra::trace_macros::CheckResult>>,
+        child: Arc<Mutex<std::process::Child>>,
     ) -> Self {
         let inner = Arc::new((
             Mutex::new(CacheInner {
@@ -160,7 +239,20 @@ impl ExpansionCache {
             condvar.notify_all();
         });
 
-        Self { inner }
+        Self { inner, child }
+    }
+
+    /// Kill this run's `cargo check`.
+    ///
+    /// Safe to call at any time: if the child already exited and was reaped by the
+    /// reader thread, `kill` returns an error that is deliberately ignored. Closing
+    /// the pipes makes both reader threads see EOF and finish on their own.
+    fn kill_child(&self) {
+        let mut child = self
+            .child
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _ = child.kill();
     }
 
     /// Convert MacroKind to MacroExpansionKind for comparison.
@@ -183,6 +275,7 @@ impl ExpansionCache {
         name: &str,
         kind: MacroKind,
         relaxed_name: bool,
+        strict_input: bool,
     ) -> bool {
         let macro_name = name.rsplit("::").next().unwrap_or(name).trim();
         let exp_name = exp.name.rsplit("::").next().unwrap_or(&exp.name).trim();
@@ -191,10 +284,14 @@ impl ExpansionCache {
                 && exp_name.starts_with("__")
                 && exp_name[2..].starts_with(macro_name));
         let input_matches = if kind == MacroKind::Attribute {
-            // Hook-captured attribute macros serialize doc comments differently
-            // than syn (/// vs #[doc = "..."]). The arguments alone are
-            // sufficient to identify the specific invocation.
-            true
+            // Hook-captured attribute macros serialize doc comments differently than
+            // syn (`///` vs `#[doc = "..."]`), so the inputs legitimately differ and
+            // this comparison cannot simply be required. But skipping it outright
+            // reduces the key to name + arguments, and two bare `#[my_attr]`s on
+            // different items then collide — expanding the second showed the first
+            // one's output. So try the input first and only fall back to ignoring it.
+            !strict_input
+                || cargo_macra::normalize_tokens(&exp.input) == cargo_macra::normalize_tokens(input)
         } else if exp.input.is_empty() {
             // Either both inputs are empty (normal match), or rustc may
             // truncate very large macro invocations and emit only `name!`
@@ -219,19 +316,38 @@ impl ExpansionCache {
         name: &str,
         kind: MacroKind,
     ) -> Option<usize> {
-        // Exact name match first, then relaxed name match as fallback
-        for relaxed in [false, true] {
-            for idx in inner.current_idx..inner.expansions.len() {
-                let exp = &inner.expansions[idx];
-                if Self::expansion_matches(exp, input, arguments, name, kind, relaxed) {
-                    return Some(idx);
+        // Most specific match first: exact name before relaxed (mangled) name, and an
+        // input that actually matches before falling back to ignoring it.
+        for strict_input in [true, false] {
+            for relaxed in [false, true] {
+                for idx in inner.current_idx..inner.expansions.len() {
+                    let exp = &inner.expansions[idx];
+                    if Self::expansion_matches(
+                        exp,
+                        input,
+                        arguments,
+                        name,
+                        kind,
+                        relaxed,
+                        strict_input,
+                    ) {
+                        return Some(idx);
+                    }
                 }
-            }
-            // Wrap around: search from beginning to current_idx
-            for idx in 0..inner.current_idx {
-                let exp = &inner.expansions[idx];
-                if Self::expansion_matches(exp, input, arguments, name, kind, relaxed) {
-                    return Some(idx);
+                // Wrap around: search from beginning to current_idx
+                for idx in 0..inner.current_idx {
+                    let exp = &inner.expansions[idx];
+                    if Self::expansion_matches(
+                        exp,
+                        input,
+                        arguments,
+                        name,
+                        kind,
+                        relaxed,
+                        strict_input,
+                    ) {
+                        return Some(idx);
+                    }
                 }
             }
         }
@@ -240,14 +356,20 @@ impl ExpansionCache {
     }
 
     /// Find an expansion that matches the given macro input/arguments.
-    /// Blocks until a match is found or the iterator is exhausted.
+    ///
+    /// Waits for the background stream to produce a match, but never blocks the UI
+    /// thread indefinitely: `should_abort` is polled between waits so the caller can
+    /// let the user cancel. Without this the TUI freezes with no redraw and no key
+    /// handling whenever a trace never arrives — and because raw mode swallows
+    /// SIGINT, Ctrl-C cannot break out either.
     fn find_trace_for_tokens(
         &self,
         input: &str,
         arguments: &str,
         name: &str,
         kind: MacroKind,
-    ) -> Option<String> {
+        should_abort: &mut dyn FnMut() -> bool,
+    ) -> TraceLookup {
         let (ref mutex, ref condvar) = *self.inner;
         let mut inner = mutex.lock().unwrap();
 
@@ -255,15 +377,22 @@ impl ExpansionCache {
             if let Some(idx) = Self::search_expansions(&inner, input, arguments, name, kind) {
                 let result = inner.expansions[idx].to.clone();
                 inner.current_idx = idx + 1;
-                return Some(result);
+                return TraceLookup::Found(result);
             }
 
             if inner.done {
-                return None;
+                return TraceLookup::Exhausted;
             }
 
-            // Wait for more data from the background thread
-            inner = condvar.wait(inner).unwrap();
+            // Wait in short slices so the abort check stays responsive.
+            let (guard, _timeout) = condvar
+                .wait_timeout(inner, std::time::Duration::from_millis(50))
+                .unwrap();
+            inner = guard;
+
+            if should_abort() {
+                return TraceLookup::Aborted;
+            }
         }
     }
 
@@ -359,6 +488,13 @@ impl ExpansionCache {
     }
 }
 
+impl Drop for ExpansionCache {
+    fn drop(&mut self) {
+        // Quitting the TUI should not leave a `cargo check` running behind it.
+        self.kill_child();
+    }
+}
+
 /// Saved state when navigating into a submodule
 struct ModuleState {
     source_lines: Vec<String>,
@@ -370,6 +506,7 @@ struct ModuleState {
     list_state: ListState,
     scroll_offset: u16,
     cursor_line: usize,
+    cursor_col: usize,
     file_path: PathBuf,
     module_path: Vec<String>,
 }
@@ -396,6 +533,11 @@ struct App {
     /// Current cursor line in the source view (1-indexed). This can be on any line,
     /// not just macro lines.
     cursor_line: usize,
+    /// Current cursor column (0-indexed) within `cursor_line`. Several macros can
+    /// share one line — most importantly the derives of a single `#[derive(A, B)]`,
+    /// which are order-independent and must each be selectable. Left/Right move the
+    /// cursor between the macro spans on the current line.
+    cursor_col: usize,
     /// Height of the source view area (updated each frame)
     source_view_height: u16,
     /// Status message to display
@@ -410,6 +552,136 @@ struct App {
     module_path: Vec<String>,
     /// Stack of saved module states for returning to parent modules
     module_stack: Vec<ModuleState>,
+    /// When set, each expanded range is rendered as a two-column block comparing the
+    /// original source (left) with the expansion (right). Code outside those ranges
+    /// stays full width. Toggled with `v`.
+    split_view: bool,
+}
+
+/// A range of `source_lines` that holds macro output, paired with the source it
+/// replaced, so the two can be shown side by side.
+struct SplitRegion {
+    /// 0-based index into `source_lines` where the expansion starts.
+    start: usize,
+    /// How many `source_lines` entries the expansion occupies.
+    len: usize,
+    /// The source lines that were replaced.
+    original: Vec<String>,
+    /// The expansion's own lines as `(source index, text)`. The `// -- expanded: X --`
+    /// / `// -- end X --` markers are dropped: the block header already names the
+    /// macro. Keeping the source index means the cursor still lines up after the drop.
+    right: Vec<(usize, String)>,
+    /// Name of the macro that produced the expansion.
+    name: String,
+}
+
+impl SplitRegion {
+    /// Body rows in the block: the taller of the two columns.
+    fn rows(&self) -> usize {
+        self.right.len().max(self.original.len())
+    }
+}
+
+/// Sort regions by position and drop any that sit inside another. A macro expanded
+/// inside another macro's output already lies within that parent's range; splitting it
+/// again would nest columns inside columns.
+fn keep_outermost(mut regions: Vec<SplitRegion>) -> Vec<SplitRegion> {
+    regions.sort_by_key(|r| (r.start, std::cmp::Reverse(r.len)));
+    let mut out: Vec<SplitRegion> = Vec::new();
+    for r in regions {
+        match out.last() {
+            Some(prev) if r.start < prev.start + prev.len => continue,
+            _ => out.push(r),
+        }
+    }
+    out
+}
+
+/// Is this one of the `// -- expanded: X --` / `// -- end X --` marker lines that
+/// `expand_selected` wraps inlined output in?
+fn is_expansion_marker(line: &str) -> bool {
+    let t = line.trim();
+    t.starts_with("// -- expanded:") || (t.starts_with("// -- end ") && t.ends_with("--"))
+}
+
+/// Build the top-level macro nodes for one file.
+///
+/// Shared by the initial file and by `enter_submodule` so a module behaves exactly
+/// like the root file.
+fn build_root_nodes(source: &str, source_lines: &[String]) -> (Vec<MacroNode>, usize) {
+    let macros = find_macros(source);
+
+    let mut nodes = Vec::new();
+    let mut next_id = 0;
+
+    // Items whose (single) top-level attribute macro node has already been added.
+    // Attribute macros are order-*dependent*: rustc expands them outside-in, and
+    // each one's output contains the remaining attributes, so only the first can
+    // be expanded from the original source. The rest appear as children later.
+    let mut item_first_attr: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    // Items that carry a non-built-in attribute macro. Derives on such an item
+    // cannot be expanded until that attribute has run, so they stay hidden.
+    let attr_gated_items: std::collections::HashSet<usize> = macros
+        .iter()
+        .filter(|m| m.kind == MacroKind::Attribute && !is_builtin_attribute(&m.name))
+        .map(|m| m.item_line_end)
+        .collect();
+
+    // Create root-level nodes for each macro found
+    for mac in macros {
+        match mac.kind {
+            MacroKind::Attribute => {
+                // Built-in attributes are not macros we can expand; they show up
+                // as children when a non-built-in sibling is expanded.
+                if is_builtin_attribute(&mac.name) {
+                    continue;
+                }
+                if !item_first_attr.insert(mac.item_line_end) {
+                    // Already have a top-level attribute macro for this item.
+                    continue;
+                }
+            }
+            MacroKind::Derive => {
+                // Derives within one `#[derive(..)]` are order-independent: each
+                // receives the same item and appends its own output. So every
+                // derive gets its own top-level node and the user can expand them
+                // in any order — provided no attribute macro has to run first.
+                if attr_gated_items.contains(&mac.item_line_end) {
+                    continue;
+                }
+            }
+            MacroKind::Functional => {}
+        }
+
+        let line_idx = mac.line.saturating_sub(1);
+        let effective_end = match mac.kind {
+            MacroKind::Attribute => mac.item_line_end,
+            MacroKind::Derive | MacroKind::Functional => mac.line_end,
+        };
+        let line_end_idx = effective_end.saturating_sub(1);
+        let original_lines: Vec<String> = source_lines
+            .get(line_idx..=line_end_idx.min(source_lines.len().saturating_sub(1)))
+            .unwrap_or(&[])
+            .to_vec();
+
+        nodes.push(MacroNode {
+            call: mac,
+            id: next_id,
+            parent_id: None,
+            depth: 0,
+            expanded: false,
+            expansion_failed: false,
+            original_lines,
+            expanded_content: None,
+            children: Vec::new(),
+            children_visible: true,
+            derive_sibling_snapshot: Vec::new(),
+            original_line_origins: Vec::new(),
+        });
+        next_id += 1;
+    }
+
+    (nodes, next_id)
 }
 
 impl App {
@@ -422,59 +694,7 @@ impl App {
     ) -> Self {
         let source_lines: Vec<String> = source.lines().map(|s| s.to_string()).collect();
         let line_origins: Vec<Option<usize>> = (1..=source_lines.len()).map(Some).collect();
-        let macros = find_macros(&source);
-
-        let mut nodes = Vec::new();
-        let mut next_id = 0;
-
-        // Track which items already have a top-level attribute/derive macro.
-        // Key: item_line_end, Value: true if first attr/derive already added.
-        let mut item_first_attr: std::collections::HashSet<usize> =
-            std::collections::HashSet::new();
-
-        // Create root-level nodes for each macro found
-        for mac in macros {
-            // For attr/derive macros, only show the first non-built-in one as top-level.
-            // Subsequent attrs/derives on the same item will appear as children
-            // when the first one is expanded.
-            if matches!(mac.kind, MacroKind::Attribute | MacroKind::Derive) {
-                // Skip built-in attributes entirely at top-level; they'll appear
-                // as children when a non-built-in sibling is expanded.
-                if mac.kind == MacroKind::Attribute && is_builtin_attribute(&mac.name) {
-                    continue;
-                }
-                if !item_first_attr.insert(mac.item_line_end) {
-                    // Already have a top-level attr/derive for this item; skip
-                    continue;
-                }
-            }
-
-            let line_idx = mac.line.saturating_sub(1);
-            let effective_end = match mac.kind {
-                MacroKind::Attribute => mac.item_line_end,
-                MacroKind::Derive | MacroKind::Functional => mac.line_end,
-            };
-            let line_end_idx = effective_end.saturating_sub(1);
-            let original_lines: Vec<String> = source_lines
-                .get(line_idx..=line_end_idx.min(source_lines.len().saturating_sub(1)))
-                .unwrap_or(&[])
-                .to_vec();
-
-            nodes.push(MacroNode {
-                call: mac,
-                id: next_id,
-                parent_id: None,
-                depth: 0,
-                expanded: false,
-                expansion_failed: false,
-                original_lines,
-                expanded_content: None,
-                children: Vec::new(),
-                children_visible: true,
-                derive_sibling_snapshot: Vec::new(),
-            });
-            next_id += 1;
-        }
+        let (nodes, next_id) = build_root_nodes(&source, &source_lines);
 
         let visible_nodes: Vec<usize> = nodes.iter().map(|n| n.id).collect();
         let list_state = ListState::default();
@@ -492,6 +712,7 @@ impl App {
             list_state,
             scroll_offset: 0,
             cursor_line: 1,
+            cursor_col: 0,
             source_view_height: 20,
             status,
             error_message: None,
@@ -499,6 +720,7 @@ impl App {
             file_path,
             module_path,
             module_stack: Vec::new(),
+            split_view: false,
         };
         app.sync_selection_to_cursor();
         app
@@ -564,6 +786,7 @@ impl App {
         if let Some(&target) = lines.iter().find(|&&l| l > self.cursor_line) {
             self.cursor_line = target;
             self.ensure_cursor_visible();
+            self.snap_cursor_col();
             self.sync_selection_to_cursor();
         }
     }
@@ -584,6 +807,7 @@ impl App {
         if let Some(&target) = lines.iter().rev().find(|&&l| l < self.cursor_line) {
             self.cursor_line = target;
             self.ensure_cursor_visible();
+            self.snap_cursor_col();
             self.sync_selection_to_cursor();
         }
     }
@@ -593,6 +817,7 @@ impl App {
         if self.cursor_line > 1 {
             self.cursor_line -= 1;
             self.ensure_cursor_visible();
+            self.snap_cursor_col();
             self.sync_selection_to_cursor();
         }
     }
@@ -602,74 +827,247 @@ impl App {
         if self.cursor_line < self.source_lines.len() {
             self.cursor_line += 1;
             self.ensure_cursor_visible();
+            self.snap_cursor_col();
             self.sync_selection_to_cursor();
         }
     }
 
-    /// Ensure the cursor line is visible in the scroll viewport
+    /// Ensure the cursor line is visible in the scroll viewport.
+    ///
+    /// `scroll_offset` stays in source-line space (the renderer converts it), but the
+    /// viewport height is measured in *display* rows, which split blocks inflate. So
+    /// the comparisons are done in display space, otherwise the cursor drifts off the
+    /// bottom of a split region.
     fn ensure_cursor_visible(&mut self) {
         let view_h = self.source_view_height.saturating_sub(2) as usize; // account for borders
         if view_h == 0 {
             return;
         }
-        let top = self.scroll_offset as usize;
-        let bottom = top + view_h;
         let total = self.source_lines.len();
+        let regions = self.split_regions();
+        let display_row_of = |source_idx: usize| -> usize {
+            source_idx
+                + regions
+                    .iter()
+                    .filter(|r| r.start + r.len <= source_idx)
+                    .map(|r| (r.rows() + 2).saturating_sub(r.len))
+                    .sum::<usize>()
+        };
 
-        if self.cursor_line.saturating_sub(1) < top {
-            self.scroll_offset = self.cursor_line.saturating_sub(1) as u16;
-        } else if self.cursor_line > bottom {
-            self.scroll_offset = (self.cursor_line - view_h) as u16;
+        let cursor_idx = self.cursor_line.saturating_sub(1);
+        let cur_disp = display_row_of(cursor_idx);
+        let top_disp = display_row_of(self.scroll_offset as usize);
+
+        if cur_disp < top_disp {
+            self.scroll_offset = cursor_idx.min(u16::MAX as usize) as u16;
+        } else if cur_disp >= top_disp + view_h {
+            // Scroll down just enough to bring the cursor row into view.
+            let want = cur_disp + 1 - view_h;
+            let idx = (0..total).find(|&i| display_row_of(i) >= want).unwrap_or(0);
+            self.scroll_offset = idx.min(u16::MAX as usize) as u16;
         }
 
-        // Clamp scroll so viewport doesn't extend past the last line
-        let max_scroll = total.saturating_sub(view_h);
+        // Clamp scroll so the viewport doesn't extend past the last row.
+        let total_disp = display_row_of(total);
+        let max_disp = total_disp.saturating_sub(view_h);
+        let max_scroll = (0..total)
+            .find(|&i| display_row_of(i) >= max_disp)
+            .unwrap_or(0);
         if (self.scroll_offset as usize) > max_scroll {
-            self.scroll_offset = max_scroll as u16;
+            self.scroll_offset = max_scroll.min(u16::MAX as usize) as u16;
         }
     }
 
-    /// Sync the macro list selection to the macro at cursor_line (if any).
-    /// If the cursor is not on any macro's line range, deselect.
-    /// When multiple nodes overlap (parent covering children), prefer the deepest match.
+    /// The column range a node occupies on `line`, if it has a meaningful one there.
+    /// Only the node's starting line carries a column range; on continuation lines
+    /// the whole line belongs to the node.
+    fn node_col_span(node: &MacroNode, line: usize) -> Option<(usize, usize)> {
+        let own_line = if node.call.kind == MacroKind::Derive {
+            node.call.derive_line
+        } else {
+            node.call.line
+        };
+        if own_line != line {
+            return None;
+        }
+        let end = if node.call.line_end == own_line || node.call.kind == MacroKind::Derive {
+            node.call.col_end
+        } else {
+            // Multi-line invocation: it owns the rest of its first line.
+            usize::MAX
+        };
+        Some((node.call.col_start, end.max(node.call.col_start + 1)))
+    }
+
+    /// Visible-node indices of every macro that starts on `line`, ordered by column.
+    /// This is what Left/Right steps through.
+    fn macros_on_line(&self, line: usize) -> Vec<(usize, usize)> {
+        let mut v: Vec<(usize, usize)> = self
+            .visible_nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &nid)| {
+                let node = self.get_node(nid)?;
+                let (start, _) = Self::node_col_span(node, line)?;
+                Some((i, start))
+            })
+            .collect();
+        v.sort_by_key(|&(i, col)| (col, i));
+        v
+    }
+
+    /// Sync the macro list selection to the macro under the cursor (if any).
+    /// If the cursor is not on any macro, deselect.
+    ///
+    /// Selection is column-aware: when several macros share a line — the derives of
+    /// one `#[derive(A, B, C)]`, or `a!(); b!();` — the one whose column range covers
+    /// `cursor_col` wins, so the user can address each independently. Ties fall back
+    /// to the deepest node (a child nested inside a parent's range), then the
+    /// narrowest span.
     fn sync_selection_to_cursor(&mut self) {
-        if self.visible_nodes.is_empty() {
-            self.list_state.select(None);
-            return;
-        }
-        let mut best: Option<(usize, usize)> = None; // (visible_idx, depth)
-        for (i, &nid) in self.visible_nodes.iter().enumerate() {
-            if let Some(node) = self.get_node(nid) {
-                let start = node.call.line;
-                let end = if node.expanded {
-                    let num = node
-                        .expanded_content
-                        .as_ref()
-                        .map(|c| c.lines().count())
-                        .unwrap_or(1);
-                    start + num - 1
-                } else {
-                    match node.call.kind {
-                        MacroKind::Attribute => node.call.item_line_end,
-                        _ => node.call.line_end,
-                    }
-                };
-                if self.cursor_line >= start
-                    && self.cursor_line <= end
-                    && best.is_none_or(|(_, d)| node.depth > d)
-                {
-                    best = Some((i, node.depth));
-                }
-            }
-        }
-        match best {
-            Some((idx, _)) => {
+        let nodes: Vec<&MacroNode> = self
+            .visible_nodes
+            .iter()
+            .filter_map(|&nid| self.get_node(nid))
+            .collect();
+        match Self::pick_node_at(&nodes, self.cursor_line, self.cursor_col) {
+            Some(idx) => {
                 self.selected_idx = idx;
                 self.list_state.select(Some(idx));
             }
             None => {
                 self.list_state.select(None);
             }
+        }
+    }
+
+    /// Index into `nodes` of the macro under `(line, col)`, or `None` if there is
+    /// none. Pure so the selection rules can be tested directly.
+    fn pick_node_at(nodes: &[&MacroNode], line: usize, col: usize) -> Option<usize> {
+        // (visible_idx, covers_column, depth, span_width)
+        let mut best: Option<(usize, bool, usize, usize)> = None;
+        for (i, node) in nodes.iter().enumerate() {
+            let start = node.call.line;
+            let end = if node.expanded {
+                let num = node
+                    .expanded_content
+                    .as_ref()
+                    .map(|c| c.lines().count())
+                    .unwrap_or(1);
+                start + num - 1
+            } else {
+                match node.call.kind {
+                    MacroKind::Attribute => node.call.item_line_end,
+                    _ => node.call.line_end,
+                }
+            };
+            if line < start || line > end {
+                continue;
+            }
+            let (covers, width) = match Self::node_col_span(node, line) {
+                Some((cs, ce)) => (col >= cs && col < ce, ce.saturating_sub(cs)),
+                None => (false, usize::MAX),
+            };
+            let better = match best {
+                None => true,
+                Some((_, b_covers, b_depth, b_width)) => {
+                    (covers, node.depth, std::cmp::Reverse(width))
+                        > (b_covers, b_depth, std::cmp::Reverse(b_width))
+                }
+            };
+            if better {
+                best = Some((i, covers, node.depth, width));
+            }
+        }
+        best.map(|(i, ..)| i)
+    }
+
+    /// Move the cursor to the previous/next macro on the current line. Returns false
+    /// when there is nothing to move to, so the caller can fall back to line movement.
+    fn cursor_horizontal(&mut self, forward: bool) -> bool {
+        let on_line = self.macros_on_line(self.cursor_line);
+        if on_line.len() < 2 {
+            return false;
+        }
+        let cur = on_line
+            .iter()
+            .position(|&(i, _)| Some(i) == self.list_state.selected());
+        let next = match (cur, forward) {
+            (Some(p), true) if p + 1 < on_line.len() => p + 1,
+            (Some(p), false) if p > 0 => p - 1,
+            (Some(_), _) => return false,
+            (None, true) => 0,
+            (None, false) => on_line.len() - 1,
+        };
+        self.cursor_col = on_line[next].1;
+        self.sync_selection_to_cursor();
+        true
+    }
+
+    /// Toggle the side-by-side comparison of expanded ranges.
+    fn toggle_split_view(&mut self) {
+        self.split_view = !self.split_view;
+        let n = self.split_regions().len();
+        self.status = if !self.split_view {
+            "Inline view.".to_string()
+        } else if n == 0 {
+            "Split view: expand a macro to compare it with the original.".to_string()
+        } else {
+            format!("Split view: comparing {} expanded range(s).", n)
+        };
+        self.ensure_cursor_visible();
+    }
+
+    /// The expanded ranges to render side by side, in source order and never
+    /// overlapping. Only the outermost expansion of a nest produces a region: a child
+    /// expanded inside a parent's output already sits within the parent's range, and
+    /// splitting it again would nest columns inside columns.
+    fn split_regions(&self) -> Vec<SplitRegion> {
+        if !self.split_view {
+            return Vec::new();
+        }
+        let regions: Vec<SplitRegion> = self
+            .nodes
+            .iter()
+            .filter(|n| n.expanded)
+            .filter_map(|n| {
+                n.expanded_content.as_ref()?;
+                let start = n.call.line.saturating_sub(1);
+                // Not `expanded_content.lines().count()`: a child macro expanded
+                // inside this node's output grows the range it occupies, and a stale
+                // length here makes the row accounting below underflow.
+                let len = self.actual_expanded_line_count(n.id).max(1);
+                let right = (start..start + len)
+                    .filter_map(|idx| {
+                        let text = self.source_lines.get(idx)?;
+                        (!is_expansion_marker(text)).then(|| (idx, text.clone()))
+                    })
+                    .collect();
+                Some(SplitRegion {
+                    start,
+                    len,
+                    original: n.original_lines.clone(),
+                    right,
+                    name: n.call.name.clone(),
+                })
+            })
+            .collect();
+        keep_outermost(regions)
+    }
+
+    /// How far PageUp/PageDown move: one screenful, less a line of overlap so the
+    /// reader keeps some context. Never zero, or the page keys become no-ops.
+    fn page_step(&self) -> usize {
+        (self.source_view_height.saturating_sub(3) as usize).max(1)
+    }
+
+    /// Place the column cursor on the first macro of the current line (if any), so
+    /// that vertical movement always lands on a selectable macro.
+    fn snap_cursor_col(&mut self) {
+        if let Some(&(_, col)) = self.macros_on_line(self.cursor_line).first() {
+            self.cursor_col = col;
+        } else {
+            self.cursor_col = 0;
         }
     }
 
@@ -777,13 +1175,28 @@ impl App {
             return;
         }
 
-        // Find matching trace (blocks until found or iterator exhausted)
-        let expanded_text = match self
-            .expansion_cache
-            .find_trace_for_tokens(&input, &arguments, &name, kind)
-        {
-            Some(text) => text,
-            None => {
+        // Find the matching trace. This waits on the background stream, so poll for
+        // a cancel key while it runs — see `find_trace_for_tokens`.
+        // `should_abort` is only reached once the lookup has actually had to wait, so a
+        // trace that is already cached still expands without any flicker.
+        let mut notified = false;
+        let mut wait = || {
+            if !notified {
+                notified = true;
+                draw_wait_notice(&name);
+            }
+            wait_cancelled()
+        };
+        let lookup =
+            self.expansion_cache
+                .find_trace_for_tokens(&input, &arguments, &name, kind, &mut wait);
+        let expanded_text = match lookup {
+            TraceLookup::Found(text) => text,
+            TraceLookup::Aborted => {
+                self.status = format!("Expansion of '{}' cancelled.", name);
+                return;
+            }
+            TraceLookup::Exhausted => {
                 // Mark as failed and show error
                 if let Some(node) = self.get_node_mut(node_id) {
                     node.expansion_failed = true;
@@ -855,6 +1268,10 @@ impl App {
             }
         };
 
+        // Traces come back as a single line of `TokenStream`-style text; run it
+        // through the pretty-printer so the inlined expansion is readable.
+        let expanded_text = pretty::format_source(&expanded_text);
+
         let line_idx = line.saturating_sub(1);
 
         // Get indentation from original line
@@ -919,6 +1336,11 @@ impl App {
             Vec::new()
         };
 
+        // Set when a trailing fragment of the expanded line is moved onto its own line,
+        // as (first character column of that fragment in the original line, indent of
+        // the new line). Other macros that sat in that fragment have to follow it.
+        let mut tail_rebase: Option<(usize, usize)> = None;
+
         // For functional macros, replace only the macro call, keeping surrounding code
         let (formatted_lines, lines_removed) = if kind == MacroKind::Functional && line == line_end
         {
@@ -926,16 +1348,16 @@ impl App {
             let orig_line = self.source_lines.get(line_idx).cloned().unwrap_or_default();
 
             // Extract parts before and after the macro call
-            let before_macro = if col_start < orig_line.len() {
-                &orig_line[..col_start]
-            } else {
-                ""
-            };
-            let after_macro = if col_end < orig_line.len() {
-                orig_line[col_end..].trim_start()
-            } else {
-                ""
-            };
+            // `col_start`/`col_end` are character columns, so they have to be
+            // converted before they can index into the line's bytes.
+            let (before_macro, _, after_macro) = split_at_cols(&orig_line, col_start, col_end);
+            let trimmed = after_macro.trim_start();
+            if !trimmed.is_empty() {
+                // `trim_start` skipped this many characters past `col_end`.
+                let skipped = after_macro.chars().count() - trimmed.chars().count();
+                tail_rebase = Some((col_end + skipped, base_indent));
+            }
+            let after_macro = trimmed;
 
             let mut lines = Vec::new();
             // Line with code before macro and start marker
@@ -960,16 +1382,9 @@ impl App {
                 .cloned()
                 .unwrap_or_default();
 
-            let before_macro = if col_start < orig_line.len() {
-                &orig_line[..col_start]
-            } else {
-                ""
-            };
-            let after_macro = if col_end < end_orig_line.len() {
-                end_orig_line[col_end..].trim_start()
-            } else {
-                ""
-            };
+            // Character columns again — see the single-line branch above.
+            let before_macro = &orig_line[..byte_of_col(&orig_line, col_start)];
+            let after_macro = end_orig_line[byte_of_col(&end_orig_line, col_end)..].trim_start();
 
             let mut lines = Vec::new();
             lines.push(format!("{}// -- expanded: {} --", before_macro, name));
@@ -995,6 +1410,19 @@ impl App {
                     base_indent_str,
                     remaining_derives.join(", ")
                 ));
+            }
+
+            // `#[derive(Debug)] struct S;` puts the item on the attribute's own line,
+            // and that whole line is about to be removed. Carry the item text over, or
+            // it disappears from the view until the expansion is undone.
+            let last_removed = self
+                .source_lines
+                .get(line_end.saturating_sub(1))
+                .cloned()
+                .unwrap_or_default();
+            let tail = attribute_tail(&last_removed, col_start);
+            if !tail.is_empty() {
+                lines.push(format!("{}{}", base_indent_str, tail));
             }
 
             // Only remove the #[derive(...)] attribute line(s), NOT the item
@@ -1046,6 +1474,14 @@ impl App {
         let num_expanded_lines = formatted_lines.len();
         let lines_added = (num_expanded_lines as isize) - (lines_removed as isize);
 
+        // Snapshot the gutter entries about to be replaced, so undo can put back
+        // exactly what was there (see `original_line_origins`).
+        let replaced_origins: Vec<Option<usize>> = self
+            .line_origins
+            .get(line_idx..(line_idx + lines_removed).min(self.line_origins.len()))
+            .unwrap_or(&[])
+            .to_vec();
+
         // Update source and line_origins: replace the lines with expanded lines
         if line_idx < self.source_lines.len() {
             // Remove original lines from both source_lines and line_origins
@@ -1063,6 +1499,34 @@ impl App {
             }
         }
 
+        // Macros that shared the expanded line and sat *after* the expanded call moved
+        // with the trailing fragment onto its own line. The generic shift loop below
+        // only touches nodes with `line > line`, so without this they keep pointing at
+        // the original line — which is now the `// -- expanded: ... --` marker — and
+        // expanding one of them would slice the marker text at stale columns.
+        if let Some((tail_start_col, indent)) = tail_rebase {
+            let tail_line = line_idx + num_expanded_lines; // 1-indexed
+            let tail_text = self
+                .source_lines
+                .get(tail_line.saturating_sub(1))
+                .cloned()
+                .unwrap_or_default();
+            for node in &mut self.nodes {
+                if node.id != node_id
+                    && node.call.line == line
+                    && node.call.col_start >= tail_start_col
+                {
+                    node.call.line = tail_line;
+                    node.call.line_end = tail_line;
+                    node.call.derive_line = tail_line;
+                    node.call.item_line_end = tail_line;
+                    node.call.col_start = rebase_col(node.call.col_start, tail_start_col, indent);
+                    node.call.col_end = rebase_col(node.call.col_end, tail_start_col, indent);
+                    node.original_lines = vec![tail_text.clone()];
+                }
+            }
+        }
+
         // Update line numbers for all nodes that come after this line
         if lines_added != 0 {
             for node in &mut self.nodes {
@@ -1071,6 +1535,11 @@ impl App {
                     node.call.line_end = (node.call.line_end as isize + lines_added) as usize;
                     node.call.item_line_end =
                         (node.call.item_line_end as isize + lines_added) as usize;
+                    // `derive_line` keys the column span of derive nodes and can differ
+                    // from `line` for a multi-line `#[derive(...)]`; leaving it behind
+                    // silently breaks h/l stepping and the selection highlight.
+                    node.call.derive_line =
+                        (node.call.derive_line as isize + lines_added) as usize;
                 }
             }
         }
@@ -1094,6 +1563,7 @@ impl App {
                         node.call.line,
                         node.call.line_end,
                         node.call.item_line_end,
+                        node.call.derive_line,
                     ));
                 }
             }
@@ -1110,6 +1580,9 @@ impl App {
                         let remaining_line_pos = line_idx + num_expanded_lines - 1; // 0-indexed
                         node.call.line = remaining_line_pos + 1; // 1-indexed
                         node.call.line_end = remaining_line_pos + 1;
+                        // The surviving derives are rewritten onto this one line, so the
+                        // node's column span now lives there as well.
+                        node.call.derive_line = remaining_line_pos + 1;
                         // Update original_lines to the new remaining derive line
                         if let Some(new_line) = self.source_lines.get(remaining_line_pos) {
                             node.original_lines = vec![new_line.clone()];
@@ -1126,6 +1599,7 @@ impl App {
         if let Some(node) = self.get_node_mut(node_id) {
             node.expanded = true;
             node.expanded_content = Some(expanded_content.clone());
+            node.original_line_origins = replaced_origins;
             node.children_visible = true;
             node.derive_sibling_snapshot = derive_sibling_snapshot;
         }
@@ -1168,6 +1642,7 @@ impl App {
                     line: adjusted_line,
                     col_start: child_mac.col_start,
                     col_end: child_mac.col_end,
+                    derive_line: adjusted_line + (child_mac.derive_line - child_mac.line),
                     line_end: adjusted_line + (child_mac.line_end - child_mac.line),
                     item_line_end: adjusted_line + (child_mac.item_line_end - child_mac.line),
                     input: child_mac.input.replace(DOLLAR_CRATE_PLACEHOLDER, "$crate"),
@@ -1186,6 +1661,7 @@ impl App {
                 children: Vec::new(),
                 children_visible: true,
                 derive_sibling_snapshot: Vec::new(),
+                original_line_origins: Vec::new(),
             });
 
             child_ids.push(child_id);
@@ -1243,7 +1719,15 @@ impl App {
             }
         };
 
-        let (name, line, kind, expanded, original_lines, derive_sibling_snapshot) = {
+        let (
+            name,
+            line,
+            kind,
+            expanded,
+            original_lines,
+            derive_sibling_snapshot,
+            original_line_origins,
+        ) = {
             let node = match self.get_node(node_id) {
                 Some(n) => n,
                 None => return,
@@ -1255,6 +1739,7 @@ impl App {
                 node.expanded,
                 node.original_lines.clone(),
                 node.derive_sibling_snapshot.clone(),
+                node.original_line_origins.clone(),
             )
         };
 
@@ -1278,11 +1763,15 @@ impl App {
                     self.line_origins.remove(line_idx);
                 }
             }
-            // Insert the original lines back with their original line numbers
+            // Put back the exact gutter entries this expansion replaced. `line` is the
+            // node's *current* position, which an earlier expansion may have shifted,
+            // so deriving the numbers from it here produced a scrambled gutter — and
+            // stamped line numbers onto a child's lines that are expansion output and
+            // must render as `+`.
             for (i, orig) in original_lines.iter().enumerate() {
                 self.source_lines.insert(line_idx + i, orig.clone());
-                // Restore the original line number (1-indexed)
-                self.line_origins.insert(line_idx + i, Some(line + i));
+                let origin = original_line_origins.get(i).copied().unwrap_or(None);
+                self.line_origins.insert(line_idx + i, origin);
             }
         }
 
@@ -1294,20 +1783,29 @@ impl App {
                     node.call.line_end = (node.call.line_end as isize - lines_delta) as usize;
                     node.call.item_line_end =
                         (node.call.item_line_end as isize - lines_delta) as usize;
+                    node.call.derive_line =
+                        (node.call.derive_line as isize - lines_delta) as usize;
                 }
             }
         }
 
         // For derive macros: restore sibling derive nodes from snapshot
         if kind == MacroKind::Derive {
-            for (sib_id, sib_original_lines, sib_line, sib_line_end, sib_item_line_end) in
-                &derive_sibling_snapshot
+            for (
+                sib_id,
+                sib_original_lines,
+                sib_line,
+                sib_line_end,
+                sib_item_line_end,
+                sib_derive_line,
+            ) in &derive_sibling_snapshot
             {
                 if let Some(sib_node) = self.get_node_mut(*sib_id) {
                     sib_node.original_lines = sib_original_lines.clone();
                     sib_node.call.line = *sib_line;
                     sib_node.call.line_end = *sib_line_end;
                     sib_node.call.item_line_end = *sib_item_line_end;
+                    sib_node.call.derive_line = *sib_derive_line;
                 }
             }
         }
@@ -1322,9 +1820,17 @@ impl App {
             node.children.clear();
             node.children_visible = true;
             node.derive_sibling_snapshot.clear();
+            node.original_line_origins.clear();
         }
 
         self.rebuild_visible_nodes();
+
+        // Collapsing is the only mutation that shrinks the buffer. Without re-clamping,
+        // a cursor that was sitting inside the expansion is left past the end: the pane
+        // renders blank and `j`/`k` stop responding until the user presses `G`.
+        self.cursor_line = self.cursor_line.min(self.source_lines.len().max(1));
+        self.ensure_cursor_visible();
+        self.snap_cursor_col();
         self.sync_selection_to_cursor();
 
         self.status = format!("Undid expansion of '{}'", name);
@@ -1378,13 +1884,46 @@ impl App {
     fn reload_trace(&mut self) {
         self.status = "Reloading trace data...".to_string();
 
+        // Kill the previous run first: repeated `r` presses must not stack concurrent
+        // cargo processes, and the old one has to release the target-directory lock
+        // before the new one can make progress.
+        self.expansion_cache.kill_child();
+
+        // Re-read the file. The user reloads precisely because it changed on disk;
+        // keeping the old lines would leave the display and the fresh traces
+        // permanently out of sync, so every expansion would fail to match.
+        let source = match std::fs::read_to_string(&self.file_path) {
+            Ok(s) => s,
+            Err(e) => {
+                self.status = format!("Failed to re-read {}: {}", self.file_path.display(), e);
+                return;
+            }
+        };
+
         // Touch the target source file to force recompilation.
         let _ = filetime::set_file_mtime(&self.file_path, filetime::FileTime::now());
 
         match self.trace_macros.run() {
             Ok(run) => {
-                self.expansion_cache = ExpansionCache::new(run.iter, run.check_result);
-                self.status = "Reloaded trace data.".to_string();
+                self.expansion_cache = ExpansionCache::new(run.iter, run.check_result, run.child);
+
+                // Rebuild every per-file state from the fresh source. Expanded nodes
+                // are dropped on purpose: their content, undo snapshots and line ranges
+                // all describe the previous run of the previous file.
+                self.source_lines = source.lines().map(|s| s.to_string()).collect();
+                self.line_origins = (1..=self.source_lines.len()).map(Some).collect();
+                let (nodes, next_id) = build_root_nodes(&source, &self.source_lines);
+                self.visible_nodes = nodes.iter().map(|n| n.id).collect();
+                self.nodes = nodes;
+                self.next_id = next_id;
+                self.selected_idx = 0;
+                self.list_state = ListState::default();
+                // The file may have shrunk under the cursor.
+                self.cursor_line = self.cursor_line.min(self.source_lines.len()).max(1);
+                self.ensure_cursor_visible();
+                self.snap_cursor_col();
+                self.sync_selection_to_cursor();
+                self.status = format!("Reloaded trace data. Found {} macros.", self.nodes.len());
             }
             Err(e) => {
                 self.status = format!("Failed to reload trace: {}", e);
@@ -1490,6 +2029,7 @@ impl App {
             list_state: std::mem::take(&mut self.list_state),
             scroll_offset: self.scroll_offset,
             cursor_line: self.cursor_line,
+            cursor_col: self.cursor_col,
             file_path: self.file_path.clone(),
             module_path: self.module_path.clone(),
         };
@@ -1498,45 +2038,10 @@ impl App {
         // Set up new module state
         let source_lines: Vec<String> = source.lines().map(|s| s.to_string()).collect();
         let line_origins: Vec<Option<usize>> = (1..=source_lines.len()).map(Some).collect();
-        let macros = find_macros(&source);
-
-        let mut nodes = Vec::new();
-        let mut next_id = 0;
-        let mut item_first_attr: std::collections::HashSet<usize> =
-            std::collections::HashSet::new();
-
-        for mac in macros {
-            if matches!(mac.kind, MacroKind::Attribute | MacroKind::Derive)
-                && !item_first_attr.insert(mac.item_line_end)
-            {
-                continue;
-            }
-            let line_idx = mac.line.saturating_sub(1);
-            let effective_end = match mac.kind {
-                MacroKind::Attribute => mac.item_line_end,
-                MacroKind::Derive | MacroKind::Functional => mac.line_end,
-            };
-            let line_end_idx = effective_end.saturating_sub(1);
-            let original_lines: Vec<String> = source_lines
-                .get(line_idx..=line_end_idx.min(source_lines.len().saturating_sub(1)))
-                .unwrap_or(&[])
-                .to_vec();
-
-            nodes.push(MacroNode {
-                call: mac,
-                id: next_id,
-                parent_id: None,
-                depth: 0,
-                expanded: false,
-                expansion_failed: false,
-                original_lines,
-                expanded_content: None,
-                children: Vec::new(),
-                children_visible: true,
-                derive_sibling_snapshot: Vec::new(),
-            });
-            next_id += 1;
-        }
+        // Same rules as the top-level file. This used to dedupe derives per item as
+        // well as attributes, which left every derive after the first in a
+        // `#[derive(A, B)]` with no node at all — unreachable by Tab, h/l, or cursor.
+        let (nodes, next_id) = build_root_nodes(&source, &source_lines);
 
         let visible_nodes: Vec<usize> = nodes.iter().map(|n| n.id).collect();
         let list_state = ListState::default();
@@ -1550,6 +2055,7 @@ impl App {
         self.list_state = list_state;
         self.scroll_offset = 0;
         self.cursor_line = 1;
+        self.snap_cursor_col();
         self.module_path.push(mod_name.clone());
         self.file_path = sub_path;
         self.sync_selection_to_cursor();
@@ -1579,6 +2085,7 @@ impl App {
         self.list_state = saved.list_state;
         self.scroll_offset = saved.scroll_offset;
         self.cursor_line = saved.cursor_line;
+        self.cursor_col = saved.cursor_col;
         self.file_path = saved.file_path;
         self.module_path = saved.module_path;
         self.status = format!(
@@ -1716,6 +2223,16 @@ fn run_app(
     expansion_cache: ExpansionCache,
     trace_macros: TraceMacros,
 ) -> io::Result<()> {
+    // Restore the terminal even if the TUI panics — otherwise the shell is left in
+    // raw mode on the alternate screen, which looks exactly like a hang.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        default_hook(info);
+    }));
+
+    install_signal_handler();
+
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
 
@@ -1728,71 +2245,144 @@ fn run_app(
         trace_macros,
     );
 
-    loop {
-        terminal.draw(|frame| ui(frame, &mut app))?;
+    // Run the loop in a closure so that an I/O error takes the same exit path as a
+    // clean quit and always restores the terminal.
+    let result = (|| -> io::Result<()> {
+        loop {
+            terminal.draw(|frame| ui(frame, &mut app))?;
 
-        if event::poll(std::time::Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    // If error message is displayed, dismiss it on Enter
-                    if app.error_message.is_some() {
-                        if key.code == KeyCode::Enter || key.code == KeyCode::Esc {
-                            app.error_message = None;
+            if event::poll(std::time::Duration::from_millis(100))? {
+                let ev = event::read()?;
+                if let Event::Resize(_, _) = ev {
+                    // Shrinking the terminal can leave the cursor below the new
+                    // viewport; nothing else pulls it back until the next j/k.
+                    app.ensure_cursor_visible();
+                }
+                if let Event::Key(key) = ev {
+                    if key.kind == KeyEventKind::Press {
+                        // Raw mode swallows SIGINT, so Ctrl-C arrives as a plain key
+                        // event; without this the only way out of a wedged TUI is to
+                        // kill the terminal. Checked before anything else so it works
+                        // even while an error dialog is up.
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d'))
+                        {
+                            break;
                         }
-                        continue;
-                    }
 
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => break,
-                        KeyCode::Down | KeyCode::Char('j') => app.cursor_down(),
-                        KeyCode::Up | KeyCode::Char('k') => app.cursor_up(),
-                        KeyCode::Enter => {
-                            // If cursor is on a `mod foo;` declaration, enter that submodule.
-                            // Otherwise, toggle macro expansion.
-                            if app.parse_mod_declaration_at_cursor().is_some() {
-                                app.enter_submodule();
-                            } else {
-                                app.toggle_expansion();
+                        // If error message is displayed, dismiss it on Enter
+                        if app.error_message.is_some() {
+                            if key.code == KeyCode::Enter || key.code == KeyCode::Esc {
+                                app.error_message = None;
                             }
+                            continue;
                         }
-                        KeyCode::Backspace => app.return_to_parent_module(),
-                        KeyCode::Char('r') => app.reload_trace(),
-                        KeyCode::Char('n') => app.jump_to_next_macro(),
-                        KeyCode::Char('N') => app.jump_to_prev_macro(),
-                        KeyCode::Tab => app.next(),
-                        KeyCode::BackTab => app.previous(),
-                        KeyCode::Char(' ') => app.toggle_children(),
-                        KeyCode::PageDown => {
-                            for _ in 0..10 {
-                                app.cursor_down();
+
+                        match key.code {
+                            KeyCode::Char('q') => break,
+                            // Deliberately not a quit key: Esc cancels a pending
+                            // expansion, and an Esc arriving just after the trace
+                            // landed used to exit the application instead.
+                            KeyCode::Esc => {
+                                app.status = "Press 'q' to quit.".to_string();
                             }
-                        }
-                        KeyCode::PageUp => {
-                            for _ in 0..10 {
-                                app.cursor_up();
+                            KeyCode::Down | KeyCode::Char('j') => app.cursor_down(),
+                            KeyCode::Up | KeyCode::Char('k') => app.cursor_up(),
+                            // Step between macros that share the current line (the
+                            // derives of one `#[derive(A, B)]`, `a!(); b!();`, ...).
+                            // A no-op when the line holds nothing further, rather
+                            // than silently moving the cursor somewhere unexpected.
+                            KeyCode::Right | KeyCode::Char('l') => {
+                                app.cursor_horizontal(true);
                             }
+                            KeyCode::Left | KeyCode::Char('h') => {
+                                app.cursor_horizontal(false);
+                            }
+                            KeyCode::Enter => {
+                                // If cursor is on a `mod foo;` declaration, enter that submodule.
+                                // Otherwise, toggle macro expansion.
+                                if app.parse_mod_declaration_at_cursor().is_some() {
+                                    app.enter_submodule();
+                                } else {
+                                    app.toggle_expansion();
+                                }
+                            }
+                            KeyCode::Backspace => app.return_to_parent_module(),
+                            KeyCode::Char('v') => app.toggle_split_view(),
+                            KeyCode::Char('r') => app.reload_trace(),
+                            KeyCode::Char('n') => app.jump_to_next_macro(),
+                            KeyCode::Char('N') => app.jump_to_prev_macro(),
+                            KeyCode::Tab => app.next(),
+                            KeyCode::BackTab => app.previous(),
+                            KeyCode::Char(' ') => app.toggle_children(),
+                            KeyCode::PageDown => {
+                                for _ in 0..app.page_step() {
+                                    app.cursor_down();
+                                }
+                            }
+                            KeyCode::PageUp => {
+                                for _ in 0..app.page_step() {
+                                    app.cursor_up();
+                                }
+                            }
+                            KeyCode::Home | KeyCode::Char('g') => {
+                                app.cursor_line = 1;
+                                app.ensure_cursor_visible();
+                                app.snap_cursor_col();
+                                app.sync_selection_to_cursor();
+                            }
+                            KeyCode::End | KeyCode::Char('G') => {
+                                app.cursor_line = app.source_lines.len().max(1);
+                                app.ensure_cursor_visible();
+                                app.snap_cursor_col();
+                                app.sync_selection_to_cursor();
+                            }
+                            _ => {}
                         }
-                        KeyCode::Home | KeyCode::Char('g') => {
-                            app.cursor_line = 1;
-                            app.ensure_cursor_visible();
-                            app.sync_selection_to_cursor();
-                        }
-                        KeyCode::End | KeyCode::Char('G') => {
-                            app.cursor_line = app.source_lines.len().max(1);
-                            app.ensure_cursor_visible();
-                            app.sync_selection_to_cursor();
-                        }
-                        _ => {}
                     }
                 }
             }
         }
+
+        Ok(())
+    })();
+
+    restore_terminal();
+    let _ = std::panic::take_hook();
+
+    result
+}
+
+/// Put the terminal back into its normal state. Safe to call more than once.
+/// Restore the terminal if we are killed from outside.
+///
+/// Raw mode swallows Ctrl-C (it arrives as a key event instead), so the signals that
+/// actually reach this process come from `kill`, a closing terminal emulator, or a CI
+/// timeout. The default disposition terminates without unwinding, so neither the panic
+/// hook nor the normal exit path runs, and the user is left staring at a shell in raw
+/// mode on the alternate screen.
+#[cfg(unix)]
+fn install_signal_handler() {
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+    for &sig in &[SIGTERM, SIGINT, SIGHUP] {
+        // Safety: `restore_terminal` only issues terminal escape sequences and an
+        // ioctl; it allocates nothing and takes no locks that a signal could interrupt.
+        let registered = unsafe {
+            signal_hook::low_level::register(sig, move || {
+                restore_terminal();
+                let _ = signal_hook::low_level::emulate_default_handler(sig);
+            })
+        };
+        let _ = registered;
     }
+}
 
-    disable_raw_mode()?;
-    stdout().execute(LeaveAlternateScreen)?;
+#[cfg(not(unix))]
+fn install_signal_handler() {}
 
-    Ok(())
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = stdout().execute(LeaveAlternateScreen);
 }
 
 fn ui(frame: &mut Frame, app: &mut App) {
@@ -1884,51 +2474,84 @@ fn ui(frame: &mut Frame, app: &mut App) {
 
     // Right panel: source code with highlighting
     let cursor_line = app.cursor_line;
+    // Column range of the selected macro on the cursor line. Several macros can share
+    // a line — the derives of one `#[derive(A, B, C)]` above all — so highlighting the
+    // whole line is not enough to show which one Enter will expand.
+    let sel_span: Option<(usize, usize)> = app
+        .selected_node()
+        .and_then(|n| App::node_col_span(n, cursor_line));
 
-    let source_lines: Vec<Line> = app
-        .source_lines
+    let regions = app.split_regions();
+    // Inner width of the source pane, minus the 7-char line-number gutter.
+    let content_w = main_chunks[1].width.saturating_sub(2).saturating_sub(7) as usize;
+
+    // Display rows the split blocks add before source line `idx`. Same arithmetic as
+    // `ensure_cursor_visible`, but over the regions already built above rather than
+    // re-deriving (and re-cloning) them.
+    let extra_before = |idx: usize| -> usize {
+        regions
+            .iter()
+            .filter(|r| r.start + r.len <= idx)
+            .map(|r| (r.rows() + 2).saturating_sub(r.len))
+            .sum()
+    };
+
+    // Build only the rows that fit in the viewport. Rendering the whole buffer meant
+    // re-tokenizing and re-allocating every line ~10x/second: on a 5k-line buffer a
+    // single frame took longer than the event loop's poll interval, so keystrokes
+    // lagged by nearly a second.
+    //
+    // `scroll_offset` is in source-line space; `top_disp` is the display row the
+    // viewport starts at — the same value the old `Paragraph::scroll` offset used, so
+    // scrolling behaves identically.
+    let view_h = main_chunks[1].height.saturating_sub(2) as usize;
+    let top_src = app.scroll_offset as usize;
+    let top_disp = top_src + extra_before(top_src);
+
+    // Start the walk at the beginning of the split region containing the top source
+    // line — its block may be partially scrolled off the top — or at the top line
+    // itself when it sits outside every region.
+    let start_i = regions
         .iter()
-        .zip(app.line_origins.iter())
-        .enumerate()
-        .map(|(i, (line, origin))| {
-            let display_idx = i + 1; // 1-indexed position in the display
-            let is_cursor = display_idx == cursor_line;
-            let is_expanded = origin.is_none();
+        .find(|r| r.start <= top_src && top_src < r.start + r.len)
+        .map(|r| r.start)
+        .unwrap_or(top_src)
+        .min(app.source_lines.len());
 
-            // Format line number: show original number or blank for expanded lines
-            let line_num_str = match origin {
-                Some(n) => format!("{:4} │ ", n),
-                None => "     │ ".to_string(),
-            };
-
-            let line_num_style = if is_cursor {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .bg(Color::DarkGray)
-                    .bold()
-            } else if is_expanded {
-                Style::default().fg(Color::Green)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-
-            let content_style = if is_cursor {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .bg(Color::DarkGray)
-                    .bold()
-            } else if is_expanded {
-                Style::default().fg(Color::Green)
-            } else {
-                colorize_line(line)
-            };
-
-            Line::from(vec![
-                Span::styled(line_num_str, line_num_style),
-                Span::styled(line.as_str(), content_style),
-            ])
-        })
-        .collect();
+    let mut source_lines: Vec<Line> = Vec::with_capacity(view_h);
+    let mut i = start_i; // source-line index
+    let mut row = start_i + extra_before(start_i); // display row of source line `i`
+    while i < app.source_lines.len() && row < top_disp + view_h {
+        if let Some(region) = regions.iter().find(|r| r.start == i) {
+            let block_rows = region.rows() + 2;
+            if row + block_rows > top_disp {
+                // Only the slice of the block that intersects the viewport.
+                let first = top_disp.saturating_sub(row);
+                let last = (top_disp + view_h - row).min(block_rows);
+                render_split_block_rows(
+                    &mut source_lines,
+                    region,
+                    content_w,
+                    cursor_line,
+                    first..last,
+                );
+            }
+            row += block_rows;
+            i += region.len;
+            continue;
+        }
+        if row >= top_disp {
+            source_lines.push(render_plain_line(
+                &app.source_lines[i],
+                app.line_origins[i],
+                i + 1,
+                cursor_line,
+                sel_span,
+            ));
+        }
+        row += 1;
+        i += 1;
+    }
 
     let mod_display = app.module_path_display();
     let title = if let Some(node) = app.selected_node() {
@@ -1940,14 +2563,15 @@ fn ui(frame: &mut Frame, app: &mut App) {
         format!(" {} ", mod_display)
     };
 
+    // `source_lines` already starts at the viewport's first display row and holds at
+    // most one screenful, so the widget needs no scroll of its own.
     let paragraph = Paragraph::new(source_lines)
-        .block(Block::default().borders(Borders::ALL).title(title))
-        .scroll((app.scroll_offset, 0));
+        .block(Block::default().borders(Borders::ALL).title(title));
 
     frame.render_widget(paragraph, main_chunks[1]);
 
     // Bottom status bar with key guide
-    let key_guide = " j/k=↑↓  g/G=top/bottom  n/N=next/prev macro  Enter=expand/mod  BS=back  r=reload  q=quit ";
+    let key_guide = " j/k=↑↓  h/l=←→ pick macro  g/G=top/bottom  n/N=next/prev  Enter=expand/mod  v=split/inline  BS=back  r=reload  q=quit ";
     let status_text = if app.status.is_empty() {
         key_guide.to_string()
     } else {
@@ -1962,8 +2586,10 @@ fn ui(frame: &mut Frame, app: &mut App) {
     // Error popup (if any)
     if let Some(ref error_msg) = app.error_message {
         let area = frame.area();
-        let popup_width = (area.width * 80 / 100).min(80);
-        let popup_height = (area.height * 60 / 100).min(20);
+        // Widen in u32: `area.width * 80` overflows a u16 past 819 columns, which
+        // panics in debug builds the moment an error popup is shown.
+        let popup_width = (area.width as u32 * 80 / 100).min(80) as u16;
+        let popup_height = (area.height as u32 * 60 / 100).min(20) as u16;
         let popup_x = (area.width - popup_width) / 2;
         let popup_y = (area.height - popup_height) / 2;
 
@@ -1987,92 +2613,340 @@ fn ui(frame: &mut Frame, app: &mut App) {
     }
 }
 
-/// Simple syntax coloring for Rust code.
-fn colorize_line(line: &str) -> Style {
-    let trimmed = line.trim();
-
-    // Comments (highest priority)
-    if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with("*") {
-        return Style::default().fg(Color::DarkGray);
-    }
-
-    // Attributes
-    if trimmed.starts_with("#[") || trimmed.starts_with("#![") {
-        return Style::default().fg(Color::Yellow);
-    }
-
-    // Functional macro invocations (check before keywords so `let x = vec![...]` gets cyan)
-    if trimmed.contains("!(")
-        || trimmed.contains("! (")
-        || trimmed.contains("!{")
-        || trimmed.contains("![")
-    {
-        return Style::default().fg(Color::Cyan);
-    }
-
-    // External module declarations (`mod foo;` / `pub mod foo;`) — navigable with Enter
-    if is_mod_declaration(trimmed) {
-        return Style::default().fg(Color::Cyan).bold();
-    }
-
-    // Keywords
-    if trimmed.starts_with("fn ")
-        || trimmed.starts_with("pub ")
-        || trimmed.starts_with("let ")
-        || trimmed.starts_with("const ")
-        || trimmed.starts_with("static ")
-        || trimmed.starts_with("struct ")
-        || trimmed.starts_with("enum ")
-        || trimmed.starts_with("impl ")
-        || trimmed.starts_with("trait ")
-        || trimmed.starts_with("type ")
-        || trimmed.starts_with("mod ")
-        || trimmed.starts_with("use ")
-        || trimmed.starts_with("where ")
-        || trimmed.starts_with("if ")
-        || trimmed.starts_with("else ")
-        || trimmed.starts_with("match ")
-        || trimmed.starts_with("for ")
-        || trimmed.starts_with("while ")
-        || trimmed.starts_with("loop ")
-        || trimmed.starts_with("return ")
-        || trimmed.starts_with("async ")
-        || trimmed.starts_with("await ")
-    {
-        return Style::default().fg(Color::Blue);
-    }
-
-    // Strings
-    if trimmed.contains('"') {
-        return Style::default().fg(Color::Green);
-    }
-
-    Style::default().fg(Color::White)
+/// Byte offset of character column `col` in `line`, clamped to the end of the line.
+///
+/// Columns come from proc-macro2 spans and are character-based; slicing a `str` with
+/// one directly panics on any line containing multibyte text. Every conversion from a
+/// span column to a byte index must go through here.
+fn byte_of_col(line: &str, col: usize) -> usize {
+    line.char_indices()
+        .nth(col)
+        .map(|(b, _)| b)
+        .unwrap_or(line.len())
 }
 
-/// Check if a trimmed line is an external module declaration (`mod foo;`).
-fn is_mod_declaration(trimmed: &str) -> bool {
-    let rest = if let Some(rest) = trimmed.strip_prefix("mod ") {
-        rest
-    } else if let Some(after_pub) = trimmed.strip_prefix("pub ") {
-        if let Some(rest) = after_pub.strip_prefix("mod ") {
-            rest
-        } else if after_pub.starts_with('(') {
-            match after_pub.find(')') {
-                Some(close) => match after_pub[close + 1..].trim_start().strip_prefix("mod ") {
-                    Some(rest) => rest,
-                    None => return false,
-                },
-                None => return false,
-            }
-        } else {
-            return false;
-        }
-    } else {
-        return false;
+/// Where a macro that sat at character column `col` lands after the text from
+/// `tail_start_col` onward is lifted onto its own line indented by `indent`.
+fn rebase_col(col: usize, tail_start_col: usize, indent: usize) -> usize {
+    indent + col.saturating_sub(tail_start_col)
+}
+
+/// Whatever follows the `#[...]` attribute containing character column `col` on
+/// `line`, trimmed.
+///
+/// Used to rescue the item text when an attribute and its item share a line, as in
+/// `#[derive(Debug)] struct S;`. Returns an empty string when the attribute ends the
+/// line (the usual formatting), so the common case is unaffected.
+fn attribute_tail(line: &str, col: usize) -> String {
+    let anchor = byte_of_col(line, col);
+    let Some(open) = line[..anchor].rfind("#[") else {
+        return String::new();
     };
-    let rest = rest.trim();
-    rest.ends_with(';') && !rest.contains('{')
+    // `[` and `]` are ASCII, so scanning bytes cannot land inside a multibyte char.
+    let bytes = line.as_bytes();
+    let mut depth = 0usize;
+    for idx in (open + 1)..bytes.len() {
+        match bytes[idx] {
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return line[idx + 1..].trim().to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+    String::new()
+}
+
+/// Split `line` at the character columns `[start, end)`, returning the three pieces.
+/// Columns come from proc-macro2 spans and are character-based, so they must not be
+/// used as byte offsets.
+fn split_at_cols(line: &str, start: usize, end: usize) -> (&str, &str, &str) {
+    let s = byte_of_col(line, start);
+    let e = byte_of_col(line, end.max(start));
+    (&line[..s], &line[s..e], &line[e..])
+}
+
+/// Ratatui style for one syntax token kind.
+///
+/// Mirrors the ANSI palette that `pretty::highlight` uses for `--show-expansion`
+/// so the TUI and stdout output look the same.
+/// Truncate to `w` *display columns* (with an ellipsis) or pad with spaces to exactly
+/// `w`. Never byte- or char-based: a CJK glyph counts as one char but occupies two
+/// cells, and ratatui lays the buffer out by display width. Measuring in chars made the
+/// split view's separator drift right by one cell per wide glyph on that row.
+fn fit_to_width(s: &str, w: usize) -> String {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+    let width = s.width();
+    if width <= w {
+        let mut out = s.to_string();
+        out.extend(std::iter::repeat_n(' ', w - width));
+        return out;
+    }
+    if w == 0 {
+        return String::new();
+    }
+    // Keep one column for the ellipsis. A wide glyph straddling the boundary is
+    // dropped whole, so the result can fall a column short — pad it back below.
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in s.chars() {
+        let cw = ch.width().unwrap_or(0);
+        if used + cw > w - 1 {
+            break;
+        }
+        out.push(ch);
+        used += cw;
+    }
+    out.push('…');
+    used += 1;
+    out.extend(std::iter::repeat_n(' ', w.saturating_sub(used)));
+    out
+}
+
+/// Syntax-highlight `text` into spans that own their content, so callers can pass
+/// temporaries (padded/truncated cells) rather than borrowing from `source_lines`.
+fn highlight_owned(text: &str, base: Style) -> Vec<Span<'static>> {
+    highlight_spans(text, base, None)
+        .into_iter()
+        .map(|s| Span::styled(s.content.into_owned(), s.style))
+        .collect()
+}
+
+/// Render one ordinary, full-width source line.
+fn render_plain_line(
+    line: &str,
+    origin: Option<usize>,
+    display_idx: usize,
+    cursor_line: usize,
+    sel_span: Option<(usize, usize)>,
+) -> Line<'static> {
+    let is_cursor = display_idx == cursor_line;
+    let is_expanded = origin.is_none();
+
+    // Expanded lines have no original number; a green `+` marks them as macro output
+    // so they stay distinguishable now that their content is syntax highlighted like
+    // everything else.
+    let line_num_str = match origin {
+        Some(n) => format!("{:4} │ ", n),
+        None => "   + │ ".to_string(),
+    };
+
+    let line_num_style = if is_cursor {
+        Style::default()
+            .fg(Color::Yellow)
+            .bg(Color::DarkGray)
+            .bold()
+    } else if is_expanded {
+        Style::default().fg(Color::Green).bold()
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    // The cursor line keeps its dark-gray background (and bold) while the syntax
+    // colors show through on top of it.
+    let base_style = if is_cursor {
+        Style::default().bg(Color::DarkGray).bold()
+    } else {
+        Style::default()
+    };
+
+    // On the cursor line, pick out the selected macro's own columns.
+    let sel = sel_span.filter(|_| is_cursor);
+    let mut spans = vec![Span::styled(line_num_str, line_num_style)];
+    spans.extend(
+        highlight_spans(line, base_style, sel)
+            .into_iter()
+            .map(|s| Span::styled(s.content.into_owned(), s.style)),
+    );
+    Line::from(spans)
+}
+
+/// Render one expanded range as a two-column block: the source it replaced on the
+/// left, the macro output on the right, framed by divider rows. The UI renders through
+/// `render_split_block_rows`; the tests exercise whole blocks through this.
+#[cfg(test)]
+fn render_split_block(
+    out: &mut Vec<Line<'static>>,
+    region: &SplitRegion,
+    content_w: usize,
+    cursor_line: usize,
+) {
+    render_split_block_rows(out, region, content_w, cursor_line, 0..region.rows() + 2);
+}
+
+/// Render only the given slice of a split block's display rows, so a block partially
+/// scrolled out of the viewport costs only its visible rows.
+///
+/// Block-row space: row 0 is the header, rows `1..=region.rows()` are the body (body
+/// row `k` is block row `k + 1`), and row `region.rows() + 1` is the footer. `rows` is
+/// clamped to that space; an empty or out-of-range slice emits nothing.
+fn render_split_block_rows(
+    out: &mut Vec<Line<'static>>,
+    region: &SplitRegion,
+    content_w: usize,
+    cursor_line: usize,
+    rows: std::ops::Range<usize>,
+) {
+    let total = region.rows() + 2;
+    let rows = rows.start.min(total)..rows.end.min(total);
+    if rows.is_empty() {
+        return;
+    }
+
+    let gutter = Style::default().fg(Color::DarkGray);
+    let rule = Style::default().fg(Color::DarkGray);
+    // Two columns plus the " │ " separator between them.
+    let sep = " │ ";
+    let left_w = content_w.saturating_sub(sep.chars().count()) / 2;
+    let right_w = content_w.saturating_sub(left_w + sep.chars().count());
+
+    let head = |label: &str, w: usize| -> String {
+        use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+        let text = format!("─ {} ", label);
+        // Macro names can be non-ASCII, so measure the label in display columns.
+        if text.width() >= w {
+            let mut out = String::new();
+            let mut used = 0usize;
+            for ch in text.chars() {
+                let cw = ch.width().unwrap_or(0);
+                if used + cw > w {
+                    break;
+                }
+                out.push(ch);
+                used += cw;
+            }
+            out.extend(std::iter::repeat_n('─', w - used));
+            out
+        } else {
+            let pad = w - text.width();
+            let mut s = text;
+            s.extend(std::iter::repeat_n('─', pad));
+            s
+        }
+    };
+
+    // Frame geometry, in cells from the left edge of the row. A body row is
+    // `"     │ "` (7) + left_w + `" │ "` (3) + right_w, so its separator bar sits at
+    // cell `left_w + 8`. The header/footer gutter is `"     ├"` (6), so the rule to
+    // the tee must be `left_w + 2` wide and the rule after it `right_w + 1` — the
+    // frame used to be two cells narrow, putting ┬/┴ left of the bar they cap.
+    let head_left_w = left_w + 2;
+    let head_right_w = right_w + 1;
+
+    // Header: ├─ original ──┬─ expanded (name) ──
+    if rows.contains(&0) {
+        out.push(Line::from(vec![
+            Span::styled("     ├", gutter),
+            Span::styled(head("original", head_left_w), rule),
+            Span::styled("┬", rule),
+            Span::styled(
+                head(&format!("expanded: {}", region.name), head_right_w),
+                rule,
+            ),
+        ]));
+    }
+
+    // Body: block rows `1..=region.rows()`, clipped to the requested slice.
+    for block_row in rows.start.max(1)..rows.end.min(total - 1) {
+        let k = block_row - 1;
+        let left = region.original.get(k).map(String::as_str).unwrap_or("");
+        // The cursor moves over `source_lines`, which inside a split region are the
+        // expanded lines — so it belongs to the right column.
+        let is_cursor = region
+            .right
+            .get(k)
+            .is_some_and(|(idx, _)| idx + 1 == cursor_line);
+        let right_base = if is_cursor {
+            Style::default().bg(Color::DarkGray).bold()
+        } else {
+            Style::default()
+        };
+
+        let mut spans = vec![Span::styled("     │ ", gutter)];
+        spans.extend(highlight_owned(
+            &fit_to_width(left, left_w),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+        spans.push(Span::styled(sep, rule));
+        match region.right.get(k) {
+            Some((_, text)) => {
+                spans.extend(highlight_owned(&fit_to_width(text, right_w), right_base))
+            }
+            None => spans.push(Span::styled(" ".repeat(right_w), right_base)),
+        }
+        out.push(Line::from(spans));
+    }
+
+    // Footer: ├────┴────
+    if rows.contains(&(total - 1)) {
+        out.push(Line::from(vec![
+            Span::styled("     ├", gutter),
+            Span::styled("─".repeat(head_left_w), rule),
+            Span::styled("┴", rule),
+            Span::styled("─".repeat(head_right_w), rule),
+        ]));
+    }
+}
+
+fn token_style(kind: pretty::TokenKind) -> Style {
+    use pretty::TokenKind as K;
+    let color = match kind {
+        K::Plain => Color::White,
+        K::Comment => Color::DarkGray,
+        K::Attribute => Color::Yellow,
+        K::Keyword => Color::Blue,
+        K::MacroName => Color::Cyan,
+        K::Type => Color::Magenta,
+        K::Literal => Color::Green,
+        K::Number => Color::LightYellow,
+        K::Lifetime => Color::Magenta,
+    };
+    Style::default().fg(color)
+}
+
+/// Syntax-highlight one source line into per-token spans.
+///
+/// `base` supplies the backdrop (background / modifiers) that every token
+/// inherits; each token then patches its own foreground on top.  When `sel` is
+/// given, that half-open range of *character* columns is instead rendered as the
+/// selected-macro marker (black on yellow), splitting tokens if it lands inside
+/// one.
+fn highlight_spans<'a>(line: &'a str, base: Style, sel: Option<(usize, usize)>) -> Vec<Span<'a>> {
+    let sel_style = base.patch(Style::default().fg(Color::Black).bg(Color::Yellow).bold());
+    let mut spans: Vec<Span<'a>> = Vec::new();
+    let mut push = |text: &'a str, style: Style| {
+        if !text.is_empty() {
+            spans.push(Span::styled(text, style));
+        }
+    };
+
+    let mut col = 0usize; // character column of the token about to be emitted
+    for (kind, range) in pretty::tokenize(line) {
+        let text = &line[range];
+        let len = text.chars().count();
+        let style = base.patch(token_style(kind));
+        match sel {
+            // Clamp the selection into this token's own column space; the
+            // helper is character-based, so multi-byte text is safe.
+            Some((cs, ce)) if ce > cs && ce > col && cs < col + len => {
+                let (a, b, c) = split_at_cols(
+                    text,
+                    cs.saturating_sub(col).min(len),
+                    ce.saturating_sub(col).min(len),
+                );
+                push(a, style);
+                push(b, sel_style);
+                push(c, style);
+            }
+            _ => push(text, style),
+        }
+        col += len;
+    }
+    spans
 }
 
 /// Resolve a module path (e.g., "foo::bar") relative to the top-level source file.
@@ -2177,22 +3051,25 @@ fn main() -> io::Result<()> {
 
     if args.show_expansion {
         let expansions: Vec<_> = run.iter.collect::<io::Result<Vec<_>>>()?;
-        print_expansions(&expansions);
+        print_expansions(&expansions, args.color.resolve());
         return Ok(());
     }
 
-    let cache = ExpansionCache::new(run.iter, run.check_result);
+    let cache = ExpansionCache::new(run.iter, run.check_result, run.child);
     run_app(source, src_path, module_path, cache, tm)
 }
 
 /// Print all macro expansions to stdout in a human-readable format.
 ///
+/// The token streams are pretty-printed with `prettyplease` and, when `color`
+/// is set, colorized with ANSI escapes.
+///
 /// Each expansion is printed as:
 ///   == caller_pattern ==
-///   input tokens
+///   input source
 ///   ---
-///   output tokens
-fn print_expansions(expansions: &[cargo_macra::parse_trace::MacroExpansion]) {
+///   output source
+fn print_expansions(expansions: &[cargo_macra::parse_trace::MacroExpansion], color: bool) {
     use cargo_macra::parse_trace::MacroExpansionKind;
 
     if expansions.is_empty() {
@@ -2224,18 +3101,418 @@ fn print_expansions(expansions: &[cargo_macra::parse_trace::MacroExpansion]) {
             MacroExpansionKind::Derive => format!("#[derive({})]", expansion.name),
         };
 
-        println!("== {} ==", caller);
+        println!("{}", pretty::header(&format!("== {} ==", caller), color));
         if !expansion.input.is_empty() {
-            println!("{}", expansion.input);
+            print!("{}", pretty::render(&expansion.input, color));
         }
-        println!("---");
-        println!("{}", expansion.to);
+        println!("{}", pretty::header("---", color));
+        print!("{}", pretty::render(&expansion.to, color));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn node(kind: MacroKind, line: usize, col_start: usize, col_end: usize) -> MacroNode {
+        MacroNode {
+            call: MacroCall {
+                name: "X".to_string(),
+                kind,
+                line,
+                col_start,
+                col_end,
+                derive_line: line,
+                line_end: line,
+                item_line_end: line,
+                input: String::new(),
+                arguments: String::new(),
+                sibling_derives: Vec::new(),
+            },
+            id: 0,
+            parent_id: None,
+            depth: 0,
+            expanded: false,
+            expansion_failed: false,
+            original_lines: Vec::new(),
+            expanded_content: None,
+            children: Vec::new(),
+            children_visible: true,
+            derive_sibling_snapshot: Vec::new(),
+            original_line_origins: Vec::new(),
+        }
+    }
+
+    /// `#[derive(Greet, Describe)]` on line 92, as `find_macros` reports it.
+    fn two_derives_on_one_line() -> Vec<MacroNode> {
+        let mut greet = node(MacroKind::Derive, 92, 9, 14);
+        greet.call.name = "Greet".into();
+        greet.id = 1;
+        let mut describe = node(MacroKind::Derive, 92, 16, 24);
+        describe.call.name = "Describe".into();
+        describe.id = 2;
+        vec![greet, describe]
+    }
+
+    #[test]
+    fn each_derive_on_a_shared_line_is_selectable_by_column() {
+        let nodes = two_derives_on_one_line();
+        let refs: Vec<&MacroNode> = nodes.iter().collect();
+
+        // Cursor inside `Greet`.
+        assert_eq!(App::pick_node_at(&refs, 92, 9), Some(0));
+        assert_eq!(App::pick_node_at(&refs, 92, 13), Some(0));
+        // Cursor inside `Describe` — previously unreachable: the old line-only
+        // rule always returned the first node on the line.
+        assert_eq!(App::pick_node_at(&refs, 92, 16), Some(1));
+        assert_eq!(App::pick_node_at(&refs, 92, 23), Some(1));
+    }
+
+    #[test]
+    fn column_outside_every_span_still_selects_something_on_the_line() {
+        // Enter should not become a no-op just because the column sits on a comma.
+        let nodes = two_derives_on_one_line();
+        let refs: Vec<&MacroNode> = nodes.iter().collect();
+        assert!(App::pick_node_at(&refs, 92, 15).is_some());
+        assert!(App::pick_node_at(&refs, 91, 0).is_none());
+    }
+
+    #[test]
+    fn nested_child_wins_over_its_enclosing_parent() {
+        // A child macro inside a parent's expanded range must stay reachable.
+        let mut parent = node(MacroKind::Functional, 10, 0, 40);
+        parent.call.line_end = 20;
+        parent.id = 1;
+        let mut child = node(MacroKind::Functional, 12, 4, 12);
+        child.depth = 1;
+        child.id = 2;
+        let nodes = vec![parent, child];
+        let refs: Vec<&MacroNode> = nodes.iter().collect();
+        assert_eq!(App::pick_node_at(&refs, 12, 4), Some(1));
+        // Off the child's line, the parent still owns the range.
+        assert_eq!(App::pick_node_at(&refs, 15, 0), Some(0));
+    }
+
+    fn region(start: usize, len: usize, original: usize) -> SplitRegion {
+        SplitRegion {
+            start,
+            len,
+            original: vec!["orig".to_string(); original],
+            right: (start..start + len)
+                .map(|i| (i, format!("line{}", i)))
+                .collect(),
+            name: "M".to_string(),
+        }
+    }
+
+    /// Any slice of a split block must reproduce exactly those rows of the full
+    /// render — the viewport renderer relies on this to clip blocks at the screen
+    /// edges without changing what is shown.
+    #[test]
+    fn split_block_row_slices_match_the_full_block() {
+        let reg = region(0, 3, 5); // rows() = 5, so 7 block rows with the frame
+        let total = reg.rows() + 2;
+
+        let mut full = Vec::new();
+        render_split_block(&mut full, &reg, 60, 2);
+        assert_eq!(full.len(), total);
+
+        for start in 0..=total {
+            for end in start..=total + 1 {
+                let mut sliced = Vec::new();
+                render_split_block_rows(&mut sliced, &reg, 60, 2, start..end);
+                let want = &full[start..end.min(total)];
+                assert_eq!(sliced, want, "slice {}..{} diverged", start, end);
+            }
+        }
+    }
+
+    #[test]
+    fn split_block_is_as_tall_as_its_taller_column() {
+        assert_eq!(region(0, 6, 2).rows(), 6);
+        assert_eq!(region(0, 2, 6).rows(), 6);
+    }
+
+    /// Every row of a split block — header, body, footer — must be the same number of
+    /// display cells wide, or the ┬/┴ caps drift away from the separator bar they cap.
+    #[test]
+    fn split_block_rows_all_have_the_same_width() {
+        use unicode_width::UnicodeWidthStr;
+
+        let row_width = |line: &Line<'static>| -> usize {
+            line.spans.iter().map(|s| s.content.width()).sum()
+        };
+
+        for content_w in [20usize, 41, 80, 81] {
+            let mut out = Vec::new();
+            render_split_block(&mut out, &region(0, 3, 2), content_w, 1);
+            let widths: Vec<usize> = out.iter().map(row_width).collect();
+            assert!(
+                widths.windows(2).all(|w| w[0] == w[1]),
+                "content_w={} produced ragged rows: {:?}",
+                content_w,
+                widths
+            );
+        }
+    }
+
+    /// The separator bar and the caps must land on the same cell.
+    #[test]
+    fn split_block_caps_sit_on_the_separator_bar() {
+        let cell_of = |line: &Line<'static>, needle: char| -> Option<usize> {
+            use unicode_width::UnicodeWidthChar;
+            let mut cell = 0usize;
+            for span in &line.spans {
+                for ch in span.content.chars() {
+                    if ch == needle {
+                        return Some(cell);
+                    }
+                    cell += ch.width().unwrap_or(0);
+                }
+            }
+            None
+        };
+
+        let mut out = Vec::new();
+        render_split_block(&mut out, &region(0, 3, 2), 60, 999);
+        let header = &out[0];
+        let body = &out[1];
+        let footer = out.last().unwrap();
+
+        // The body's bar is the second `│` on the row (the first is the gutter).
+        let bar = {
+            use unicode_width::UnicodeWidthChar;
+            let mut cell = 0usize;
+            let mut seen = 0;
+            let mut found = None;
+            for span in &body.spans {
+                for ch in span.content.chars() {
+                    if ch == '│' {
+                        seen += 1;
+                        if seen == 2 {
+                            found = Some(cell);
+                        }
+                    }
+                    cell += ch.width().unwrap_or(0);
+                }
+            }
+            found.expect("body row has a separator bar")
+        };
+
+        assert_eq!(cell_of(header, '┬'), Some(bar), "header cap off the bar");
+        assert_eq!(cell_of(footer, '┴'), Some(bar), "footer cap off the bar");
+    }
+
+    /// `a!(1); b!(2);` — expanding `a!` lifts `b!(2);` onto its own indented line, and
+    /// `b`'s columns have to follow it or a later expansion slices the wrong text.
+    #[test]
+    fn columns_rebase_onto_the_lifted_tail_line() {
+        // "    a!(1); b!(2);" — `b` spans columns 11..13, the tail starts at column 11.
+        let line = "    a!(1); b!(2);";
+        assert_eq!(line.chars().nth(11), Some('b'));
+        // Lifted onto its own line with the original 4-space indent, `b` starts at 4.
+        assert_eq!(rebase_col(11, 11, 4), 4);
+        // A macro further along the tail keeps its relative offset.
+        assert_eq!(rebase_col(13, 11, 4), 6);
+        // Never underflows if a column somehow precedes the tail.
+        assert_eq!(rebase_col(2, 11, 4), 4);
+    }
+
+    /// `#[derive(Debug)] struct S;` shares one line between attribute and item, and
+    /// expanding the derive removes that whole line — the item text has to be carried
+    /// over or it vanishes from the view.
+    #[test]
+    fn attribute_tail_rescues_an_item_sharing_the_attribute_line() {
+        // Column 9 is inside `Debug`.
+        assert_eq!(
+            attribute_tail("#[derive(Debug)] struct S;", 9),
+            "struct S;"
+        );
+        // Nested brackets must not end the attribute early.
+        assert_eq!(
+            attribute_tail("#[derive(Debug)] struct S([u8; 4]);", 9),
+            "struct S([u8; 4]);"
+        );
+        // The usual formatting: attribute alone on its line, nothing to rescue.
+        assert_eq!(attribute_tail("#[derive(Debug)]", 9), "");
+        assert_eq!(attribute_tail("    #[derive(Debug)]   ", 13), "");
+        // Not an attribute line at all.
+        assert_eq!(attribute_tail("struct S;", 3), "");
+        // Multibyte before the attribute must not break the byte scan.
+        assert_eq!(
+            attribute_tail("#[derive(Debug)] struct 挨拶;", 9),
+            "struct 挨拶;"
+        );
+    }
+
+    /// Regression: expansion columns are character-based, so a line containing
+    /// multibyte text used to slice at a non-char boundary and panic the whole TUI.
+    #[test]
+    fn columns_convert_to_byte_offsets_on_multibyte_lines() {
+        let line = "let 挨拶 = vec![1, 2];";
+        // `vec` starts at character column 9, but byte 9 lands inside `拶` — slicing
+        // the line with the raw column is what used to blow up the TUI.
+        assert_eq!(line.chars().nth(9), Some('v'));
+        assert!(!line.is_char_boundary(9));
+
+        let start = byte_of_col(line, 9);
+        assert_eq!(&line[..start], "let 挨拶 = ");
+        assert_eq!(&line[start..], "vec![1, 2];");
+
+        // Past the end clamps rather than panicking.
+        assert_eq!(byte_of_col(line, 9_999), line.len());
+        let (before, mid, after) = split_at_cols(line, 9, 12);
+        assert_eq!(before, "let 挨拶 = ");
+        assert_eq!(mid, "vec");
+        assert_eq!(after, "![1, 2];");
+    }
+
+    #[test]
+    fn nested_expansions_do_not_produce_nested_split_blocks() {
+        // A child expanded inside its parent's output lies within the parent's range.
+        let kept = keep_outermost(vec![region(10, 8, 1), region(12, 3, 1), region(30, 2, 1)]);
+        let spans: Vec<(usize, usize)> = kept.iter().map(|r| (r.start, r.len)).collect();
+        assert_eq!(spans, vec![(10, 8), (30, 2)]);
+    }
+
+    #[test]
+    fn adjacent_regions_are_both_kept() {
+        // Ending exactly where the next starts is not an overlap.
+        let kept = keep_outermost(vec![region(0, 5, 1), region(5, 5, 1)]);
+        assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn expansion_markers_are_recognised() {
+        assert!(is_expansion_marker("    // -- expanded: Describe --"));
+        assert!(is_expansion_marker("// -- end Describe --"));
+        // Real code that merely mentions the words must not be swallowed.
+        assert!(!is_expansion_marker("let x = 1; // -- end of the line"));
+        assert!(!is_expansion_marker("impl Foo {"));
+    }
+
+    #[test]
+    fn fit_to_width_pads_and_truncates_by_display_columns() {
+        use unicode_width::UnicodeWidthStr;
+        assert_eq!(fit_to_width("ab", 5), "ab   ");
+        assert_eq!(fit_to_width("abcdef", 4), "abc…");
+        assert_eq!(fit_to_width("abc", 3), "abc");
+        assert_eq!(fit_to_width("abc", 0), "");
+        // Wide glyphs occupy two cells each: measuring them in chars is what made the
+        // split view's separator drift. Every result must be exactly `w` cells wide.
+        assert_eq!(fit_to_width("日本語", 5).width(), 5);
+        assert_eq!(fit_to_width("日本語です", 4).width(), 4);
+        assert_eq!(fit_to_width("日本", 6).width(), 6);
+        assert_eq!(fit_to_width("日本", 4), "日本");
+        // A wide glyph straddling the cut is dropped whole, then padded back.
+        assert_eq!(fit_to_width("日本語", 4).width(), 4);
+    }
+
+    #[test]
+    fn col_span_is_reported_only_on_the_macros_own_line() {
+        let n = node(MacroKind::Derive, 3, 9, 14);
+        assert_eq!(App::node_col_span(&n, 3), Some((9, 14)));
+        assert_eq!(App::node_col_span(&n, 4), None);
+    }
+
+    #[test]
+    fn multiline_invocation_owns_the_rest_of_its_first_line() {
+        let mut n = node(MacroKind::Functional, 2, 4, 7);
+        n.call.line_end = 5;
+        // The end column belongs to line 5, so on line 2 the macro extends to EOL.
+        assert_eq!(App::node_col_span(&n, 2), Some((4, usize::MAX)));
+    }
+
+    #[test]
+    fn split_at_cols_is_character_based() {
+        // Byte slicing would panic or mis-split on multi-byte characters.
+        let line = "let x = \"日本語\"; foo!();";
+        let start = line.chars().position(|c| c == 'f').unwrap();
+        let (a, b, c) = split_at_cols(line, start, start + 4);
+        assert_eq!(b, "foo!");
+        assert_eq!(a, "let x = \"日本語\"; ");
+        assert_eq!(c, "();");
+    }
+
+    #[test]
+    fn split_at_cols_clamps_past_end_of_line() {
+        let (a, b, c) = split_at_cols("abc", 1, usize::MAX);
+        assert_eq!((a, b, c), ("a", "bc", ""));
+    }
+
+    /// The concatenated span contents must always reproduce the line.
+    fn spans_text(spans: &[Span<'_>]) -> String {
+        spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn highlight_spans_colors_each_token_separately() {
+        let line = "    pub fn f() { foo!(\"s\"); } // c";
+        let spans = highlight_spans(line, Style::default(), None);
+        assert_eq!(spans_text(&spans), line);
+        let colored = |text: &str| {
+            spans
+                .iter()
+                .find(|s| s.content == text)
+                .unwrap_or_else(|| panic!("no span {:?} in {:?}", text, spans))
+                .style
+                .fg
+        };
+        assert_eq!(colored("pub"), Some(Color::Blue));
+        assert_eq!(colored("fn"), Some(Color::Blue));
+        assert_eq!(colored("foo!"), Some(Color::Cyan));
+        assert_eq!(colored("\"s\""), Some(Color::Green));
+        assert_eq!(colored("// c"), Some(Color::DarkGray));
+        // More than one distinct color: this is what "actually highlighted" means.
+        let mut colors: Vec<_> = spans.iter().filter_map(|s| s.style.fg).collect();
+        colors.sort_by_key(|c| format!("{:?}", c));
+        colors.dedup();
+        assert!(colors.len() >= 4, "{:?}", colors);
+    }
+
+    #[test]
+    fn highlight_spans_keeps_the_base_background() {
+        let base = Style::default().bg(Color::DarkGray).bold();
+        let spans = highlight_spans("let x = 1;", base, None);
+        assert!(spans.iter().all(|s| s.style.bg == Some(Color::DarkGray)));
+        assert!(spans.iter().any(|s| s.style.fg == Some(Color::Blue)));
+    }
+
+    #[test]
+    fn highlight_spans_marks_the_selected_macro_columns() {
+        let line = "#[derive(Greet, Describe)]";
+        let start = line.find("Describe").unwrap();
+        let spans = highlight_spans(line, Style::default(), Some((start, start + 8)));
+        assert_eq!(spans_text(&spans), line);
+        let marked: Vec<&str> = spans
+            .iter()
+            .filter(|s| s.style.bg == Some(Color::Yellow))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(marked, vec!["Describe"]);
+        assert!(
+            spans
+                .iter()
+                .filter(|s| s.style.bg == Some(Color::Yellow))
+                .all(|s| s.style.fg == Some(Color::Black))
+        );
+    }
+
+    #[test]
+    fn highlight_spans_selection_is_character_based() {
+        // The attribute is one token, so the selection has to split inside it —
+        // with multi-byte text before the range, byte offsets would mis-split.
+        let line = "let s = \"日本語\"; foo!();";
+        let start = line.chars().position(|c| c == 'f').unwrap();
+        let spans = highlight_spans(line, Style::default(), Some((start, start + 4)));
+        assert_eq!(spans_text(&spans), line);
+        let marked: String = spans
+            .iter()
+            .filter(|s| s.style.bg == Some(Color::Yellow))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(marked, "foo!");
+    }
 
     #[test]
     fn expansion_matches_falls_back_for_truncated_bang_input() {
@@ -2254,7 +3531,8 @@ mod tests {
             "",
             "impl_char",
             MacroKind::Functional,
-            false
+            false,
+            true
         ));
     }
 
@@ -2275,7 +3553,8 @@ mod tests {
             "",
             "foo",
             MacroKind::Functional,
-            false
+            false,
+            true
         ));
     }
 
@@ -2298,8 +3577,42 @@ mod tests {
             "",
             "mystruct_hello",
             MacroKind::Functional,
-            false
+            false,
+            true
         ));
+    }
+
+    /// Two bare `#[my_attr]`s differ only by the item they wrap. The strict pass has
+    /// to tell them apart; the lenient pass still has to accept the doc-comment
+    /// divergence the hook produces (`///` vs `#[doc = "..."]`).
+    #[test]
+    fn attribute_input_is_compared_strictly_first_then_ignored() {
+        let exp = MacroExpansion {
+            expanding: "#[my_attr] fn a() {}".to_string(),
+            arguments: String::new(),
+            to: "fn a() {}".to_string(),
+            name: "my_attr".to_string(),
+            kind: MacroExpansionKind::Attribute,
+            input: "fn a() {}".to_string(),
+        };
+
+        let matches = |input: &str, strict: bool| {
+            ExpansionCache::expansion_matches(
+                &exp,
+                input,
+                "",
+                "my_attr",
+                MacroKind::Attribute,
+                false,
+                strict,
+            )
+        };
+
+        // Strict: only the item this entry actually wrapped.
+        assert!(matches("fn a() {}", true));
+        assert!(!matches("fn b() {}", true));
+        // Lenient fallback: input ignored, as before.
+        assert!(matches("fn b() {}", false));
     }
 
     #[test]
@@ -2322,7 +3635,8 @@ mod tests {
             "",
             "Parse",
             MacroKind::Functional,
-            false
+            false,
+            true
         ));
         // Relaxed match succeeds
         assert!(ExpansionCache::expansion_matches(
@@ -2331,6 +3645,7 @@ mod tests {
             "",
             "Parse",
             MacroKind::Functional,
+            true,
             true
         ));
     }
