@@ -118,7 +118,7 @@ terminal; `NO_COLOR` and `TERM=dumb` disable them as well.
 - `PageUp` / `PageDown`: Move a screenful
 - `r`: Reload trace data
 - `q`: Quit
-- `Esc`: Cancel a pending expansion
+- `Esc`: Cancel a pending expansion, or dismiss the expansion-choice popup
 - `Ctrl-C` / `Ctrl-D`: Quit, and cancel a pending expansion
 
 `Esc` deliberately does not quit: it is the cancel key for a pending expansion, and an
@@ -134,6 +134,31 @@ the cursor is on is highlighted in the source view.
 Attribute macros are different: `rustc` expands them outside-in and each one's
 output contains the remaining attributes, so only the outermost is offered. The
 rest appear as children once it has been expanded.
+
+### Ambiguous expansions
+
+Occasionally more than one recorded expansion matches the macro under the cursor and
+they expand to *different* code — most often two attribute macros of the same name whose
+inputs `rustc` and `syn` serialize differently, or a crate that generates several
+similarly named helper macros. Nothing in the trace says which one belongs to this call
+site, so `cargo-macra` asks rather than guessing:
+
+```text
+┌ Which 'my_attr'? ─────────────────────────────────┐
+│ > 1. #[my_attr] fn first() {}                     │
+│   2. #[my_attr] fn second() {}                    │
+│                                                   │
+│ expands to:                                       │
+│ fn first() {                                      │
+│     ...                                           │
+│ }                                                 │
+└───────────────────────────────────────────────────┘
+```
+
+`j` / `k` (or `Up` / `Down`) move between candidates, showing each one's expansion
+below; `Enter` expands the highlighted one and `Esc` backs out. Matches that expand to
+identical code are not a real choice and never open the popup — they are collapsed to a
+single candidate and expanded directly.
 
 ### Split view
 

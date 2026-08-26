@@ -159,12 +159,35 @@ fn wait_cancelled() -> bool {
 
 /// Outcome of a trace lookup.
 enum TraceLookup {
-    /// A matching expansion was found.
+    /// Exactly one distinct expansion matched.
     Found(String),
+    /// Several equally good but *differing* expansions matched, and nothing in the
+    /// trace distinguishes them — the user has to say which one they meant.
+    Ambiguous(Vec<TraceCandidate>),
     /// The expansion stream ran to completion without a match.
     Exhausted,
     /// The user cancelled while waiting.
     Aborted,
+}
+
+/// An ambiguous expansion awaiting the user's choice.
+struct PendingChoice {
+    /// The macro node being expanded.
+    node_id: usize,
+    /// Its name, for the popup title.
+    name: String,
+    candidates: Vec<TraceCandidate>,
+    selected: usize,
+}
+
+/// One option offered when a lookup is ambiguous.
+#[derive(Clone)]
+struct TraceCandidate {
+    /// The invocation as rustc reported it (`exp.expanding`), which is what actually
+    /// tells two colliding entries apart.
+    label: String,
+    /// The expansion this candidate would inline.
+    output: String,
 }
 
 struct CacheInner {
@@ -172,7 +195,6 @@ struct CacheInner {
     /// `normalize_tokens` of each expansion's `input` and `arguments`, computed once
     /// when the entry is pushed; index-aligned with `expansions`.
     normalized: Vec<(String, String)>,
-    current_idx: usize,
     done: bool,
     error: Option<String>,
     /// Stored build failure message (non-zero exit from cargo check).
@@ -196,7 +218,6 @@ impl ExpansionCache {
             Mutex::new(CacheInner {
                 expansions: Vec::new(),
                 normalized: Vec::new(),
-                current_idx: 0,
                 done: false,
                 error: None,
                 build_error: None,
@@ -379,16 +400,45 @@ impl ExpansionCache {
             && exp_norm_arguments == norm_arguments
     }
 
-    /// Search cached expansions for a matching trace. Returns the index if found.
+    /// The distinct expansions among `hits`, in stream order.
+    ///
+    /// Collisions that expand to the same text are not a real choice — the usual case
+    /// being one macro invoked twice with identical arguments — so they collapse to a
+    /// single candidate. Only genuinely differing outputs are worth asking about.
+    fn distinct_candidates(inner: &CacheInner, hits: &[usize]) -> Vec<TraceCandidate> {
+        let mut candidates: Vec<TraceCandidate> = Vec::new();
+        for &idx in hits {
+            let exp = &inner.expansions[idx];
+            if candidates.iter().any(|c| c.output == exp.to) {
+                continue;
+            }
+            candidates.push(TraceCandidate {
+                label: exp.expanding.lines().next().unwrap_or("").trim().to_string(),
+                output: exp.to.clone(),
+            });
+        }
+        candidates
+    }
+
+    /// Every cached expansion matching this query at the most specific pass that
+    /// matches anything, in stream order.
+    ///
+    /// Passes run most specific first — an exact name before a relaxed (mangled) one,
+    /// and an input that actually matches before falling back to ignoring it — and the
+    /// first pass to match anything wins outright. A less specific pass can never add
+    /// candidates alongside a more specific one.
     ///
     /// `norm_input` / `norm_arguments` are `normalize_tokens` of the query, computed
     /// once by the caller. `min_idx` restricts the scan to entries at index >=
     /// `min_idx`: `find_trace_for_tokens` passes 0 for a lookup's first scan and, after
-    /// each unsuccessful scan, the length it saw, so later wakes only test entries
-    /// appended since. That is equivalent to a full rescan because entries are
-    /// immutable, only ever appended at the tail, and matching is deterministic —
-    /// everything below `min_idx` was already rejected in all four passes for this same
-    /// query and cannot start matching later.
+    /// each *unsuccessful* scan, the length it saw, so later wakes only test entries
+    /// appended since. That is safe because entries are immutable and only ever
+    /// appended, and matching is a pure function of entry and query — an entry rejected
+    /// by every pass cannot start matching later. (A scan that does match returns
+    /// immediately, so the watermark never hides a candidate from a later scan.)
+    ///
+    /// Note the `strict_input` dimension only affects attribute macros; for bang and
+    /// derive macros both values behave identically, so those passes are skipped.
     #[allow(clippy::too_many_arguments)]
     fn search_expansions(
         inner: &CacheInner,
@@ -398,42 +448,38 @@ impl ExpansionCache {
         name: &str,
         kind: MacroKind,
         min_idx: usize,
-    ) -> Option<usize> {
-        // Most specific match first: exact name before relaxed (mangled) name, and an
-        // input that actually matches before falling back to ignoring it.
-        for strict_input in [true, false] {
+    ) -> Vec<usize> {
+        let strict_passes: &[bool] = if kind == MacroKind::Attribute {
+            &[true, false]
+        } else {
+            &[true]
+        };
+        for &strict_input in strict_passes {
             for relaxed in [false, true] {
-                // Rotating order: current_idx..len, then wrap to 0..current_idx, so
-                // repeated identical invocations round-robin through their entries. On
-                // resumed scans `min_idx` is a previously seen length (always >=
-                // current_idx), so the wrap segment and the already-rejected tail
-                // prefix are skipped.
-                for idx in (inner.current_idx..inner.expansions.len()).chain(0..inner.current_idx)
-                {
-                    if idx < min_idx {
-                        continue;
-                    }
-                    let exp = &inner.expansions[idx];
-                    let (exp_norm_input, exp_norm_arguments) = &inner.normalized[idx];
-                    if Self::expansion_matches_pre(
-                        exp,
-                        exp_norm_input,
-                        exp_norm_arguments,
-                        input,
-                        norm_input,
-                        norm_arguments,
-                        name,
-                        kind,
-                        relaxed,
-                        strict_input,
-                    ) {
-                        return Some(idx);
-                    }
+                let hits: Vec<usize> = (min_idx..inner.expansions.len())
+                    .filter(|&idx| {
+                        let (exp_norm_input, exp_norm_arguments) = &inner.normalized[idx];
+                        Self::expansion_matches_pre(
+                            &inner.expansions[idx],
+                            exp_norm_input,
+                            exp_norm_arguments,
+                            input,
+                            norm_input,
+                            norm_arguments,
+                            name,
+                            kind,
+                            relaxed,
+                            strict_input,
+                        )
+                    })
+                    .collect();
+                if !hits.is_empty() {
+                    return hits;
                 }
             }
         }
 
-        None
+        Vec::new()
     }
 
     /// Find an expansion that matches the given macro input/arguments.
@@ -465,7 +511,7 @@ impl ExpansionCache {
         let mut scanned_len = 0;
 
         loop {
-            if let Some(idx) = Self::search_expansions(
+            let hits = Self::search_expansions(
                 &inner,
                 input,
                 &norm_input,
@@ -473,10 +519,13 @@ impl ExpansionCache {
                 name,
                 kind,
                 scanned_len,
-            ) {
-                let result = inner.expansions[idx].to.clone();
-                inner.current_idx = idx + 1;
-                return TraceLookup::Found(result);
+            );
+            if !hits.is_empty() {
+                let mut candidates = Self::distinct_candidates(&inner, &hits);
+                return match candidates.len() {
+                    1 => TraceLookup::Found(candidates.pop().expect("just checked").output),
+                    _ => TraceLookup::Ambiguous(candidates),
+                };
             }
             scanned_len = inner.expansions.len();
 
@@ -644,6 +693,9 @@ struct App {
     status: String,
     /// Error message to display (shown until user presses Enter)
     error_message: Option<String>,
+    /// Set when an expansion lookup matched several differing traces and is waiting
+    /// for the user to pick one.
+    pending_choice: Option<PendingChoice>,
     /// Reusable `TraceMacros` for reloading trace data
     trace_macros: TraceMacros,
     /// Path of the currently loaded source file
@@ -857,6 +909,7 @@ impl App {
             source_view_height: 20,
             status,
             error_message: None,
+            pending_choice: None,
             trace_macros,
             file_path,
             module_path,
@@ -1333,6 +1386,33 @@ impl App {
         relocated
     }
 
+    /// Move the highlight in the ambiguity popup, clamped at both ends.
+    fn choice_move(&mut self, delta: isize) {
+        if let Some(choice) = &mut self.pending_choice {
+            let last = choice.candidates.len().saturating_sub(1);
+            let next = choice.selected as isize + delta;
+            choice.selected = next.clamp(0, last as isize) as usize;
+        }
+    }
+
+    /// Expand using the highlighted candidate.
+    fn choice_confirm(&mut self) {
+        let Some(choice) = self.pending_choice.take() else {
+            return;
+        };
+        let Some(candidate) = choice.candidates.get(choice.selected).cloned() else {
+            return;
+        };
+        self.expand_node(choice.node_id, Some(candidate.output));
+    }
+
+    /// Dismiss the popup without expanding.
+    fn choice_cancel(&mut self) {
+        if let Some(choice) = self.pending_choice.take() {
+            self.status = format!("Expansion of '{}' cancelled.", choice.name);
+        }
+    }
+
     /// Expand the currently selected macro
     fn expand_selected(&mut self) {
         let node_id = match self.selected_node_id() {
@@ -1342,6 +1422,12 @@ impl App {
                 return;
             }
         };
+        self.expand_node(node_id, None);
+    }
+
+    /// Expand `node_id`, either resolving the trace now or using one the user already
+    /// picked out of an ambiguity popup.
+    fn expand_node(&mut self, node_id: usize, chosen: Option<String>) {
 
         // Get node info
         let (
@@ -1387,19 +1473,42 @@ impl App {
         // a cancel key while it runs — see `find_trace_for_tokens`.
         // `should_abort` is only reached once the lookup has actually had to wait, so a
         // trace that is already cached still expands without any flicker.
-        let mut notified = false;
-        let mut wait = || {
-            if !notified {
-                notified = true;
-                draw_wait_notice(&name);
+        let lookup = match chosen {
+            // Resuming from the ambiguity popup: the user already picked.
+            Some(text) => TraceLookup::Found(text),
+            None => {
+                let mut notified = false;
+                let mut wait = || {
+                    if !notified {
+                        notified = true;
+                        draw_wait_notice(&name);
+                    }
+                    wait_cancelled()
+                };
+                self.expansion_cache
+                    .find_trace_for_tokens(&input, &arguments, &name, kind, &mut wait)
             }
-            wait_cancelled()
         };
-        let lookup =
-            self.expansion_cache
-                .find_trace_for_tokens(&input, &arguments, &name, kind, &mut wait);
         let expanded_text = match lookup {
             TraceLookup::Found(text) => text,
+            TraceLookup::Ambiguous(candidates) => {
+                // Several traces match this invocation and expand differently, and
+                // nothing in the trace says which one is this call site's. Guessing
+                // (the old rotating pointer did) silently shows the wrong expansion,
+                // so ask instead.
+                self.status = format!(
+                    "'{}' matches {} different expansions — pick one.",
+                    name,
+                    candidates.len()
+                );
+                self.pending_choice = Some(PendingChoice {
+                    node_id,
+                    name: name.clone(),
+                    candidates,
+                    selected: 0,
+                });
+                return;
+            }
             TraceLookup::Aborted => {
                 self.status = format!("Expansion of '{}' cancelled.", name);
                 return;
@@ -2491,6 +2600,19 @@ fn run_app(
                             break;
                         }
 
+                        // The ambiguity popup is modal: it owns the keyboard until the
+                        // user picks a candidate or backs out.
+                        if app.pending_choice.is_some() {
+                            match key.code {
+                                KeyCode::Down | KeyCode::Char('j') => app.choice_move(1),
+                                KeyCode::Up | KeyCode::Char('k') => app.choice_move(-1),
+                                KeyCode::Enter => app.choice_confirm(),
+                                KeyCode::Esc | KeyCode::Char('q') => app.choice_cancel(),
+                                _ => {}
+                            }
+                            continue;
+                        }
+
                         // If error message is displayed, dismiss it on Enter
                         if app.error_message.is_some() {
                             if key.code == KeyCode::Enter || key.code == KeyCode::Esc {
@@ -2801,6 +2923,65 @@ fn ui(frame: &mut Frame, app: &mut App) {
         .style(Style::default().fg(Color::Cyan));
 
     frame.render_widget(status, chunks[1]);
+
+    // Ambiguity popup: several traces matched and expand differently.
+    if let Some(ref choice) = app.pending_choice {
+        let area = frame.area();
+        let popup_width = (area.width as u32 * 80 / 100).min(90) as u16;
+        let popup_height = (area.height as u32 * 70 / 100).min(24) as u16;
+        let popup_area = Rect::new(
+            (area.width - popup_width) / 2,
+            (area.height - popup_height) / 2,
+            popup_width,
+            popup_height,
+        );
+        frame.render_widget(ratatui::widgets::Clear, popup_area);
+
+        let inner_w = popup_width.saturating_sub(2) as usize;
+        let mut lines: Vec<Line> = Vec::new();
+        for (i, cand) in choice.candidates.iter().enumerate() {
+            let selected = i == choice.selected;
+            let marker = if selected { "> " } else { "  " };
+            let style = if selected {
+                Style::default().fg(Color::White).bg(Color::DarkGray).bold()
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{}{}. ", marker, i + 1), style),
+                Span::styled(
+                    fit_to_width(&cand.label, inner_w.saturating_sub(6)),
+                    style,
+                ),
+            ]));
+        }
+
+        // Preview of the highlighted candidate, so the labels alone don't have to
+        // carry the decision.
+        if let Some(cand) = choice.candidates.get(choice.selected) {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "expands to:",
+                Style::default().fg(Color::DarkGray),
+            )));
+            let budget = (popup_height as usize).saturating_sub(lines.len() + 3);
+            for text in cand.output.lines().take(budget) {
+                lines.push(Line::from(highlight_owned(
+                    &fit_to_width(text, inner_w),
+                    Style::default(),
+                )));
+            }
+        }
+
+        let popup = Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow))
+                .title(format!(" Which '{}'? ", choice.name))
+                .title_style(Style::default().fg(Color::Yellow).bold()),
+        );
+        frame.render_widget(popup, popup_area);
+    }
 
     // Error popup (if any)
     if let Some(ref error_msg) = app.error_message {
@@ -3942,7 +4123,7 @@ mod tests {
         }
     }
 
-    fn cache_inner_of(expansions: Vec<MacroExpansion>, current_idx: usize) -> CacheInner {
+    fn cache_inner_of(expansions: Vec<MacroExpansion>) -> CacheInner {
         let normalized = expansions
             .iter()
             .map(|e| {
@@ -3955,84 +4136,86 @@ mod tests {
         CacheInner {
             expansions,
             normalized,
-            current_idx,
             done: false,
             error: None,
             build_error: None,
         }
     }
 
-    #[test]
-    fn search_expansions_prefers_exact_name_and_resumes_from_min_idx() {
+    fn search(inner: &CacheInner, min_idx: usize) -> Vec<usize> {
         let norm_input = cargo_macra::normalize_tokens("a");
         let norm_arguments = cargo_macra::normalize_tokens("");
-        let search = |inner: &CacheInner, min_idx: usize| {
-            ExpansionCache::search_expansions(
-                inner,
-                "a",
-                &norm_input,
-                &norm_arguments,
-                "foo",
-                MacroKind::Functional,
-                min_idx,
-            )
-        };
-
-        // The mangled helper sits at a lower index, but the exact-name pass runs first
-        // over all entries, so the exact match wins.
-        let inner = cache_inner_of(
-            vec![
-                bang_expansion("other", "a", "0"),
-                bang_expansion("__foo_mangled", "a", "relaxed"),
-                bang_expansion("foo", "a", "exact"),
-            ],
-            0,
-        );
-        assert_eq!(search(&inner, 0), Some(2));
-        // A resumed scan only considers entries appended since the last scan: with
-        // min_idx past the end nothing is re-examined...
-        assert_eq!(search(&inner, 3), None);
-        // ...and all four passes still run over the new suffix, so a relaxed-name entry
-        // appended after the watermark is found.
-        let inner = cache_inner_of(
-            vec![
-                bang_expansion("foo", "a", "already scanned"),
-                bang_expansion("__foo_mangled", "a", "new arrival"),
-            ],
-            0,
-        );
-        assert_eq!(search(&inner, 1), Some(1));
+        ExpansionCache::search_expansions(
+            inner,
+            "a",
+            &norm_input,
+            &norm_arguments,
+            "foo",
+            MacroKind::Functional,
+            min_idx,
+        )
     }
 
     #[test]
-    fn search_expansions_round_robins_repeated_invocations() {
-        let two = |current_idx| {
-            cache_inner_of(
-                vec![
-                    bang_expansion("foo", "a", "first"),
-                    bang_expansion("foo", "a", "second"),
-                ],
-                current_idx,
-            )
-        };
-        let norm_input = cargo_macra::normalize_tokens("a");
-        let norm_arguments = cargo_macra::normalize_tokens("");
-        let search = |inner: &CacheInner| {
-            ExpansionCache::search_expansions(
-                inner,
-                "a",
-                &norm_input,
-                &norm_arguments,
-                "foo",
-                MacroKind::Functional,
-                0,
-            )
-        };
+    fn search_expansions_prefers_exact_name_and_resumes_from_min_idx() {
+        // The mangled helper sits at a lower index, but the exact-name pass runs first
+        // over all entries, so only the exact match is returned — a less specific pass
+        // never contributes candidates alongside a more specific one.
+        let inner = cache_inner_of(vec![
+            bang_expansion("other", "a", "0"),
+            bang_expansion("__foo_mangled", "a", "relaxed"),
+            bang_expansion("foo", "a", "exact"),
+        ]);
+        assert_eq!(search(&inner, 0), vec![2]);
+        // A resumed scan only considers entries appended since the last scan: with
+        // min_idx past the end nothing is re-examined...
+        assert!(search(&inner, 3).is_empty());
+        // ...and every pass still runs over the new suffix, so a relaxed-name entry
+        // appended after the watermark is found.
+        let inner = cache_inner_of(vec![
+            bang_expansion("foo", "a", "already scanned"),
+            bang_expansion("__foo_mangled", "a", "new arrival"),
+        ]);
+        assert_eq!(search(&inner, 1), vec![1]);
+    }
 
-        // A fresh lookup (min_idx = 0) rotates from current_idx and wraps.
-        assert_eq!(search(&two(0)), Some(0));
-        assert_eq!(search(&two(1)), Some(1));
-        assert_eq!(search(&two(2)), Some(0));
+    /// Colliding entries are all returned, in stream order, rather than one being
+    /// handed out per lookup by a rotating pointer.
+    #[test]
+    fn search_expansions_returns_every_equally_specific_match() {
+        let inner = cache_inner_of(vec![
+            bang_expansion("foo", "a", "first"),
+            bang_expansion("other", "a", "unrelated"),
+            bang_expansion("foo", "a", "second"),
+        ]);
+        assert_eq!(search(&inner, 0), vec![0, 2]);
+    }
+
+    /// Two invocations that expand to the same text are not a choice worth making, so
+    /// they collapse; genuinely differing outputs each become a candidate.
+    #[test]
+    fn identical_outputs_collapse_but_differing_ones_do_not() {
+        let same = cache_inner_of(vec![
+            bang_expansion("foo", "a", "same output"),
+            bang_expansion("foo", "a", "same output"),
+        ]);
+        let collapsed = ExpansionCache::distinct_candidates(&same, &[0, 1]);
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(collapsed[0].output, "same output");
+
+        let differing = cache_inner_of(vec![
+            bang_expansion("foo", "a", "one"),
+            bang_expansion("foo", "a", "two"),
+        ]);
+        let both = ExpansionCache::distinct_candidates(&differing, &[0, 1]);
+        assert_eq!(both.len(), 2);
+        // The label is the invocation as rustc reported it — what actually tells the
+        // colliding entries apart in the popup.
+        assert_eq!(both[0].label, "foo! { a }");
+        assert_eq!(
+            both.iter().map(|c| c.output.as_str()).collect::<Vec<_>>(),
+            vec!["one", "two"]
+        );
     }
 
     #[test]
