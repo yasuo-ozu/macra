@@ -83,6 +83,14 @@ impl Iterator for MacroExpansionIter {
 const HOOK_LINE_PREFIX: &str = "__MACRA_HOOK__:";
 #[cfg(target_os = "macos")]
 static LINKER_WRAPPER_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// Path of the linker wrapper already built by this process, if any.
+///
+/// The wrapper's source is a compile-time constant, so within one process it cannot go
+/// stale, and its path embeds this process id, so it is never shared with (or picked up
+/// from) another process or an older cargo-macra binary. Rebuilt only if the temp file
+/// has vanished in the meantime.
+#[cfg(target_os = "macos")]
+static LINKER_WRAPPER_CACHE: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 #[derive(serde::Deserialize)]
 struct HookRecord {
@@ -342,6 +350,23 @@ impl TraceMacros {
 
 #[cfg(target_os = "macos")]
 fn create_macos_linker_wrapper() -> io::Result<PathBuf> {
+    // Building the wrapper shells out to `cc`, and `run()` is called again on the UI
+    // thread on every `r` reload. Reuse the binary this process already built.
+    let mut cache = LINKER_WRAPPER_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(path) = cache.as_deref() {
+        if path.exists() {
+            return Ok(path.to_path_buf());
+        }
+    }
+    let path = build_macos_linker_wrapper()?;
+    *cache = Some(path.clone());
+    Ok(path)
+}
+
+#[cfg(target_os = "macos")]
+fn build_macos_linker_wrapper() -> io::Result<PathBuf> {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
