@@ -1,10 +1,11 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 #[cfg(target_os = "macos")]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crate::parse_trace::{MacroExpansion, MacroExpansionKind, parse_trace};
@@ -42,6 +43,10 @@ pub struct TraceRun {
     pub iter: MacroExpansionIter,
     /// Receives cargo check result once the child exits.
     pub check_result: mpsc::Receiver<io::Result<CheckResult>>,
+    /// The spawned `cargo check`, shared with the reader thread that `wait()`s on
+    /// it once the pipes hit EOF. Lock and `kill()` to abort a run early: the
+    /// readers then see EOF and wind down on their own.
+    pub child: Arc<Mutex<Child>>,
 }
 
 /// Result details for the traced `cargo check` execution.
@@ -239,6 +244,9 @@ impl TraceMacros {
             .take()
             .ok_or_else(|| io::Error::other("failed to capture stderr"))?;
 
+        let child = Arc::new(Mutex::new(child));
+        let child_for_wait = Arc::clone(&child);
+
         let (tx, rx) = mpsc::channel();
         let (status_tx, status_rx) = mpsc::channel();
 
@@ -289,7 +297,12 @@ impl TraceMacros {
 
             // Wait for stdout draining and child process to finish
             let stdout_buf = stdout_thread.join().unwrap_or_default();
-            let wait_result: io::Result<ExitStatus> = child.wait();
+            // Held only from pipe-EOF until the child is reaped, so a concurrent
+            // `kill()` never blocks for long.
+            let wait_result: io::Result<ExitStatus> = child_for_wait
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .wait();
 
             // Parse plain-text trace-macros output from stderr and stdout.
             for group in parse_trace(stderr_buf.as_bytes()) {
@@ -322,6 +335,7 @@ impl TraceMacros {
         Ok(TraceRun {
             iter: MacroExpansionIter { rx },
             check_result: status_rx,
+            child,
         })
     }
 }
@@ -376,6 +390,10 @@ fn create_macos_linker_wrapper() -> io::Result<PathBuf> {
         .arg("-o")
         .arg(&bin_path)
         .arg(&src_path)
+        // Reload (`r`) runs this while the TUI owns the screen; inherited stdio would
+        // let any cc diagnostic scribble over the alternate screen.
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status();
     let _ = fs::remove_file(&src_path);
 

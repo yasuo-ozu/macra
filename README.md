@@ -95,20 +95,70 @@ Options:
       --example <EXAMPLE>              Build only the specified example
       --manifest-path <MANIFEST_PATH>  Path to Cargo.toml
       --show-expansion                 Print expansions and exit
+      --color <WHEN>                   Coloring of printed expansions
+                                       [default: auto] [possible values: auto, always, never]
   -h, --help                           Print help
 ```
+
+Printed expansions are pretty-printed with `prettyplease` and syntax-highlighted.
+With `--color auto` (the default) colors are emitted only when stdout is a
+terminal; `NO_COLOR` and `TERM=dumb` disable them as well.
 
 ## TUI Keys
 
 - `j` / `k`, `Up` / `Down`: Move cursor
+- `h` / `l`, `Left` / `Right`: Move between macros that share the current line
 - `g` / `G`, `Home` / `End`: Jump top/bottom
 - `n` / `N`: Jump next/previous macro
 - `Enter`: Expand/collapse macro or enter `mod` file
 - `Backspace`: Return to parent module
 - `Tab` / `Shift+Tab`: Move tree selection
 - `Space`: Toggle child visibility in macro tree
+- `v`: Toggle split view (compare original vs expanded)
+- `PageUp` / `PageDown`: Move a screenful
 - `r`: Reload trace data
-- `q` / `Esc`: Quit
+- `q`: Quit
+- `Esc`: Cancel a pending expansion
+- `Ctrl-C` / `Ctrl-D`: Quit, and cancel a pending expansion
+
+`Esc` deliberately does not quit: it is the cancel key for a pending expansion, and an
+`Esc` arriving just after the trace landed would otherwise exit the application.
+
+### Choosing which macro to expand
+
+The derives of a single `#[derive(A, B, C)]` are order-independent — each one
+receives the same item — so all of them are listed and any can be expanded first.
+Because they share a line, use `Left` / `Right` to move between them; the macro
+the cursor is on is highlighted in the source view.
+
+Attribute macros are different: `rustc` expands them outside-in and each one's
+output contains the remaining attributes, so only the outermost is offered. The
+rest appear as children once it has been expanded.
+
+### Split view
+
+By default an expansion is inlined in place of the code it replaced. Press `v` to
+compare the two instead: every expanded range becomes a two-column block with the
+original source on the left and the macro output on the right. Code outside those
+ranges stays full width, so only what actually changed is split.
+
+```text
+  91 │
+  92 │ #[derive(Greet, Describe)]
+     ├─ original ─────────────────┬─ expanded: Describe ──────────────
+     │ #[derive(Greet, Describe)]  │ impl MultiDeriveOneAttr {
+     │                             │     pub fn describe() -> String {
+     │                             │         format!("{} is a struct", ..)
+     │                             │     }
+     │                             │ }
+     │                             │ #[derive(Greet)]
+     ├─────────────────────────────┴──────────────────────────────────
+  93 │ pub struct MultiDeriveOneAttr;
+```
+
+Both columns are syntax highlighted; the original is dimmed to keep the expansion
+in focus. Nested expansions do not nest columns — only the outermost expanded range
+of a nest is split, since inner expansions already sit inside its output.
 
 ## Development
 
