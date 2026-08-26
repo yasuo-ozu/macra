@@ -947,6 +947,22 @@ impl App {
         Some((node.call.col_start, end.max(node.call.col_start + 1)))
     }
 
+    /// The cursor position that puts the source cursor on `node` itself: its own line
+    /// (`derive_line` for derives — the line `node_col_span` keys their span on, which
+    /// differs from `call.line` in a multi-line `#[derive(...)]` list) and the start of
+    /// its column span there.
+    fn node_cursor_pos(node: &MacroNode) -> (usize, usize) {
+        let own_line = if node.call.kind == MacroKind::Derive {
+            node.call.derive_line
+        } else {
+            node.call.line
+        };
+        let col = Self::node_col_span(node, own_line)
+            .map(|(start, _)| start)
+            .unwrap_or(node.call.col_start);
+        (own_line, col)
+    }
+
     /// Visible-node indices of every macro that starts on `line`, ordered by column.
     /// This is what Left/Right steps through.
     fn macros_on_line(&self, line: usize) -> Vec<(usize, usize)> {
@@ -1121,7 +1137,14 @@ impl App {
 
     fn update_scroll(&mut self) {
         if let Some(node) = self.selected_node() {
-            self.cursor_line = node.call.line;
+            // Park the cursor on the selected node itself — line *and* column. Leaving
+            // `cursor_col` behind meant the next j/k re-snapped it to the first macro on
+            // the line and silently changed the selection; and a derive in a multi-line
+            // `#[derive(...)]` list keys its span on `derive_line`, so parking on
+            // `call.line` left the selection with no highlighted span in the source.
+            let (own_line, col) = Self::node_cursor_pos(node);
+            self.cursor_line = own_line;
+            self.cursor_col = col;
             self.ensure_cursor_visible();
         }
     }
@@ -1171,6 +1194,43 @@ impl App {
                 self.collect_visible_nodes(child_id);
             }
         }
+    }
+
+    /// Relocate the macros that sat in the lifted trailing fragment of an expanded call
+    /// onto the fragment's new line, rebasing their columns onto its text.
+    ///
+    /// `tail_src_line` is the line the fragment was cut from — the call's own line for a
+    /// single-line invocation, its end line for a multi-line one. `tail_line` is the
+    /// 1-indexed line the fragment now occupies (the last formatted line of the
+    /// expansion), and `tail_text` that line's text. Returns the ids of the nodes moved,
+    /// so the caller's generic shift loop can skip them: `tail_line` is already their
+    /// final position.
+    fn relocate_tail_nodes(
+        nodes: &mut [MacroNode],
+        expanded_id: usize,
+        tail_src_line: usize,
+        tail_start_col: usize,
+        indent: usize,
+        tail_line: usize,
+        tail_text: &str,
+    ) -> Vec<usize> {
+        let mut relocated = Vec::new();
+        for node in nodes.iter_mut() {
+            if node.id != expanded_id
+                && node.call.line == tail_src_line
+                && node.call.col_start >= tail_start_col
+            {
+                node.call.line = tail_line;
+                node.call.line_end = tail_line;
+                node.call.derive_line = tail_line;
+                node.call.item_line_end = tail_line;
+                node.call.col_start = rebase_col(node.call.col_start, tail_start_col, indent);
+                node.call.col_end = rebase_col(node.call.col_end, tail_start_col, indent);
+                node.original_lines = vec![tail_text.to_string()];
+                relocated.push(node.id);
+            }
+        }
+        relocated
     }
 
     /// Expand the currently selected macro
@@ -1384,10 +1444,12 @@ impl App {
             Vec::new()
         };
 
-        // Set when a trailing fragment of the expanded line is moved onto its own line,
-        // as (first character column of that fragment in the original line, indent of
-        // the new line). Other macros that sat in that fragment have to follow it.
-        let mut tail_rebase: Option<(usize, usize)> = None;
+        // Set when a trailing fragment of an expanded line is moved onto its own line,
+        // as (source line the fragment came from, first character column of the
+        // fragment on that line, indent of the new line). The fragment comes from
+        // `line` for a single-line call and from `line_end` for a multi-line one.
+        // Other macros that sat in that fragment have to follow it.
+        let mut tail_rebase: Option<(usize, usize, usize)> = None;
 
         // For functional macros, replace only the macro call, keeping surrounding code
         let (formatted_lines, lines_removed) = if kind == MacroKind::Functional && line == line_end
@@ -1403,7 +1465,7 @@ impl App {
             if !trimmed.is_empty() {
                 // `trim_start` skipped this many characters past `col_end`.
                 let skipped = after_macro.chars().count() - trimmed.chars().count();
-                tail_rebase = Some((col_end + skipped, base_indent));
+                tail_rebase = Some((line, col_end + skipped, base_indent));
             }
             let after_macro = trimmed;
 
@@ -1432,7 +1494,16 @@ impl App {
 
             // Character columns again — see the single-line branch above.
             let before_macro = &orig_line[..byte_of_col(&orig_line, col_start)];
-            let after_macro = end_orig_line[byte_of_col(&end_orig_line, col_end)..].trim_start();
+            let after_macro = &end_orig_line[byte_of_col(&end_orig_line, col_end)..];
+            let trimmed = after_macro.trim_start();
+            if !trimmed.is_empty() {
+                // The tail is lifted off the macro's *end* line, so macros that have to
+                // follow it sit on `line_end`, past `col_end` plus the whitespace
+                // `trim_start` skipped.
+                let skipped = after_macro.chars().count() - trimmed.chars().count();
+                tail_rebase = Some((line_end, col_end + skipped, base_indent));
+            }
+            let after_macro = trimmed;
 
             let mut lines = Vec::new();
             lines.push(format!("{}// -- expanded: {} --", before_macro, name));
@@ -1547,38 +1618,40 @@ impl App {
             }
         }
 
-        // Macros that shared the expanded line and sat *after* the expanded call moved
-        // with the trailing fragment onto its own line. The generic shift loop below
-        // only touches nodes with `line > line`, so without this they keep pointing at
-        // the original line — which is now the `// -- expanded: ... --` marker — and
-        // expanding one of them would slice the marker text at stale columns.
-        if let Some((tail_start_col, indent)) = tail_rebase {
+        // Macros that sat *after* the expanded call on a removed line moved with the
+        // trailing fragment onto its own line — the fragment of `line` itself for a
+        // single-line call, the fragment of `line_end` for a multi-line one. Without
+        // this they keep pointing at a line that is now expansion output (or gone
+        // entirely), and expanding one of them would slice that text at stale columns.
+        // The relocated ids are excluded from the generic shift loop below: `tail_line`
+        // is already their final position, and shifting them again would overshoot by
+        // `lines_added`.
+        let mut relocated_ids: Vec<usize> = Vec::new();
+        if let Some((tail_src_line, tail_start_col, indent)) = tail_rebase {
             let tail_line = line_idx + num_expanded_lines; // 1-indexed
             let tail_text = self
                 .source_lines
                 .get(tail_line.saturating_sub(1))
                 .cloned()
                 .unwrap_or_default();
-            for node in &mut self.nodes {
-                if node.id != node_id
-                    && node.call.line == line
-                    && node.call.col_start >= tail_start_col
-                {
-                    node.call.line = tail_line;
-                    node.call.line_end = tail_line;
-                    node.call.derive_line = tail_line;
-                    node.call.item_line_end = tail_line;
-                    node.call.col_start = rebase_col(node.call.col_start, tail_start_col, indent);
-                    node.call.col_end = rebase_col(node.call.col_end, tail_start_col, indent);
-                    node.original_lines = vec![tail_text.clone()];
-                }
-            }
+            relocated_ids = Self::relocate_tail_nodes(
+                &mut self.nodes,
+                node_id,
+                tail_src_line,
+                tail_start_col,
+                indent,
+                tail_line,
+                &tail_text,
+            );
         }
 
         // Update line numbers for all nodes that come after this line
         if lines_added != 0 {
             for node in &mut self.nodes {
-                if node.id != node_id && node.call.line > line {
+                if node.id != node_id
+                    && node.call.line > line
+                    && !relocated_ids.contains(&node.id)
+                {
                     node.call.line = (node.call.line as isize + lines_added) as usize;
                     node.call.line_end = (node.call.line_end as isize + lines_added) as usize;
                     node.call.item_line_end =
@@ -3492,6 +3565,63 @@ mod tests {
         assert_eq!(fit_to_width("日本", 4), "日本");
         // A wide glyph straddling the cut is dropped whole, then padded back.
         assert_eq!(fit_to_width("日本語", 4).width(), 4);
+    }
+
+    /// Expanding a multi-line `foo!(\n ... \n); bar!(9);` lifts the fragment after
+    /// foo's closing paren — which lives on foo's END line — onto its own new line.
+    /// `bar` must follow it there: keying the relocation on the start line missed it
+    /// entirely and left it pointing into removed text.
+    #[test]
+    fn tail_macros_on_a_multiline_calls_end_line_follow_the_lifted_tail() {
+        // 2: "    foo!("        — foo spans lines 2..=4, its span ends at col 5 of line 4
+        // 3: "        1,"
+        // 4: "    ); bar!(9);"  — bar (cols 7..14) sits after foo on foo's end line
+        let mut foo = node(MacroKind::Functional, 2, 4, 5);
+        foo.call.line_end = 4;
+        foo.id = 1;
+        let mut bar = node(MacroKind::Functional, 4, 7, 14);
+        bar.id = 2;
+        // A macro nested inside foo's last line, before the tail: must not move.
+        let mut inner = node(MacroKind::Functional, 4, 4, 5);
+        inner.id = 3;
+        let mut nodes = vec![foo, bar, inner];
+
+        // foo's 3 removed lines became 5 formatted lines whose last is the lifted
+        // tail "    ; bar!(9);" — 1-indexed line 6, indented 4.
+        let relocated = App::relocate_tail_nodes(&mut nodes, 1, 4, 5, 4, 6, "    ; bar!(9);");
+
+        assert_eq!(relocated, vec![2]);
+        let bar = &nodes[1];
+        assert_eq!((bar.call.line, bar.call.line_end), (6, 6));
+        // "    ; bar!(9);" — `bar!(9)` now spans character columns 6..13.
+        assert_eq!((bar.call.col_start, bar.call.col_end), (6, 13));
+        assert_eq!(bar.original_lines, vec!["    ; bar!(9);".to_string()]);
+        // The expanded macro itself and the nested node keep their coordinates.
+        assert_eq!(nodes[0].call.line, 2);
+        assert_eq!(nodes[2].call.line, 4);
+    }
+
+    /// Tab moves the tree selection without going through the cursor, so the cursor
+    /// must be parked on the selected node's own line *and* column — otherwise the
+    /// next j/k re-snaps the column to the first macro on the line and silently
+    /// changes the selection (`#[derive(A, B)]`: Tab onto `B`, then j, k → `A`).
+    #[test]
+    fn tab_parks_the_cursor_on_the_selected_nodes_own_span() {
+        let nodes = two_derives_on_one_line();
+        // The second derive's cursor lands on its own column, not the line's first.
+        assert_eq!(App::node_cursor_pos(&nodes[1]), (92, 16));
+
+        // A derive in a multi-line derive list lives on `derive_line`, not on the
+        // attribute's first line; the cursor must follow it there or the selected
+        // node has no highlighted span in the source.
+        let mut wrapped = node(MacroKind::Derive, 10, 4, 9);
+        wrapped.call.derive_line = 11;
+        wrapped.call.line_end = 12;
+        assert_eq!(App::node_cursor_pos(&wrapped), (11, 4));
+        // The reported position is exactly where `node_col_span` keys the span, so
+        // cursor, highlight, and selection all agree.
+        assert_eq!(App::node_col_span(&wrapped, 11), Some((4, 9)));
+        assert_eq!(App::node_col_span(&wrapped, 10), None);
     }
 
     #[test]
