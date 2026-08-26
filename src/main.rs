@@ -560,22 +560,22 @@ struct App {
 
 /// A range of `source_lines` that holds macro output, paired with the source it
 /// replaced, so the two can be shown side by side.
-struct SplitRegion {
+struct SplitRegion<'a> {
     /// 0-based index into `source_lines` where the expansion starts.
     start: usize,
     /// How many `source_lines` entries the expansion occupies.
     len: usize,
     /// The source lines that were replaced.
-    original: Vec<String>,
+    original: &'a [String],
     /// The expansion's own lines as `(source index, text)`. The `// -- expanded: X --`
     /// / `// -- end X --` markers are dropped: the block header already names the
     /// macro. Keeping the source index means the cursor still lines up after the drop.
-    right: Vec<(usize, String)>,
+    right: Vec<(usize, &'a str)>,
     /// Name of the macro that produced the expansion.
-    name: String,
+    name: &'a str,
 }
 
-impl SplitRegion {
+impl SplitRegion<'_> {
     /// Body rows in the block: the taller of the two columns.
     fn rows(&self) -> usize {
         self.right.len().max(self.original.len())
@@ -585,7 +585,7 @@ impl SplitRegion {
 /// Sort regions by position and drop any that sit inside another. A macro expanded
 /// inside another macro's output already lies within that parent's range; splitting it
 /// again would nest columns inside columns.
-fn keep_outermost(mut regions: Vec<SplitRegion>) -> Vec<SplitRegion> {
+fn keep_outermost<'a>(mut regions: Vec<SplitRegion<'a>>) -> Vec<SplitRegion<'a>> {
     regions.sort_by_key(|r| (r.start, std::cmp::Reverse(r.len)));
     let mut out: Vec<SplitRegion> = Vec::new();
     for r in regions {
@@ -844,13 +844,20 @@ impl App {
             return;
         }
         let total = self.source_lines.len();
-        let regions = self.split_regions();
+        // Only each region's geometry matters here. Collecting it into plain tuples
+        // ends the borrow of `self` that the regions hold, so `scroll_offset` can be
+        // assigned below.
+        let regions: Vec<(usize, usize, usize)> = self
+            .split_regions()
+            .iter()
+            .map(|r| (r.start, r.len, r.rows()))
+            .collect();
         let display_row_of = |source_idx: usize| -> usize {
             source_idx
                 + regions
                     .iter()
-                    .filter(|r| r.start + r.len <= source_idx)
-                    .map(|r| (r.rows() + 2).saturating_sub(r.len))
+                    .filter(|&&(start, len, _)| start + len <= source_idx)
+                    .map(|&(_, len, rows)| (rows + 2).saturating_sub(len))
                     .sum::<usize>()
         };
 
@@ -1022,7 +1029,7 @@ impl App {
     /// overlapping. Only the outermost expansion of a nest produces a region: a child
     /// expanded inside a parent's output already sits within the parent's range, and
     /// splitting it again would nest columns inside columns.
-    fn split_regions(&self) -> Vec<SplitRegion> {
+    fn split_regions(&self) -> Vec<SplitRegion<'_>> {
         if !self.split_view {
             return Vec::new();
         }
@@ -1040,15 +1047,15 @@ impl App {
                 let right = (start..start + len)
                     .filter_map(|idx| {
                         let text = self.source_lines.get(idx)?;
-                        (!is_expansion_marker(text)).then(|| (idx, text.clone()))
+                        (!is_expansion_marker(text)).then(|| (idx, text.as_str()))
                     })
                     .collect();
                 Some(SplitRegion {
                     start,
                     len,
-                    original: n.original_lines.clone(),
+                    original: &n.original_lines,
                     right,
-                    name: n.call.name.clone(),
+                    name: &n.call.name,
                 })
             })
             .collect();
@@ -2397,15 +2404,13 @@ fn ui(frame: &mut Frame, app: &mut App) {
         .split(chunks[0]);
 
     // Left panel: macro tree
-    // Collect node data first to avoid borrow issues
-    let node_data: Vec<_> = app
+    // Borrow each node for the duration of the map; only the name is cloned into its
+    // span, so the items own their text and the borrow of `app` ends at `collect`.
+    // Cloning whole nodes here copied each macro's entire input text every frame.
+    let items: Vec<ListItem> = app
         .visible_nodes
         .iter()
-        .filter_map(|&id| app.get_node(id).cloned())
-        .collect();
-
-    let items: Vec<ListItem> = node_data
-        .iter()
+        .filter_map(|&id| app.get_node(id))
         .map(|node| {
             let indent = "  ".repeat(node.depth);
 
@@ -2447,7 +2452,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
                 Span::raw(branch),
                 Span::raw(collapse_indicator),
                 Span::styled(format!("[{}] ", node.call.kind.as_str()), kind_style),
-                Span::styled(&node.call.name, name_style),
+                Span::styled(node.call.name.clone(), name_style),
                 Span::styled(
                     format!(" L{}", node.call.line),
                     Style::default().fg(Color::DarkGray),
@@ -3193,15 +3198,15 @@ mod tests {
         assert_eq!(App::pick_node_at(&refs, 15, 0), Some(0));
     }
 
-    fn region(start: usize, len: usize, original: usize) -> SplitRegion {
+    fn region(start: usize, len: usize, original: usize) -> SplitRegion<'static> {
         SplitRegion {
             start,
             len,
-            original: vec!["orig".to_string(); original],
+            original: vec!["orig".to_string(); original].leak(),
             right: (start..start + len)
-                .map(|i| (i, format!("line{}", i)))
+                .map(|i| (i, format!("line{}", i).leak() as &str))
                 .collect(),
-            name: "M".to_string(),
+            name: "M",
         }
     }
 
