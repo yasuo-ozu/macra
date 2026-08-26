@@ -169,6 +169,9 @@ enum TraceLookup {
 
 struct CacheInner {
     expansions: Vec<MacroExpansion>,
+    /// `normalize_tokens` of each expansion's `input` and `arguments`, computed once
+    /// when the entry is pushed; index-aligned with `expansions`.
+    normalized: Vec<(String, String)>,
     current_idx: usize,
     done: bool,
     error: Option<String>,
@@ -192,6 +195,7 @@ impl ExpansionCache {
         let inner = Arc::new((
             Mutex::new(CacheInner {
                 expansions: Vec::new(),
+                normalized: Vec::new(),
                 current_idx: 0,
                 done: false,
                 error: None,
@@ -204,13 +208,22 @@ impl ExpansionCache {
         thread::spawn(move || {
             let (ref mutex, ref condvar) = *bg_inner;
             for result in iter {
-                let mut cache = mutex.lock().unwrap();
                 match result {
                     Ok(exp) => {
+                        // Normalize outside the lock: entries are matched against this
+                        // pre-normalized text, so it is computed once per entry ever
+                        // instead of once per candidate per scan.
+                        let normalized = (
+                            cargo_macra::normalize_tokens(&exp.input),
+                            cargo_macra::normalize_tokens(&exp.arguments),
+                        );
+                        let mut cache = mutex.lock().unwrap();
                         cache.expansions.push(exp);
+                        cache.normalized.push(normalized);
                         condvar.notify_all();
                     }
                     Err(e) => {
+                        let mut cache = mutex.lock().unwrap();
                         cache.error = Some(format!("{}", e));
                         cache.done = true;
                         condvar.notify_all();
@@ -219,20 +232,9 @@ impl ExpansionCache {
                 }
             }
             // Check the build result after the expansion stream is exhausted.
-            if let Ok(Ok(result)) = check_result.recv() {
-                if !result.success {
-                    // Extract compiler error lines from stderr (skip hook/trace noise).
-                    let errors: Vec<&str> = result
-                        .stderr
-                        .lines()
-                        .filter(|l| l.starts_with("error"))
-                        .collect();
-                    if !errors.is_empty() {
-                        let msg = errors.join("\n");
-                        let mut cache = mutex.lock().unwrap();
-                        cache.build_error = Some(msg);
-                    }
-                }
+            if let Some(msg) = Self::check_result_to_build_error(check_result.recv()) {
+                let mut cache = mutex.lock().unwrap();
+                cache.build_error = Some(msg);
             }
             let mut cache = mutex.lock().unwrap();
             cache.done = true;
@@ -240,6 +242,40 @@ impl ExpansionCache {
         });
 
         Self { inner, child }
+    }
+
+    /// Turn the `cargo check` completion message into a user-visible build error.
+    ///
+    /// A successful build produces `None`, and so does a disconnected channel (the run
+    /// was killed on reload or exit). A failed build yields its compiler error lines.
+    /// An `io::Error` from `wait()`ing on the child is surfaced too: silently dropping
+    /// it degraded the user-visible message to a generic "No trace found".
+    fn check_result_to_build_error(
+        recv: Result<
+            io::Result<cargo_macra::trace_macros::CheckResult>,
+            std::sync::mpsc::RecvError,
+        >,
+    ) -> Option<String> {
+        match recv {
+            Ok(Ok(result)) => {
+                if result.success {
+                    return None;
+                }
+                // Extract compiler error lines from stderr (skip hook/trace noise).
+                let errors: Vec<&str> = result
+                    .stderr
+                    .lines()
+                    .filter(|l| l.starts_with("error"))
+                    .collect();
+                if errors.is_empty() {
+                    None
+                } else {
+                    Some(errors.join("\n"))
+                }
+            }
+            Ok(Err(e)) => Some(format!("failed to wait for cargo check: {}", e)),
+            Err(_) => None,
+        }
     }
 
     /// Kill this run's `cargo check`.
@@ -268,10 +304,47 @@ impl ExpansionCache {
     /// using normalized comparison for input and arguments.
     /// When `relaxed_name` is true, also matches mangled names that contain the
     /// source name (e.g. `__Parse_temporal_<hash>` matches source name `Parse`).
+    /// Convenience form that normalizes on every call; the hot path in
+    /// `search_expansions` calls `expansion_matches_pre` directly, with normalization
+    /// done once per entry and once per query instead.
+    #[cfg(test)]
     fn expansion_matches(
         exp: &MacroExpansion,
         input: &str,
         arguments: &str,
+        name: &str,
+        kind: MacroKind,
+        relaxed_name: bool,
+        strict_input: bool,
+    ) -> bool {
+        Self::expansion_matches_pre(
+            exp,
+            &cargo_macra::normalize_tokens(&exp.input),
+            &cargo_macra::normalize_tokens(&exp.arguments),
+            input,
+            &cargo_macra::normalize_tokens(input),
+            &cargo_macra::normalize_tokens(arguments),
+            name,
+            kind,
+            relaxed_name,
+            strict_input,
+        )
+    }
+
+    /// Core of `expansion_matches`, taking pre-normalized token text.
+    ///
+    /// `exp_norm_input` / `exp_norm_arguments` must be `normalize_tokens` of
+    /// `exp.input` / `exp.arguments` (stored in `CacheInner::normalized`), and
+    /// `norm_input` / `norm_arguments` those of the query. The raw `input` is still
+    /// needed for the truncated-invocation fallback below.
+    #[allow(clippy::too_many_arguments)]
+    fn expansion_matches_pre(
+        exp: &MacroExpansion,
+        exp_norm_input: &str,
+        exp_norm_arguments: &str,
+        input: &str,
+        norm_input: &str,
+        norm_arguments: &str,
         name: &str,
         kind: MacroKind,
         relaxed_name: bool,
@@ -290,8 +363,7 @@ impl ExpansionCache {
             // reduces the key to name + arguments, and two bare `#[my_attr]`s on
             // different items then collide — expanding the second showed the first
             // one's output. So try the input first and only fall back to ignoring it.
-            !strict_input
-                || cargo_macra::normalize_tokens(&exp.input) == cargo_macra::normalize_tokens(input)
+            !strict_input || exp_norm_input == norm_input
         } else if exp.input.is_empty() {
             // Either both inputs are empty (normal match), or rustc may
             // truncate very large macro invocations and emit only `name!`
@@ -299,48 +371,57 @@ impl ExpansionCache {
             input.is_empty()
                 || (exp.kind == MacroExpansionKind::Bang && exp.expanding.trim_end().ends_with('!'))
         } else {
-            cargo_macra::normalize_tokens(&exp.input) == cargo_macra::normalize_tokens(input)
+            exp_norm_input == norm_input
         };
         name_matches
             && exp.kind == Self::to_expansion_kind(kind)
             && input_matches
-            && cargo_macra::normalize_tokens(&exp.arguments)
-                == cargo_macra::normalize_tokens(arguments)
+            && exp_norm_arguments == norm_arguments
     }
 
     /// Search cached expansions for a matching trace. Returns the index if found.
+    ///
+    /// `norm_input` / `norm_arguments` are `normalize_tokens` of the query, computed
+    /// once by the caller. `min_idx` restricts the scan to entries at index >=
+    /// `min_idx`: `find_trace_for_tokens` passes 0 for a lookup's first scan and, after
+    /// each unsuccessful scan, the length it saw, so later wakes only test entries
+    /// appended since. That is equivalent to a full rescan because entries are
+    /// immutable, only ever appended at the tail, and matching is deterministic —
+    /// everything below `min_idx` was already rejected in all four passes for this same
+    /// query and cannot start matching later.
+    #[allow(clippy::too_many_arguments)]
     fn search_expansions(
         inner: &CacheInner,
         input: &str,
-        arguments: &str,
+        norm_input: &str,
+        norm_arguments: &str,
         name: &str,
         kind: MacroKind,
+        min_idx: usize,
     ) -> Option<usize> {
         // Most specific match first: exact name before relaxed (mangled) name, and an
         // input that actually matches before falling back to ignoring it.
         for strict_input in [true, false] {
             for relaxed in [false, true] {
-                for idx in inner.current_idx..inner.expansions.len() {
-                    let exp = &inner.expansions[idx];
-                    if Self::expansion_matches(
-                        exp,
-                        input,
-                        arguments,
-                        name,
-                        kind,
-                        relaxed,
-                        strict_input,
-                    ) {
-                        return Some(idx);
+                // Rotating order: current_idx..len, then wrap to 0..current_idx, so
+                // repeated identical invocations round-robin through their entries. On
+                // resumed scans `min_idx` is a previously seen length (always >=
+                // current_idx), so the wrap segment and the already-rejected tail
+                // prefix are skipped.
+                for idx in (inner.current_idx..inner.expansions.len()).chain(0..inner.current_idx)
+                {
+                    if idx < min_idx {
+                        continue;
                     }
-                }
-                // Wrap around: search from beginning to current_idx
-                for idx in 0..inner.current_idx {
                     let exp = &inner.expansions[idx];
-                    if Self::expansion_matches(
+                    let (exp_norm_input, exp_norm_arguments) = &inner.normalized[idx];
+                    if Self::expansion_matches_pre(
                         exp,
+                        exp_norm_input,
+                        exp_norm_arguments,
                         input,
-                        arguments,
+                        norm_input,
+                        norm_arguments,
                         name,
                         kind,
                         relaxed,
@@ -370,15 +451,34 @@ impl ExpansionCache {
         kind: MacroKind,
         should_abort: &mut dyn FnMut() -> bool,
     ) -> TraceLookup {
+        // Normalize the query once for the whole lookup, not once per candidate per wake.
+        let norm_input = cargo_macra::normalize_tokens(input);
+        let norm_arguments = cargo_macra::normalize_tokens(arguments);
+
         let (ref mutex, ref condvar) = *self.inner;
         let mut inner = mutex.lock().unwrap();
 
+        // Entries below this watermark have already been tested against this query in
+        // all four passes and rejected, so later wakes only scan what arrived since.
+        // The watermark is read under the lock, and pushes also happen under the lock,
+        // so an entry arriving during a wait always has an index >= the watermark.
+        let mut scanned_len = 0;
+
         loop {
-            if let Some(idx) = Self::search_expansions(&inner, input, arguments, name, kind) {
+            if let Some(idx) = Self::search_expansions(
+                &inner,
+                input,
+                &norm_input,
+                &norm_arguments,
+                name,
+                kind,
+                scanned_len,
+            ) {
                 let result = inner.expansions[idx].to.clone();
                 inner.current_idx = idx + 1;
                 return TraceLookup::Found(result);
             }
+            scanned_len = inner.expansions.len();
 
             if inner.done {
                 return TraceLookup::Exhausted;
@@ -1104,7 +1204,7 @@ impl App {
                 let right = (start..start + len)
                     .filter_map(|idx| {
                         let text = self.source_lines.get(idx)?;
-                        (!is_expansion_marker(text)).then(|| (idx, text.as_str()))
+                        (!is_expansion_marker(text)).then_some((idx, text.as_str()))
                     })
                     .collect();
                 Some(SplitRegion {
@@ -3829,6 +3929,145 @@ mod tests {
         assert!(!matches("fn b() {}", true));
         // Lenient fallback: input ignored, as before.
         assert!(matches("fn b() {}", false));
+    }
+
+    fn bang_expansion(name: &str, input: &str, to: &str) -> MacroExpansion {
+        MacroExpansion {
+            expanding: format!("{}! {{ {} }}", name, input),
+            arguments: String::new(),
+            to: to.to_string(),
+            name: name.to_string(),
+            kind: MacroExpansionKind::Bang,
+            input: input.to_string(),
+        }
+    }
+
+    fn cache_inner_of(expansions: Vec<MacroExpansion>, current_idx: usize) -> CacheInner {
+        let normalized = expansions
+            .iter()
+            .map(|e| {
+                (
+                    cargo_macra::normalize_tokens(&e.input),
+                    cargo_macra::normalize_tokens(&e.arguments),
+                )
+            })
+            .collect();
+        CacheInner {
+            expansions,
+            normalized,
+            current_idx,
+            done: false,
+            error: None,
+            build_error: None,
+        }
+    }
+
+    #[test]
+    fn search_expansions_prefers_exact_name_and_resumes_from_min_idx() {
+        let norm_input = cargo_macra::normalize_tokens("a");
+        let norm_arguments = cargo_macra::normalize_tokens("");
+        let search = |inner: &CacheInner, min_idx: usize| {
+            ExpansionCache::search_expansions(
+                inner,
+                "a",
+                &norm_input,
+                &norm_arguments,
+                "foo",
+                MacroKind::Functional,
+                min_idx,
+            )
+        };
+
+        // The mangled helper sits at a lower index, but the exact-name pass runs first
+        // over all entries, so the exact match wins.
+        let inner = cache_inner_of(
+            vec![
+                bang_expansion("other", "a", "0"),
+                bang_expansion("__foo_mangled", "a", "relaxed"),
+                bang_expansion("foo", "a", "exact"),
+            ],
+            0,
+        );
+        assert_eq!(search(&inner, 0), Some(2));
+        // A resumed scan only considers entries appended since the last scan: with
+        // min_idx past the end nothing is re-examined...
+        assert_eq!(search(&inner, 3), None);
+        // ...and all four passes still run over the new suffix, so a relaxed-name entry
+        // appended after the watermark is found.
+        let inner = cache_inner_of(
+            vec![
+                bang_expansion("foo", "a", "already scanned"),
+                bang_expansion("__foo_mangled", "a", "new arrival"),
+            ],
+            0,
+        );
+        assert_eq!(search(&inner, 1), Some(1));
+    }
+
+    #[test]
+    fn search_expansions_round_robins_repeated_invocations() {
+        let two = |current_idx| {
+            cache_inner_of(
+                vec![
+                    bang_expansion("foo", "a", "first"),
+                    bang_expansion("foo", "a", "second"),
+                ],
+                current_idx,
+            )
+        };
+        let norm_input = cargo_macra::normalize_tokens("a");
+        let norm_arguments = cargo_macra::normalize_tokens("");
+        let search = |inner: &CacheInner| {
+            ExpansionCache::search_expansions(
+                inner,
+                "a",
+                &norm_input,
+                &norm_arguments,
+                "foo",
+                MacroKind::Functional,
+                0,
+            )
+        };
+
+        // A fresh lookup (min_idx = 0) rotates from current_idx and wraps.
+        assert_eq!(search(&two(0)), Some(0));
+        assert_eq!(search(&two(1)), Some(1));
+        assert_eq!(search(&two(2)), Some(0));
+    }
+
+    #[test]
+    fn check_wait_error_is_surfaced_as_build_error() {
+        use cargo_macra::trace_macros::CheckResult;
+
+        // An io::Error from wait()ing on cargo must reach the user instead of being
+        // swallowed into a generic "No trace found".
+        let err = std::io::Error::other("waitpid failed");
+        let msg = ExpansionCache::check_result_to_build_error(Ok(Err(err)))
+            .expect("wait error should surface");
+        assert!(msg.contains("waitpid failed"));
+
+        // A failed build still extracts only the compiler error lines...
+        let failed = CheckResult {
+            success: false,
+            stdout: String::new(),
+            stderr: "warning: noise\nerror[E0308]: mismatched types\n".to_string(),
+        };
+        assert_eq!(
+            ExpansionCache::check_result_to_build_error(Ok(Ok(failed))).as_deref(),
+            Some("error[E0308]: mismatched types")
+        );
+
+        // ...and a success or a killed run (disconnected channel) reports nothing.
+        let ok = CheckResult {
+            success: true,
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+        assert_eq!(ExpansionCache::check_result_to_build_error(Ok(Ok(ok))), None);
+        assert_eq!(
+            ExpansionCache::check_result_to_build_error(Err(std::sync::mpsc::RecvError)),
+            None
+        );
     }
 
     #[test]
