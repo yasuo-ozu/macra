@@ -95,6 +95,11 @@ struct MacroNode {
     /// used to restore their state on undo.
     /// Vec of (node_id, original_lines, line, line_end, item_line_end, derive_line)
     derive_sibling_snapshot: Vec<(usize, Vec<String>, usize, usize, usize, usize)>,
+    /// Nodes this expansion relocated onto its lifted tail, as they were beforehand.
+    /// Undo restores them: reversing only the line shift left their columns rebased
+    /// onto the tail line and their `original_lines` holding the tail's text, so they
+    /// overlapped the macro they had shared a line with.
+    tail_relocation_snapshot: Vec<RelocatedNode>,
     /// The `line_origins` entries this expansion replaced, restored verbatim on undo.
     /// Recomputing them from the node's `call.line` gets the gutter wrong as soon as an
     /// earlier expansion has shifted this node, and stamps real line numbers onto lines
@@ -185,6 +190,20 @@ struct PendingChoice {
     name: String,
     candidates: Vec<TraceCandidate>,
     selected: usize,
+}
+
+/// A node's coordinates before it was relocated onto an expansion's lifted tail,
+/// kept so undo can put it back exactly.
+#[derive(Debug, Clone)]
+struct RelocatedNode {
+    id: usize,
+    line: usize,
+    line_end: usize,
+    derive_line: usize,
+    item_line_end: usize,
+    col_start: usize,
+    col_end: usize,
+    original_lines: Vec<String>,
 }
 
 /// One option offered when a lookup is ambiguous.
@@ -935,6 +954,7 @@ fn build_root_nodes(source: &str, source_lines: &[String]) -> (Vec<MacroNode>, u
             children_visible: true,
             derive_sibling_snapshot: Vec::new(),
             original_line_origins: Vec::new(),
+            tail_relocation_snapshot: Vec::new(),
         });
         next_id += 1;
     }
@@ -1432,7 +1452,7 @@ impl App {
         tail_start_col: usize,
         indent: usize,
         tail_line: usize,
-    ) -> Vec<usize> {
+    ) -> Vec<RelocatedNode> {
         // Shift the whole span rather than pinning every line to `tail_line`: a
         // relocated macro can itself be multi-line, and collapsing its end onto its
         // start left its continuation lines outside it. The delta equals the
@@ -1443,10 +1463,25 @@ impl App {
 
         let mut relocated = Vec::new();
         for node in nodes.iter_mut() {
+            // An already-expanded node's `call.line` points at its own marker line and
+            // its `original_lines` hold the text it replaced. Rebasing either would
+            // overwrite that with marker text and corrupt its undo. Skipping it here
+            // leaves it to the generic shift loop, which moves it by the same delta.
             if node.id != expanded_id
+                && !node.expanded
                 && node.call.line == tail_src_line
                 && node.call.col_start >= tail_start_col
             {
+                let before = RelocatedNode {
+                    id: node.id,
+                    line: node.call.line,
+                    line_end: node.call.line_end,
+                    derive_line: node.call.derive_line,
+                    item_line_end: node.call.item_line_end,
+                    col_start: node.call.col_start,
+                    col_end: node.call.col_end,
+                    original_lines: node.original_lines.clone(),
+                };
                 node.call.line = shift(node.call.line);
                 node.call.line_end = shift(node.call.line_end);
                 node.call.derive_line = shift(node.call.derive_line);
@@ -1463,7 +1498,7 @@ impl App {
                     .max(first)
                     .min(source_lines.len().saturating_sub(1));
                 node.original_lines = source_lines.get(first..=last).unwrap_or(&[]).to_vec();
-                relocated.push(node.id);
+                relocated.push(before);
             }
         }
         relocated
@@ -1751,6 +1786,9 @@ impl App {
         // `line` for a single-line call and from `line_end` for a multi-line one.
         // Other macros that sat in that fragment have to follow it.
         let mut tail_rebase: Option<(usize, usize, usize)> = None;
+        // Whether the derive branch appended a rescued item after the remaining
+        // `#[derive(...)]` line, which shifts where that line ends up.
+        let mut derive_tail_pushed = false;
 
         // For functional macros, replace only the macro call, keeping surrounding code
         let (formatted_lines, lines_removed) = if kind == MacroKind::Functional && line == line_end
@@ -1843,6 +1881,7 @@ impl App {
             let tail = attribute_tail(&last_removed, col_start);
             if !tail.is_empty() {
                 lines.push(format!("{}{}", base_indent_str, tail));
+                derive_tail_pushed = true;
             }
 
             // Only remove the #[derive(...)] attribute line(s), NOT the item
@@ -1927,10 +1966,10 @@ impl App {
         // The relocated ids are excluded from the generic shift loop below: `tail_line`
         // is already their final position, and shifting them again would overshoot by
         // `lines_added`.
-        let mut relocated_ids: Vec<usize> = Vec::new();
+        let mut tail_relocation: Vec<RelocatedNode> = Vec::new();
         if let Some((tail_src_line, tail_start_col, indent)) = tail_rebase {
             let tail_line = line_idx + num_expanded_lines; // 1-indexed
-            relocated_ids = Self::relocate_tail_nodes(
+            tail_relocation = Self::relocate_tail_nodes(
                 &mut self.nodes,
                 &self.source_lines,
                 node_id,
@@ -1946,7 +1985,7 @@ impl App {
             for node in &mut self.nodes {
                 if node.id != node_id
                     && node.call.line > line
-                    && !relocated_ids.contains(&node.id)
+                    && !tail_relocation.iter().any(|r| r.id == node.id)
                 {
                     node.call.line = (node.call.line as isize + lines_added) as usize;
                     node.call.line_end = (node.call.line_end as isize + lines_added) as usize;
@@ -1994,7 +2033,12 @@ impl App {
                 {
                     if has_remaining_line {
                         // The remaining #[derive(...)] line is the last line in formatted_lines
-                        let remaining_line_pos = line_idx + num_expanded_lines - 1; // 0-indexed
+                        // Last formatted line, unless a rescued item was appended
+                        // after it — attributes have to precede their item, so the
+                        // remaining `#[derive(...)]` sits one line further up then.
+                        let remaining_line_pos = line_idx + num_expanded_lines
+                            - 1
+                            - usize::from(derive_tail_pushed); // 0-indexed
                         node.call.line = remaining_line_pos + 1; // 1-indexed
                         node.call.line_end = remaining_line_pos + 1;
                         // The surviving derives are rewritten onto this one line, so the
@@ -2021,6 +2065,7 @@ impl App {
             node.expansion_failed = false;
             node.expanded_content = Some(expanded_content.clone());
             node.original_line_origins = replaced_origins;
+            node.tail_relocation_snapshot = tail_relocation;
             node.children_visible = true;
             node.derive_sibling_snapshot = derive_sibling_snapshot;
         }
@@ -2083,6 +2128,7 @@ impl App {
                 children_visible: true,
                 derive_sibling_snapshot: Vec::new(),
                 original_line_origins: Vec::new(),
+                tail_relocation_snapshot: Vec::new(),
             });
 
             child_ids.push(child_id);
@@ -2148,6 +2194,7 @@ impl App {
             original_lines,
             derive_sibling_snapshot,
             original_line_origins,
+            tail_relocation,
         ) = {
             let node = match self.get_node(node_id) {
                 Some(n) => n,
@@ -2161,6 +2208,7 @@ impl App {
                 node.original_lines.clone(),
                 node.derive_sibling_snapshot.clone(),
                 node.original_line_origins.clone(),
+                node.tail_relocation_snapshot.clone(),
             )
         };
 
@@ -2199,7 +2247,10 @@ impl App {
         // Update line numbers for all nodes that come after this line
         if lines_delta != 0 {
             for node in &mut self.nodes {
-                if node.id != node_id && node.call.line > line {
+                if node.id != node_id
+                    && node.call.line > line
+                    && !tail_relocation.iter().any(|r| r.id == node.id)
+                {
                     node.call.line = (node.call.line as isize - lines_delta) as usize;
                     node.call.line_end = (node.call.line_end as isize - lines_delta) as usize;
                     node.call.item_line_end =
@@ -2231,6 +2282,22 @@ impl App {
             }
         }
 
+        // Put back the nodes this expansion had relocated onto its lifted tail. Undoing
+        // only the line shift left their columns rebased onto the tail and their
+        // `original_lines` holding the tail's text, so they overlapped the macro they
+        // had shared a line with — and expanding one then sliced the wrong text.
+        for r in &tail_relocation {
+            if let Some(node) = self.get_node_mut(r.id) {
+                node.call.line = r.line;
+                node.call.line_end = r.line_end;
+                node.call.derive_line = r.derive_line;
+                node.call.item_line_end = r.item_line_end;
+                node.call.col_start = r.col_start;
+                node.call.col_end = r.col_end;
+                node.original_lines = r.original_lines.clone();
+            }
+        }
+
         // Remove all descendant nodes recursively
         self.remove_descendants(node_id);
 
@@ -2242,6 +2309,7 @@ impl App {
             node.children_visible = true;
             node.derive_sibling_snapshot.clear();
             node.original_line_origins.clear();
+            node.tail_relocation_snapshot.clear();
         }
 
         self.rebuild_visible_nodes();
@@ -3659,6 +3727,7 @@ mod tests {
             children_visible: true,
             derive_sibling_snapshot: Vec::new(),
             original_line_origins: Vec::new(),
+            tail_relocation_snapshot: Vec::new(),
         }
     }
 
@@ -4009,7 +4078,7 @@ mod tests {
         ];
         let relocated = App::relocate_tail_nodes(&mut nodes, &source_lines, 1, 4, 5, 4, 6);
 
-        assert_eq!(relocated, vec![2]);
+        assert_eq!(relocated.iter().map(|r| r.id).collect::<Vec<_>>(), vec![2]);
         let bar = &nodes[1];
         assert_eq!((bar.call.line, bar.call.line_end), (6, 6));
         // "    ; bar!(9);" — `bar!(9)` now spans character columns 6..13.
@@ -4018,6 +4087,48 @@ mod tests {
         // The expanded macro itself and the nested node keep their coordinates.
         assert_eq!(nodes[0].call.line, 2);
         assert_eq!(nodes[2].call.line, 4);
+    }
+
+    /// `relocate_tail_nodes` returns each moved node's prior coordinates so undo can
+    /// restore them; reversing only the line shift left them overlapping their
+    /// neighbour with columns rebased onto the tail.
+    #[test]
+    fn relocation_reports_the_pre_move_coordinates() {
+        let mut bar = node(MacroKind::Functional, 2, 10, 14);
+        bar.id = 2;
+        let mut nodes = vec![bar];
+        let source_lines: Vec<String> = vec![String::new(); 6];
+
+        let moved = App::relocate_tail_nodes(&mut nodes, &source_lines, 1, 2, 10, 4, 5);
+
+        assert_eq!(moved.len(), 1);
+        let before = &moved[0];
+        assert_eq!(before.id, 2);
+        // The snapshot holds where it was, not where it went.
+        assert_eq!((before.line, before.col_start, before.col_end), (2, 10, 14));
+        assert_eq!(
+            (nodes[0].call.line, nodes[0].call.col_start),
+            (5, 4),
+            "the node itself moved"
+        );
+    }
+
+    /// An already-expanded node must not be relocated: its `original_lines` hold the
+    /// text it replaced, and rebasing would overwrite that with marker text.
+    #[test]
+    fn an_expanded_node_is_left_alone_by_relocation() {
+        let mut b = node(MacroKind::Functional, 2, 10, 14);
+        b.id = 2;
+        b.expanded = true;
+        b.original_lines = vec!["    a!(); b!();".to_string()];
+        let mut nodes = vec![b];
+        let source_lines: Vec<String> = vec![String::new(); 6];
+
+        let moved = App::relocate_tail_nodes(&mut nodes, &source_lines, 1, 2, 10, 4, 5);
+
+        assert!(moved.is_empty());
+        assert_eq!(nodes[0].call.col_start, 10);
+        assert_eq!(nodes[0].original_lines, vec!["    a!(); b!();".to_string()]);
     }
 
     /// A relocated macro can itself span several lines. Pinning its end to the tail
@@ -4033,7 +4144,7 @@ mod tests {
         let source_lines: Vec<String> = vec![String::new(); 8];
         let relocated = App::relocate_tail_nodes(&mut nodes, &source_lines, 1, 4, 5, 4, 6);
 
-        assert_eq!(relocated, vec![2]);
+        assert_eq!(relocated.iter().map(|r| r.id).collect::<Vec<_>>(), vec![2]);
         let n = &nodes[0];
         // Shifted by tail_line - tail_src_line = 2, so the two-line span is preserved
         // rather than collapsed onto line 6.
