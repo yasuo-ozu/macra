@@ -373,10 +373,17 @@ impl ExpansionCache {
     ) -> bool {
         let macro_name = name.rsplit("::").next().unwrap_or(name).trim();
         let exp_name = exp.name.rsplit("::").next().unwrap_or(&exp.name).trim();
+        // Mangled helper macros are generated as `__<Name>_<hash>`, so the relaxed
+        // pass has to stop at a `_` boundary. A bare prefix test also accepted
+        // `__Parser_<hash>` for source name `Parse`, silently expanding a different
+        // macro — and with only one such match there is no collision to prompt about.
         let name_matches = exp_name == macro_name
             || (relaxed_name
-                && exp_name.starts_with("__")
-                && exp_name[2..].starts_with(macro_name));
+                && !macro_name.is_empty()
+                && exp_name
+                    .strip_prefix("__")
+                    .and_then(|rest| rest.strip_prefix(macro_name))
+                    .is_some_and(|tail| tail.is_empty() || tail.starts_with('_')));
         let input_matches = if kind == MacroKind::Attribute {
             // Hook-captured attribute macros serialize doc comments differently than
             // syn (`///` vs `#[doc = "..."]`), so the inputs legitimately differ and
@@ -752,8 +759,19 @@ fn keep_outermost<'a>(mut regions: Vec<SplitRegion<'a>>) -> Vec<SplitRegion<'a>>
 /// Is this one of the `// -- expanded: X --` / `// -- end X --` marker lines that
 /// `expand_selected` wraps inlined output in?
 fn is_expansion_marker(line: &str) -> bool {
+    // Markers are generated as `// -- expanded: NAME --` and `// -- end NAME --`,
+    // where NAME is a macro path and so never contains whitespace. Requiring the whole
+    // shape — both delimiters and a whitespace-free name — keeps an ordinary comment
+    // like `// -- end of section --` from being taken for a marker and silently
+    // dropped from a split block. The old test accepted any `// -- end …--` line.
     let t = line.trim();
-    t.starts_with("// -- expanded:") || (t.starts_with("// -- end ") && t.ends_with("--"))
+    let names_a_macro = |prefix: &str| {
+        t.strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix("--"))
+            .map(str::trim)
+            .is_some_and(|name| !name.is_empty() && !name.contains(char::is_whitespace))
+    };
+    names_a_macro("// -- expanded:") || names_a_macro("// -- end ")
 }
 
 /// Tab stop width used when expanding `\t` in loaded source files.
@@ -1360,26 +1378,43 @@ impl App {
     /// final position.
     fn relocate_tail_nodes(
         nodes: &mut [MacroNode],
+        source_lines: &[String],
         expanded_id: usize,
         tail_src_line: usize,
         tail_start_col: usize,
         indent: usize,
         tail_line: usize,
-        tail_text: &str,
     ) -> Vec<usize> {
+        // Shift the whole span rather than pinning every line to `tail_line`: a
+        // relocated macro can itself be multi-line, and collapsing its end onto its
+        // start left its continuation lines outside it. The delta equals the
+        // expansion's net line change, so this agrees with the generic shift loop
+        // these nodes are excluded from.
+        let delta = tail_line as isize - tail_src_line as isize;
+        let shift = |v: usize| (v as isize + delta).max(1) as usize;
+
         let mut relocated = Vec::new();
         for node in nodes.iter_mut() {
             if node.id != expanded_id
                 && node.call.line == tail_src_line
                 && node.call.col_start >= tail_start_col
             {
-                node.call.line = tail_line;
-                node.call.line_end = tail_line;
-                node.call.derive_line = tail_line;
-                node.call.item_line_end = tail_line;
+                node.call.line = shift(node.call.line);
+                node.call.line_end = shift(node.call.line_end);
+                node.call.derive_line = shift(node.call.derive_line);
+                node.call.item_line_end = shift(node.call.item_line_end);
+                // Columns only describe the span's first line, which is the lifted
+                // fragment; the continuation lines keep their own text.
                 node.call.col_start = rebase_col(node.call.col_start, tail_start_col, indent);
                 node.call.col_end = rebase_col(node.call.col_end, tail_start_col, indent);
-                node.original_lines = vec![tail_text.to_string()];
+                let first = node.call.line.saturating_sub(1);
+                let last = node
+                    .call
+                    .line_end
+                    .saturating_sub(1)
+                    .max(first)
+                    .min(source_lines.len().saturating_sub(1));
+                node.original_lines = source_lines.get(first..=last).unwrap_or(&[]).to_vec();
                 relocated.push(node.id);
             }
         }
@@ -1838,19 +1873,14 @@ impl App {
         let mut relocated_ids: Vec<usize> = Vec::new();
         if let Some((tail_src_line, tail_start_col, indent)) = tail_rebase {
             let tail_line = line_idx + num_expanded_lines; // 1-indexed
-            let tail_text = self
-                .source_lines
-                .get(tail_line.saturating_sub(1))
-                .cloned()
-                .unwrap_or_default();
             relocated_ids = Self::relocate_tail_nodes(
                 &mut self.nodes,
+                &self.source_lines,
                 node_id,
                 tail_src_line,
                 tail_start_col,
                 indent,
                 tail_line,
-                &tail_text,
             );
         }
 
@@ -2253,6 +2283,30 @@ impl App {
                 self.ensure_cursor_visible();
                 self.snap_cursor_col();
                 self.sync_selection_to_cursor();
+
+                // Parent modules on the stack still hold their pre-edit source. Backing
+                // out into one would show stale lines whose macros no longer match the
+                // traces this reload just generated, so refresh them the same way.
+                for saved in &mut self.module_stack {
+                    let Ok(text) = std::fs::read_to_string(&saved.file_path) else {
+                        continue;
+                    };
+                    let text = expand_tabs(&text);
+                    saved.source_lines = text.lines().map(|s| s.to_string()).collect();
+                    saved.line_origins = (1..=saved.source_lines.len()).map(Some).collect();
+                    let (nodes, next_id) = build_root_nodes(&text, &saved.source_lines);
+                    saved.visible_nodes = nodes.iter().map(|n| n.id).collect();
+                    saved.nodes = nodes;
+                    saved.next_id = next_id;
+                    saved.selected_idx = 0;
+                    saved.list_state = ListState::default();
+                    saved.cursor_line = saved.cursor_line.min(saved.source_lines.len()).max(1);
+                    saved.cursor_col = 0;
+                    saved.scroll_offset = saved
+                        .scroll_offset
+                        .min(saved.source_lines.len().saturating_sub(1));
+                }
+
                 self.status = format!("Reloaded trace data. Found {} macros.", self.nodes.len());
             }
             Err(e) => {
@@ -3826,9 +3880,18 @@ mod tests {
     fn expansion_markers_are_recognised() {
         assert!(is_expansion_marker("    // -- expanded: Describe --"));
         assert!(is_expansion_marker("// -- end Describe --"));
+        assert!(is_expansion_marker("// -- end foo::bar --"));
         // Real code that merely mentions the words must not be swallowed.
         assert!(!is_expansion_marker("let x = 1; // -- end of the line"));
         assert!(!is_expansion_marker("impl Foo {"));
+        // A comment shaped like a marker but naming several words is prose, not a
+        // macro — this one used to match and vanish from the split view.
+        assert!(!is_expansion_marker("// -- end of section --"));
+        assert!(!is_expansion_marker("    // -- expanded: see below --"));
+        // Both delimiters are required.
+        assert!(!is_expansion_marker("// -- expanded: Describe"));
+        assert!(!is_expansion_marker("// -- end Describe"));
+        assert!(!is_expansion_marker("// -- end  --"));
     }
 
     #[test]
@@ -3869,7 +3932,17 @@ mod tests {
 
         // foo's 3 removed lines became 5 formatted lines whose last is the lifted
         // tail "    ; bar!(9);" — 1-indexed line 6, indented 4.
-        let relocated = App::relocate_tail_nodes(&mut nodes, 1, 4, 5, 4, 6, "    ; bar!(9);");
+        // foo's 3 lines (2..=4) became 5 formatted lines (2..=6), the last being the
+        // lifted tail.
+        let source_lines: Vec<String> = vec![
+            "fn main() {".into(),
+            "    // -- expanded: foo --".into(),
+            "    ()".into(),
+            "    ()".into(),
+            "    // -- end foo --".into(),
+            "    ; bar!(9);".into(),
+        ];
+        let relocated = App::relocate_tail_nodes(&mut nodes, &source_lines, 1, 4, 5, 4, 6);
 
         assert_eq!(relocated, vec![2]);
         let bar = &nodes[1];
@@ -3880,6 +3953,29 @@ mod tests {
         // The expanded macro itself and the nested node keep their coordinates.
         assert_eq!(nodes[0].call.line, 2);
         assert_eq!(nodes[2].call.line, 4);
+    }
+
+    /// A relocated macro can itself span several lines. Pinning its end to the tail
+    /// line put its own continuation lines outside it; the span has to shift whole.
+    #[test]
+    fn a_relocated_multiline_macro_keeps_its_extent() {
+        let mut spanning = node(MacroKind::Functional, 4, 7, 14);
+        spanning.call.line_end = 5;
+        spanning.call.item_line_end = 5;
+        spanning.id = 2;
+        let mut nodes = vec![spanning];
+
+        let source_lines: Vec<String> = vec![String::new(); 8];
+        let relocated = App::relocate_tail_nodes(&mut nodes, &source_lines, 1, 4, 5, 4, 6);
+
+        assert_eq!(relocated, vec![2]);
+        let n = &nodes[0];
+        // Shifted by tail_line - tail_src_line = 2, so the two-line span is preserved
+        // rather than collapsed onto line 6.
+        assert_eq!(n.call.line, 6);
+        assert_eq!(n.call.line_end, 7);
+        assert_eq!(n.call.item_line_end, 7);
+        assert_eq!(n.original_lines.len(), 2);
     }
 
     /// Tab moves the tree selection without going through the cursor, so the cursor
@@ -4274,6 +4370,20 @@ mod tests {
             "Parse",
             MacroKind::Functional,
             false,
+            true
+        ));
+        // A different macro that merely starts with the same letters must not match,
+        // or `Parse` silently expands `__Parser_<hash>`.
+        assert!(!ExpansionCache::expansion_matches(
+            &MacroExpansion {
+                name: "__Parser_9874485626140785372".to_string(),
+                ..exp.clone()
+            },
+            "args",
+            "",
+            "Parse",
+            MacroKind::Functional,
+            true,
             true
         ));
         // Relaxed match succeeds
