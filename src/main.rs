@@ -157,6 +157,13 @@ fn wait_cancelled() -> bool {
     false
 }
 
+/// How long a lookup lets the trace stream settle after its first match before
+/// deciding whether the match is ambiguous.
+///
+/// Entries for one macro are emitted together, so this is generous for spotting a
+/// collision while still bounded — it never waits for the whole build.
+const AMBIGUITY_SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Outcome of a trace lookup.
 enum TraceLookup {
     /// Exactly one distinct expansion matched.
@@ -183,8 +190,12 @@ struct PendingChoice {
 /// One option offered when a lookup is ambiguous.
 #[derive(Clone)]
 struct TraceCandidate {
-    /// The invocation as rustc reported it (`exp.expanding`), which is what actually
-    /// tells two colliding entries apart.
+    /// First non-blank line of `output`, as a one-line summary for the popup.
+    ///
+    /// Deliberately *not* `exp.expanding`: for a bang macro that field holds the
+    /// invocation's input and for a derive it holds the macro name, and a collision
+    /// requires both to be equal — so every candidate would carry the same label and
+    /// the list could not be chosen from. The output is what actually differs.
     label: String,
     /// The expansion this candidate would inline.
     output: String,
@@ -419,8 +430,15 @@ impl ExpansionCache {
             if candidates.iter().any(|c| c.output == exp.to) {
                 continue;
             }
+            let label = exp
+                .to
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .unwrap_or("(empty expansion)")
+                .to_string();
             candidates.push(TraceCandidate {
-                label: exp.expanding.lines().next().unwrap_or("").trim().to_string(),
+                label,
                 output: exp.to.clone(),
             });
         }
@@ -528,8 +546,34 @@ impl ExpansionCache {
                 scanned_len,
             );
             if !hits.is_empty() {
+                // A colliding entry may still be a few pushes behind: the reader thread
+                // appends one entry at a time and notifies per entry, so the first push
+                // wakes us holding a single hit even when its twin is imminent.
+                // Returning here would auto-pick it and never show the popup for any
+                // expansion done while the build is still running. Give the stream a
+                // short bounded window to settle instead — long enough for entries
+                // emitted together, short enough not to wait on the whole build.
+                if !inner.done {
+                    let deadline = std::time::Instant::now() + AMBIGUITY_SETTLE;
+                    while !inner.done && std::time::Instant::now() < deadline {
+                        let (guard, _timeout) = condvar
+                            .wait_timeout(inner, std::time::Duration::from_millis(25))
+                            .unwrap();
+                        inner = guard;
+                        if should_abort() {
+                            return TraceLookup::Aborted;
+                        }
+                    }
+                }
+                // Rescan from the start: the watermark would exclude the hits found
+                // above, and every candidate has to be considered together.
+                let hits =
+                    Self::search_expansions(&inner, input, &norm_input, &norm_arguments, name, kind, 0);
                 let mut candidates = Self::distinct_candidates(&inner, &hits);
                 return match candidates.len() {
+                    // Unreachable: entries are only ever appended, so the hits found
+                    // above are still present.
+                    0 => TraceLookup::Exhausted,
                     1 => TraceLookup::Found(candidates.pop().expect("just checked").output),
                     _ => TraceLookup::Ambiguous(candidates),
                 };
@@ -703,6 +747,9 @@ struct App {
     /// Set when an expansion lookup matched several differing traces and is waiting
     /// for the user to pick one.
     pending_choice: Option<PendingChoice>,
+    /// Set when something drew outside ratatui's buffer (the blocking-lookup notice),
+    /// so the event loop knows the next frame has to be a full repaint.
+    needs_full_redraw: bool,
     /// Reusable `TraceMacros` for reloading trace data
     trace_macros: TraceMacros,
     /// Path of the currently loaded source file
@@ -928,6 +975,7 @@ impl App {
             status,
             error_message: None,
             pending_choice: None,
+            needs_full_redraw: false,
             trace_macros,
             file_path,
             module_path,
@@ -1512,16 +1560,25 @@ impl App {
             // Resuming from the ambiguity popup: the user already picked.
             Some(text) => TraceLookup::Found(text),
             None => {
-                let mut notified = false;
+                // `Cell` so the closure can record that it painted without borrowing
+                // `self`, which the lookup call already borrows.
+                let notified = std::cell::Cell::new(false);
                 let mut wait = || {
-                    if !notified {
-                        notified = true;
+                    if !notified.get() {
+                        notified.set(true);
                         draw_wait_notice(&name);
                     }
                     wait_cancelled()
                 };
-                self.expansion_cache
-                    .find_trace_for_tokens(&input, &arguments, &name, kind, &mut wait)
+                let lookup =
+                    self.expansion_cache
+                        .find_trace_for_tokens(&input, &arguments, &name, kind, &mut wait);
+                // The notice went straight to the terminal, so ratatui's buffer does
+                // not know that row changed and its diff would leave it on screen.
+                if notified.get() {
+                    self.needs_full_redraw = true;
+                }
+                lookup
             }
         };
         let expanded_text = match lookup {
@@ -1958,6 +2015,10 @@ impl App {
         // Mark node as expanded and store expanded content
         if let Some(node) = self.get_node_mut(node_id) {
             node.expanded = true;
+            // A previous attempt may have failed because the trace had not streamed in
+            // yet. Leaving the flag set kept the `!` marker on a node that is now
+            // expanded, and permanently excluded it from the derive-sibling retry.
+            node.expansion_failed = false;
             node.expanded_content = Some(expanded_content.clone());
             node.original_line_origins = replaced_origins;
             node.children_visible = true;
@@ -2633,6 +2694,10 @@ fn run_app(
     // clean quit and always restores the terminal.
     let result = (|| -> io::Result<()> {
         loop {
+            if app.needs_full_redraw {
+                app.needs_full_redraw = false;
+                terminal.clear()?;
+            }
             terminal.draw(|frame| ui(frame, &mut app))?;
 
             if event::poll(std::time::Duration::from_millis(100))? {
@@ -4305,13 +4370,29 @@ mod tests {
         ]);
         let both = ExpansionCache::distinct_candidates(&differing, &[0, 1]);
         assert_eq!(both.len(), 2);
-        // The label is the invocation as rustc reported it — what actually tells the
-        // colliding entries apart in the popup.
-        assert_eq!(both[0].label, "foo! { a }");
+        // The label summarises the *output*: for a bang macro `expanding` holds the
+        // input and for a derive the macro name, and a collision requires those to be
+        // equal — labelling with them gave every candidate the same text.
+        assert_eq!(both[0].label, "one");
+        assert_eq!(both[1].label, "two");
+        assert_ne!(both[0].label, both[1].label);
         assert_eq!(
             both.iter().map(|c| c.output.as_str()).collect::<Vec<_>>(),
             vec!["one", "two"]
         );
+    }
+
+    /// The first non-blank line is used, and a whitespace-only expansion still gets a
+    /// label rather than an empty row.
+    #[test]
+    fn candidate_labels_skip_blank_lines() {
+        let inner = cache_inner_of(vec![
+            bang_expansion("foo", "a", "\n\n   fn generated() {}\n"),
+            bang_expansion("foo", "a", "   \n"),
+        ]);
+        let candidates = ExpansionCache::distinct_candidates(&inner, &[0, 1]);
+        let labels: Vec<&str> = candidates.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(labels, ["fn generated() {}", "(empty expansion)"]);
     }
 
     #[test]
