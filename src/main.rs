@@ -95,6 +95,19 @@ struct MacroNode {
     /// used to restore their state on undo.
     /// Vec of (node_id, original_lines, line, line_end, item_line_end, derive_line)
     derive_sibling_snapshot: Vec<(usize, Vec<String>, usize, usize, usize, usize)>,
+    /// Identifies the derives of one `#[derive(A, B)]` on one item. Set to the id of
+    /// the group's first derive, so it is unique and — unlike a line number — never
+    /// moves. Matching siblings by line broke as soon as one of them was expanded and
+    /// left its line, which made an already-expanded derive look unexpanded and get
+    /// re-emitted in the remaining `#[derive(...)]`.
+    derive_group: usize,
+    /// True when this node's source text was swallowed by an enclosing expansion, so
+    /// its coordinates describe lines that no longer exist. Such nodes are hidden
+    /// rather than shifted: the enclosing expansion re-discovers them as children, and
+    /// applying a negative shift to them wrapped their line numbers past `usize::MAX`.
+    consumed: bool,
+    /// Nodes this expansion swallowed, un-hidden on undo.
+    consumed_ids: Vec<usize>,
     /// Nodes this expansion relocated onto its lifted tail, as they were beforehand.
     /// Undo restores them: reversing only the line shift left their columns rebased
     /// onto the tail line and their `original_lines` holding the tail's text, so they
@@ -904,6 +917,11 @@ fn build_root_nodes(source: &str, source_lines: &[String]) -> (Vec<MacroNode>, u
         .map(|m| m.item_line_end)
         .collect();
 
+    // Derives of one `#[derive(...)]` share an item, so group them by it — the group
+    // id is the first member's node id, which is unique and never shifts.
+    let mut derive_groups: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::new();
+
     // Create root-level nodes for each macro found
     for mac in macros {
         match mac.kind {
@@ -941,9 +959,16 @@ fn build_root_nodes(source: &str, source_lines: &[String]) -> (Vec<MacroNode>, u
             .unwrap_or(&[])
             .to_vec();
 
+        let derive_group = if mac.kind == MacroKind::Derive {
+            *derive_groups.entry(mac.item_line_end).or_insert(next_id)
+        } else {
+            next_id
+        };
+
         nodes.push(MacroNode {
             call: mac,
             id: next_id,
+            derive_group,
             parent_id: None,
             depth: 0,
             expanded: false,
@@ -955,6 +980,8 @@ fn build_root_nodes(source: &str, source_lines: &[String]) -> (Vec<MacroNode>, u
             derive_sibling_snapshot: Vec::new(),
             original_line_origins: Vec::new(),
             tail_relocation_snapshot: Vec::new(),
+            consumed: false,
+            consumed_ids: Vec::new(),
         });
         next_id += 1;
     }
@@ -1396,7 +1423,7 @@ impl App {
         let root_ids: Vec<usize> = self
             .nodes
             .iter()
-            .filter(|n| n.parent_id.is_none())
+            .filter(|n| n.parent_id.is_none() && !n.consumed)
             .map(|n| n.id)
             .collect();
 
@@ -1561,6 +1588,7 @@ impl App {
             depth,
             already_expanded,
             sibling_derives,
+            derive_group,
         ) = {
             let node = match self.get_node(node_id) {
                 Some(n) => n,
@@ -1579,6 +1607,7 @@ impl App {
                 node.depth,
                 node.expanded,
                 node.call.sibling_derives.clone(),
+                node.derive_group,
             )
         };
 
@@ -1766,7 +1795,7 @@ impl App {
                     let sibling_node = self.nodes.iter().find(|n| {
                         n.call.kind == MacroKind::Derive
                             && n.call.name == **d
-                            && n.call.line == line
+                            && n.derive_group == derive_group
                             && n.id != node_id
                     });
                     match sibling_node {
@@ -1786,9 +1815,10 @@ impl App {
         // `line` for a single-line call and from `line_end` for a multi-line one.
         // Other macros that sat in that fragment have to follow it.
         let mut tail_rebase: Option<(usize, usize, usize)> = None;
-        // Whether the derive branch appended a rescued item after the remaining
-        // `#[derive(...)]` line, which shifts where that line ends up.
-        let mut derive_tail_pushed = false;
+        // The item text the derive branch rescued from the attribute's own line, when
+        // an attribute and its item share a line. Non-empty shifts where the remaining
+        // `#[derive(...)]` line ends up, and it has to reach child discovery too.
+        let mut derive_tail = String::new();
 
         // For functional macros, replace only the macro call, keeping surrounding code
         let (formatted_lines, lines_removed) = if kind == MacroKind::Functional && line == line_end
@@ -1881,7 +1911,7 @@ impl App {
             let tail = attribute_tail(&last_removed, col_start);
             if !tail.is_empty() {
                 lines.push(format!("{}{}", base_indent_str, tail));
-                derive_tail_pushed = true;
+                derive_tail = tail;
             }
 
             // Only remove the #[derive(...)] attribute line(s), NOT the item
@@ -1916,6 +1946,13 @@ impl App {
                     base_indent_str,
                     remaining_derives.join(", ")
                 ));
+            }
+            // The item rescued off the attribute's own line is real code in the buffer
+            // now, so child macros inside it have to be discoverable — and it has to
+            // sit here in the same position as in `formatted_lines` for child line
+            // offsets to line up.
+            if !derive_tail.is_empty() {
+                parts.push(format!("{}{}", base_indent_str, derive_tail));
             }
             // Add remaining source lines between the attribute and the item end
             // (other attrs + the item body itself)
@@ -1980,11 +2017,32 @@ impl App {
             );
         }
 
+        // Nodes whose own line sat inside the range this expansion replaced describe
+        // text that no longer exists. Shifting them is meaningless and, when the
+        // expansion is shorter than what it replaced (an attribute macro that strips
+        // its item), the negative shift wrapped their line numbers past `usize::MAX` —
+        // after which `n` threw the cursor outside the buffer. Hide them instead; the
+        // expansion re-discovers whatever survived as children.
+        let mut consumed_ids: Vec<usize> = Vec::new();
+        let removed_end = line + lines_removed;
+        for node in &mut self.nodes {
+            if node.id != node_id
+                && !node.consumed
+                && node.call.line > line
+                && node.call.line < removed_end
+                && !tail_relocation.iter().any(|r| r.id == node.id)
+            {
+                node.consumed = true;
+                consumed_ids.push(node.id);
+            }
+        }
+
         // Update line numbers for all nodes that come after this line
         if lines_added != 0 {
             for node in &mut self.nodes {
                 if node.id != node_id
                     && node.call.line > line
+                    && !node.consumed
                     && !tail_relocation.iter().any(|r| r.id == node.id)
                 {
                     node.call.line = (node.call.line as isize + lines_added) as usize;
@@ -2010,7 +2068,7 @@ impl App {
             for node in &self.nodes {
                 if node.id != node_id
                     && node.call.kind == MacroKind::Derive
-                    && node.call.line == line
+                    && node.derive_group == derive_group
                     && !node.expanded
                 {
                     derive_sibling_snapshot.push((
@@ -2028,7 +2086,7 @@ impl App {
             for node in &mut self.nodes {
                 if node.id != node_id
                     && node.call.kind == MacroKind::Derive
-                    && node.call.line == line
+                    && node.derive_group == derive_group
                     && !node.expanded
                 {
                     if has_remaining_line {
@@ -2038,7 +2096,7 @@ impl App {
                         // remaining `#[derive(...)]` sits one line further up then.
                         let remaining_line_pos = line_idx + num_expanded_lines
                             - 1
-                            - usize::from(derive_tail_pushed); // 0-indexed
+                            - usize::from(!derive_tail.is_empty()); // 0-indexed
                         node.call.line = remaining_line_pos + 1; // 1-indexed
                         node.call.line_end = remaining_line_pos + 1;
                         // The surviving derives are rewritten onto this one line, so the
@@ -2066,6 +2124,7 @@ impl App {
             node.expanded_content = Some(expanded_content.clone());
             node.original_line_origins = replaced_origins;
             node.tail_relocation_snapshot = tail_relocation;
+            node.consumed_ids = consumed_ids;
             node.children_visible = true;
             node.derive_sibling_snapshot = derive_sibling_snapshot;
         }
@@ -2080,9 +2139,19 @@ impl App {
 
         // Create child nodes
         let mut child_ids = Vec::new();
+        // Same grouping as `build_root_nodes`, over the children of this expansion.
+        let mut child_derive_groups: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::new();
         for child_mac in child_macros {
             let child_id = self.next_id;
             self.next_id += 1;
+            let child_derive_group = if child_mac.kind == MacroKind::Derive {
+                *child_derive_groups
+                    .entry(child_mac.item_line_end)
+                    .or_insert(child_id)
+            } else {
+                child_id
+            };
 
             // Adjust child line number: account for the marker comment line at the start
             let adjusted_line = line + child_mac.line; // +1 for marker, child_mac.line is 1-based
@@ -2102,6 +2171,7 @@ impl App {
                 .collect();
 
             self.nodes.push(MacroNode {
+                derive_group: child_derive_group,
                 call: MacroCall {
                     name: child_mac.name,
                     kind: child_mac.kind,
@@ -2129,6 +2199,8 @@ impl App {
                 derive_sibling_snapshot: Vec::new(),
                 original_line_origins: Vec::new(),
                 tail_relocation_snapshot: Vec::new(),
+                consumed: false,
+                consumed_ids: Vec::new(),
             });
 
             child_ids.push(child_id);
@@ -2195,6 +2267,7 @@ impl App {
             derive_sibling_snapshot,
             original_line_origins,
             tail_relocation,
+            consumed_ids,
         ) = {
             let node = match self.get_node(node_id) {
                 Some(n) => n,
@@ -2209,6 +2282,7 @@ impl App {
                 node.derive_sibling_snapshot.clone(),
                 node.original_line_origins.clone(),
                 node.tail_relocation_snapshot.clone(),
+                node.consumed_ids.clone(),
             )
         };
 
@@ -2219,6 +2293,31 @@ impl App {
 
         // Compute actual line count accounting for expanded children
         let num_expanded_lines = self.actual_expanded_line_count(node_id);
+
+        // `actual_expanded_line_count` only walks descendants, so an expanded node that
+        // is *not* a descendant but sits inside this range — a sibling derive, or a
+        // macro relocated onto the lifted tail — is not counted, and undoing would
+        // remove the wrong number of lines and strand its output. Ask the user to
+        // collapse it first rather than corrupting the buffer.
+        let descendants = self.descendant_ids(node_id);
+        let blocker = self
+            .nodes
+            .iter()
+            .find(|n| {
+                n.expanded
+                    && n.id != node_id
+                    && !descendants.contains(&n.id)
+                    && n.call.line >= line
+                    && n.call.line < line + num_expanded_lines
+            })
+            .map(|n| n.call.name.clone());
+        if let Some(blocker) = blocker {
+            self.status = format!(
+                "Collapse '{}' first — it is expanded inside '{}'.",
+                blocker, name
+            );
+            return;
+        }
         let num_original_lines = original_lines.len().max(1);
         let lines_delta = num_expanded_lines as isize - num_original_lines as isize;
 
@@ -2249,6 +2348,7 @@ impl App {
             for node in &mut self.nodes {
                 if node.id != node_id
                     && node.call.line > line
+                    && !consumed_ids.contains(&node.id)
                     && !tail_relocation.iter().any(|r| r.id == node.id)
                 {
                     node.call.line = (node.call.line as isize - lines_delta) as usize;
@@ -2282,6 +2382,14 @@ impl App {
             }
         }
 
+        // The nodes this expansion swallowed are visible again, with the coordinates
+        // they never lost (they were excluded from both shift loops).
+        for id in &consumed_ids {
+            if let Some(node) = self.get_node_mut(*id) {
+                node.consumed = false;
+            }
+        }
+
         // Put back the nodes this expansion had relocated onto its lifted tail. Undoing
         // only the line shift left their columns rebased onto the tail and their
         // `original_lines` holding the tail's text, so they overlapped the macro they
@@ -2310,6 +2418,7 @@ impl App {
             node.derive_sibling_snapshot.clear();
             node.original_line_origins.clear();
             node.tail_relocation_snapshot.clear();
+            node.consumed_ids.clear();
         }
 
         self.rebuild_visible_nodes();
@@ -2334,6 +2443,22 @@ impl App {
         } else {
             self.expand_selected();
         }
+    }
+
+    /// Ids of every node below `parent_id`, at any depth.
+    fn descendant_ids(&self, parent_id: usize) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut stack: Vec<usize> = self
+            .get_node(parent_id)
+            .map(|n| n.children.clone())
+            .unwrap_or_default();
+        while let Some(id) = stack.pop() {
+            out.push(id);
+            if let Some(node) = self.get_node(id) {
+                stack.extend(node.children.iter().copied());
+            }
+        }
+        out
     }
 
     /// Recursively remove all descendant nodes
@@ -2429,6 +2554,11 @@ impl App {
                     saved.next_id = next_id;
                     saved.selected_idx = 0;
                     saved.list_state = ListState::default();
+                    // Without this the tree comes back with nothing highlighted until
+                    // the cursor moves.
+                    saved
+                        .list_state
+                        .select((!saved.visible_nodes.is_empty()).then_some(0));
                     saved.cursor_line = saved.cursor_line.min(saved.source_lines.len()).max(1);
                     saved.cursor_col = 0;
                     saved.scroll_offset = saved
@@ -3125,8 +3255,32 @@ fn ui(frame: &mut Frame, app: &mut App) {
         frame.render_widget(ratatui::widgets::Clear, popup_area);
 
         let inner_w = popup_width.saturating_sub(2) as usize;
+        let inner_h = popup_height.saturating_sub(2) as usize;
         let mut lines: Vec<Line> = Vec::new();
-        for (i, cand) in choice.candidates.iter().enumerate() {
+
+        // The list is windowed around the highlight and the preview always keeps a
+        // couple of rows: with many candidates an unwindowed list scrolled the
+        // highlight off the bottom (`Paragraph` does not scroll itself) and starved
+        // the preview of its entire budget.
+        let total = choice.candidates.len();
+        let list_rows = inner_h.saturating_sub(4).clamp(1, total.max(1)).min(total);
+        let first = choice
+            .selected
+            .saturating_sub(list_rows.saturating_sub(1))
+            .min(total.saturating_sub(list_rows));
+        if first > 0 {
+            lines.push(Line::from(Span::styled(
+                format!("  … {} above", first),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        for (i, cand) in choice
+            .candidates
+            .iter()
+            .enumerate()
+            .skip(first)
+            .take(list_rows)
+        {
             let selected = i == choice.selected;
             let marker = if selected { "> " } else { "  " };
             let style = if selected {
@@ -3136,27 +3290,32 @@ fn ui(frame: &mut Frame, app: &mut App) {
             };
             lines.push(Line::from(vec![
                 Span::styled(format!("{}{}. ", marker, i + 1), style),
-                Span::styled(
-                    fit_to_width(&cand.label, inner_w.saturating_sub(6)),
-                    style,
-                ),
+                Span::styled(fit_to_width(&cand.label, inner_w.saturating_sub(6)), style),
             ]));
+        }
+        let shown = first + list_rows;
+        if shown < total {
+            lines.push(Line::from(Span::styled(
+                format!("  … {} below", total - shown),
+                Style::default().fg(Color::DarkGray),
+            )));
         }
 
         // Preview of the highlighted candidate, so the labels alone don't have to
         // carry the decision.
         if let Some(cand) = choice.candidates.get(choice.selected) {
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                "expands to:",
-                Style::default().fg(Color::DarkGray),
-            )));
-            let budget = (popup_height as usize).saturating_sub(lines.len() + 3);
-            for text in cand.output.lines().take(budget) {
-                lines.push(Line::from(highlight_owned(
-                    &fit_to_width(text, inner_w),
-                    Style::default(),
+            let budget = inner_h.saturating_sub(lines.len() + 1);
+            if budget > 0 {
+                lines.push(Line::from(Span::styled(
+                    "expands to:",
+                    Style::default().fg(Color::DarkGray),
                 )));
+                for text in cand.output.lines().take(budget) {
+                    lines.push(Line::from(highlight_owned(
+                        &fit_to_width(text, inner_w),
+                        Style::default(),
+                    )));
+                }
             }
         }
 
@@ -3717,6 +3876,7 @@ mod tests {
                 sibling_derives: Vec::new(),
             },
             id: 0,
+            derive_group: 0,
             parent_id: None,
             depth: 0,
             expanded: false,
@@ -3728,6 +3888,8 @@ mod tests {
             derive_sibling_snapshot: Vec::new(),
             original_line_origins: Vec::new(),
             tail_relocation_snapshot: Vec::new(),
+            consumed: false,
+            consumed_ids: Vec::new(),
         }
     }
 
@@ -4008,6 +4170,36 @@ mod tests {
         // Ending exactly where the next starts is not an overlap.
         let kept = keep_outermost(vec![region(0, 5, 1), region(5, 5, 1)]);
         assert_eq!(kept.len(), 2);
+    }
+
+    /// The derives of one `#[derive(A, B)]` share a group, and derives on a different
+    /// item do not. Siblings used to be matched by line number, which broke as soon as
+    /// one of them was expanded and left its line — the expanded derive then looked
+    /// unexpanded and was re-emitted into the remaining `#[derive(...)]`.
+    #[test]
+    fn derives_of_one_attribute_share_a_group() {
+        let source = "\
+#[derive(Clone, Debug)]
+struct A;
+
+#[derive(Clone, Debug)]
+struct B;
+";
+        let source_lines: Vec<String> = source.lines().map(|s| s.to_string()).collect();
+        let (nodes, _) = build_root_nodes(source, &source_lines);
+
+        let derives: Vec<&MacroNode> = nodes
+            .iter()
+            .filter(|n| n.call.kind == MacroKind::Derive)
+            .collect();
+        assert_eq!(derives.len(), 4, "two derives on each of two items");
+
+        // Grouped by item, not by name and not by line.
+        assert_eq!(derives[0].derive_group, derives[1].derive_group);
+        assert_eq!(derives[2].derive_group, derives[3].derive_group);
+        assert_ne!(derives[0].derive_group, derives[2].derive_group);
+        // The group id is a node id, so it is stable and unique rather than a position.
+        assert_eq!(derives[0].derive_group, derives[0].id);
     }
 
     #[test]
