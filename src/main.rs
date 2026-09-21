@@ -2221,7 +2221,15 @@ impl App {
                 derive_group: child_derive_group,
                 call: MacroCall {
                     name: child_mac.name,
-                    krate: child_mac.krate,
+                    // `$crate::m!()` parses as a path rooted at the placeholder, which
+                    // would otherwise be reported as a crate literally named
+                    // `__macra_dollar_crate__`. `$crate` names the defining crate,
+                    // which the call site cannot know, so it qualifies nothing.
+                    krate: if child_mac.krate == DOLLAR_CRATE_PLACEHOLDER {
+                        String::new()
+                    } else {
+                        child_mac.krate
+                    },
                     kind: child_mac.kind,
                     line: adjusted_line,
                     col_start: child_mac.col_start,
