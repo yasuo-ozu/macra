@@ -149,6 +149,19 @@ impl TraceMacros {
     /// Hook-based expansions (proc-macros captured via `LD_PRELOAD`) are emitted
     /// immediately as the child process writes them.  Trace-macros expansions
     /// (from rustc's `-Z trace-macros`) are emitted after the child exits.
+    /// The rustc that `cargo` will drive, as reported by `rustc -vV`.
+    ///
+    /// Resolved through the same `PATH` and rustup settings cargo itself uses, so a
+    /// directory override or `RUSTUP_TOOLCHAIN` is honoured.
+    pub fn detect_rustc_version(&self) -> Option<crate::RustcVersion> {
+        let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+        let out = Command::new(rustc).arg("-vV").output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        crate::parse_rustc_version(&String::from_utf8_lossy(&out.stdout))
+    }
+
     pub fn run(&self) -> io::Result<TraceRun> {
         let mut cmd = Command::new(&self.cargo_path);
         cmd.arg("check");
@@ -184,8 +197,16 @@ impl TraceMacros {
         }
         rustflags.push_str("-Z trace-macros");
 
+        // The hook reinterprets rustc's internal macro table, so it may only be
+        // loaded into a compiler whose layout macra actually knows. On anything else
+        // it is left out entirely: `-Z trace-macros` still yields bang macros, which
+        // degrades the feature instead of aborting the build.
+        let abi = self
+            .detect_rustc_version()
+            .and_then(crate::bridge_abi_for);
+
         // Set up macra-hook via LD_PRELOAD if available
-        if !self.args.hook_lib.as_os_str().is_empty() {
+        if abi.is_some() && !self.args.hook_lib.as_os_str().is_empty() {
             let lib = self
                 .args
                 .hook_lib
@@ -237,6 +258,11 @@ impl TraceMacros {
             // On Windows (RUSTC_WRAPPER), rustc inherits the wrapper's stderr
             // handle via bInheritHandles=TRUE in CreateProcessW, so hook
             // output reaches cargo's stderr pipe just like on Linux/macOS.
+        }
+
+        if let Some(abi) = abi {
+            // Explicit handshake: the hook refuses to touch the table without it.
+            cmd.env("MACRA_ABI", abi.as_str());
         }
 
         cmd.env("RUSTFLAGS", rustflags);
