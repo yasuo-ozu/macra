@@ -372,6 +372,25 @@ pub fn bridge_abi_for(v: RustcVersion) -> Option<BridgeAbi> {
     }
 }
 
+/// Whether the rustc that will run the build is one macra has a bridge ABI for.
+///
+/// Proc-macro capture goes through the injected hook, and the hook only arms itself
+/// when [`bridge_abi_for`] recognises the compiler. On every other toolchain macra
+/// still reports `macro_rules!` expansions, but no proc-macro ones, so callers that
+/// assert on proc-macro output (the test suite) use this to skip rather than fail.
+pub fn proc_macro_capture_supported() -> bool {
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let Ok(out) = std::process::Command::new(rustc).arg("-vV").output() else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    parse_rustc_version(&String::from_utf8_lossy(&out.stdout))
+        .and_then(bridge_abi_for)
+        .is_some()
+}
+
 #[cfg(test)]
 mod abi_tests {
     use super::*;
@@ -379,11 +398,17 @@ mod abi_tests {
     #[test]
     fn parses_stable_and_prerelease_versions() {
         let stable = parse_rustc_version("rustc 1.90.0 (1159e78c4 2025-09-14)\n").unwrap();
-        assert_eq!((stable.major, stable.minor, stable.prerelease), (1, 90, false));
+        assert_eq!(
+            (stable.major, stable.minor, stable.prerelease),
+            (1, 90, false)
+        );
 
         let nightly =
             parse_rustc_version("rustc 1.100.0-nightly (cea272fa3 2026-09-07)\n").unwrap();
-        assert_eq!((nightly.major, nightly.minor, nightly.prerelease), (1, 100, true));
+        assert_eq!(
+            (nightly.major, nightly.minor, nightly.prerelease),
+            (1, 100, true)
+        );
 
         // `rustc -vV` puts the same first line above a details block.
         let verbose = parse_rustc_version("rustc 1.88.0 (abc 2025-06-01)\nbinary: rustc\n");
@@ -413,7 +438,11 @@ mod abi_tests {
         for minor in 86..=94 {
             let abi = bridge_abi_for(v(minor, false)).expect("1.{minor} is supported");
             assert_eq!(abi.table, TableLayout::ProcMacroEnum);
-            assert_eq!(abi.rpc, RpcTags::Nested, "1.{minor} predates the flattening");
+            assert_eq!(
+                abi.rpc,
+                RpcTags::Nested,
+                "1.{minor} predates the flattening"
+            );
         }
         for minor in 95..=97 {
             let abi = bridge_abi_for(v(minor, false)).expect("supported");
@@ -460,7 +489,14 @@ mod abi_tests {
                 to_string: 9
             })
         );
-        for junk in ["", "enum", "enum,flat", "enum,flat,9", "what,nested", "enum,nested,extra"] {
+        for junk in [
+            "",
+            "enum",
+            "enum,flat",
+            "enum,flat,9",
+            "what,nested",
+            "enum,nested,extra",
+        ] {
             assert_eq!(BridgeAbi::from_env(junk), None, "{junk:?} must not parse");
         }
     }
