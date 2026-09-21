@@ -141,7 +141,15 @@ fn main() {
         });
     }
 
-    // Rerun when hook/wrapper sources change
+    // Rerun when hook/wrapper sources change.
+    //
+    // `src` and the manifests matter too: the hook cdylib links the `cargo_macra`
+    // lib, so an edit to the ABI tables or the metadata scan otherwise leaves a
+    // stale hook embedded while the driver is current — the edit appears to have no
+    // effect at all.
     println!("cargo:rerun-if-changed=hook");
     println!("cargo:rerun-if-changed=rustc-wrapper");
+    println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-changed=Cargo.lock");
 }
