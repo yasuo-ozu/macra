@@ -314,8 +314,12 @@ pub fn parse_rustc_version(output: &str) -> Option<RustcVersion> {
 /// refuse, rather than guessing a layout and corrupting rustc's macro table.
 pub fn bridge_abi_for(v: RustcVersion) -> Option<BridgeAbi> {
     match (v.major, v.minor) {
-        (1, 86..=91) if !v.prerelease => Some(BridgeAbi::ProcMacroEnum),
-        (1, 100) => Some(BridgeAbi::ClientSliceOnly),
+        // Verified by CI across this whole range.
+        (1, 86..=91) => Some(BridgeAbi::ProcMacroEnum),
+        // The `ProcMacro` enum was replaced by a bare `&[Client]` somewhere in
+        // 1.92..=1.100; exactly where is unverified, so nothing in the gap selects a
+        // layout and those compilers simply get no hook.
+        (1, 100..) => Some(BridgeAbi::ClientSliceOnly),
         _ => None,
     }
 }
@@ -359,17 +363,30 @@ mod abi_tests {
                 "1.{minor} is covered by CI and must be supported"
             );
         }
+        // A beta or nightly of a supported version reads the same table.
         assert_eq!(
-            bridge_abi_for(v(100, true)),
-            Some(BridgeAbi::ClientSliceOnly)
+            bridge_abi_for(v(90, true)),
+            Some(BridgeAbi::ProcMacroEnum)
         );
+        // 1.100 onwards, including later releases that keep this layout.
+        for minor in [100, 101, 120] {
+            assert_eq!(
+                bridge_abi_for(v(minor, true)),
+                Some(BridgeAbi::ClientSliceOnly)
+            );
+        }
 
-        // Between the two known windows the layout changed without us verifying it.
-        assert_eq!(bridge_abi_for(v(96, false)), None);
-        assert_eq!(bridge_abi_for(v(92, false)), None);
+        // The layout changed somewhere in this gap and we have not verified where,
+        // so nothing in it selects a layout.
+        for minor in [92, 95, 96, 99] {
+            assert_eq!(
+                bridge_abi_for(v(minor, false)),
+                None,
+                "1.{minor} is unverified and must not guess a layout"
+            );
+        }
         assert_eq!(bridge_abi_for(v(85, false)), None);
-        // A pre-release of an otherwise-supported version is not the same compiler.
-        assert_eq!(bridge_abi_for(v(90, true)), None);
+        assert_eq!(bridge_abi_for(RustcVersion { major: 2, minor: 0, prerelease: false }), None);
     }
 
     #[test]

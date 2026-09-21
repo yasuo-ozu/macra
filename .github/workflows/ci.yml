@@ -30,6 +30,10 @@ jobs:
   test:
     name: Test ( ${{ matrix.os }} ${{ matrix.rust }})
     runs-on: ${{ matrix.os }}
+    # The hook reads rustc's internal proc-macro table, so a compiler change can
+    # break it. Nightly is tracked to find that out early, but it must not block a
+    # pull request when upstream moves.
+    continue-on-error: ${{ matrix.rust == 'nightly' }}
     strategy:
       fail-fast: false
       matrix:
@@ -45,6 +49,11 @@ jobs:
           - 1.89.0
           - 1.90.0
           - 1.91.0
+        include:
+          # One nightly job: an early warning that the bridge layout moved again,
+          # without multiplying it across every platform.
+          - os: ubuntu-latest
+            rust: nightly
     steps:
       - name: Checkout
         uses: actions/checkout@v6

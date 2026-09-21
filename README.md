@@ -33,8 +33,22 @@ context, which is useful for:
 
 | Category | Supported |
 | --- | --- |
-| rustc versions (CI) | `1.86.0`, `1.87.0`, `1.88.0`, `1.89.0`, `1.90.0`, `1.91.0` |
+| rustc versions (CI) | `1.86.0`, `1.87.0`, `1.88.0`, `1.89.0`, `1.90.0`, `1.91.0`, plus `nightly` (non-blocking) |
 | Platforms (CI) | `ubuntu-latest`, `windows-latest`, `macos-latest` (Apple Silicon), `macos-15-intel` (Intel) |
+
+### Proc-macro capture and the compiler
+
+Expanding `macro_rules!` macros only needs `-Z trace-macros`, so it works on any
+supported compiler. Capturing *procedural* macros additionally reads rustc's
+internal proc-macro table, which carries no stability guarantee and has already
+changed shape once: through 1.91 it is an enum holding each macro's name and kind
+inline, and from 1.100 it is a bare array of function pointers with the names moved
+into crate metadata.
+
+`cargo-macra` detects the compiler it will drive and selects the matching layout.
+On a version it has not been verified against it skips the hook entirely rather
+than guessing — `macro_rules!` expansions still work, proc macros are simply not
+captured. Versions between 1.92 and 1.99 are in that gap.
 
 ## Install
 
