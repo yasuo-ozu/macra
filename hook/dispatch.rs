@@ -46,57 +46,49 @@ const METHOD_TOKEN_STREAM: u8 = 0x01;
 const TS_FROM_STR: u8 = 0x04;
 const TS_TO_STRING: u8 = 0x05;
 
-/// Flat `ApiTags` indices used from rustc 1.100.
+/// The RPC tag encoding the running compiler uses.
 ///
-/// `with_api!` used to nest methods under a type (`TokenStream { .. }`), so a
-/// request began with a group tag and a method tag. It is now one flat list
-/// declared as `#[repr(u8)] enum ApiTags`, encoded as a single byte:
-///
-/// ```text
-/// 0 track_env_var  2 literal_from_str  4 ts_drop   6 ts_is_empty     8 ts_from_str
-/// 1 track_path     3 emit_diagnostic   5 ts_clone  7 ts_expand_expr  9 ts_to_string
-/// ```
-const FLAT_TS_FROM_STR: u8 = 8;
-const FLAT_TS_TO_STRING: u8 = 9;
-
-/// How the running compiler encodes an RPC request tag.
-fn flat_tags() -> bool {
-    matches!(
-        crate::types::selected_abi(),
-        Some(crate::types::TableAbi::ClientSlice)
-    )
+/// `with_api!` used to nest methods under a type, so a request began with a group
+/// byte and a method byte. From 1.95 it is one flat `#[repr(u8)] enum ApiTags`
+/// encoded as a single byte — and the indices within it shift as methods are added
+/// or removed, so cargo-macra passes the numbering rather than the hook assuming it.
+/// 1.95 through 1.99 put `ts_to_string` at 10; 1.100 removed a method, moving it
+/// to 9. Sending the wrong one invokes a different bridge method and panics rustc.
+fn rpc_tags() -> Option<cargo_macra::RpcTags> {
+    crate::types::selected_abi().map(|abi| abi.rpc)
 }
 
 /// Split a request into `(from_str, to_string)` predicates for the ABI in use.
 ///
-/// Older compilers prefix the tag with a group byte; newer ones do not, so the
-/// argument payload also starts one byte earlier.
+/// The nested encoding prefixes the tag with a group byte, so the argument payload
+/// also starts one byte later than in the flat form.
 fn classify_request(data: &[u8]) -> (bool, bool, usize) {
-    if flat_tags() {
-        let tag = data.first().copied();
-        (
-            tag == Some(FLAT_TS_FROM_STR),
-            tag == Some(FLAT_TS_TO_STRING),
-            1,
-        )
-    } else {
-        let group = data.first().copied();
-        let index = data.get(1).copied();
-        let is_ts = group == Some(METHOD_TOKEN_STREAM);
-        (
-            is_ts && index == Some(TS_FROM_STR),
-            is_ts && index == Some(TS_TO_STRING),
-            2,
-        )
+    match rpc_tags() {
+        Some(cargo_macra::RpcTags::Flat {
+            from_str,
+            to_string,
+        }) => {
+            let tag = data.first().copied();
+            (tag == Some(from_str), tag == Some(to_string), 1)
+        }
+        _ => {
+            let group = data.first().copied();
+            let index = data.get(1).copied();
+            let is_ts = group == Some(METHOD_TOKEN_STREAM);
+            (
+                is_ts && index == Some(TS_FROM_STR),
+                is_ts && index == Some(TS_TO_STRING),
+                2,
+            )
+        }
     }
 }
 
 /// Encode a `ts_to_string` request for the ABI in use.
 fn ts_to_string_request(handle: u32) -> Vec<u8> {
-    let mut request = if flat_tags() {
-        vec![FLAT_TS_TO_STRING]
-    } else {
-        vec![METHOD_TOKEN_STREAM, TS_TO_STRING]
+    let mut request = match rpc_tags() {
+        Some(cargo_macra::RpcTags::Flat { to_string, .. }) => vec![to_string],
+        _ => vec![METHOD_TOKEN_STREAM, TS_TO_STRING],
     };
     request.extend_from_slice(&handle.to_le_bytes());
     request

@@ -265,7 +265,7 @@ impl TraceMacros {
 
         if let Some(abi) = abi {
             // Explicit handshake: the hook refuses to touch the table without it.
-            cmd.env("MACRA_ABI", abi.as_str());
+            cmd.env("MACRA_ABI", abi.as_env());
         }
 
         cmd.env("RUSTFLAGS", rustflags);

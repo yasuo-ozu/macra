@@ -76,11 +76,11 @@ pub unsafe extern "C" fn dlsym(
 
     // result is a pointer to `static DECLS: &[ProcMacro]` (a thin pointer to a fat pointer).
     // Pass it to our interception logic which returns a pointer to a new fat pointer.
-    match abi {
-        crate::types::TableAbi::ProcMacroEnum => unsafe {
+    match abi.table {
+        cargo_macra::TableLayout::ProcMacroEnum => unsafe {
             trampoline::intercept_proc_macro_table(result)
         },
-        crate::types::TableAbi::ClientSlice => unsafe {
+        cargo_macra::TableLayout::ClientSlice => unsafe {
             trampoline::intercept_client_slice_table(result)
         },
     }

@@ -45,10 +45,22 @@ changed shape once: through 1.91 it is an enum holding each macro's name and kin
 inline, and from 1.100 it is a bare array of function pointers with the names moved
 into crate metadata.
 
-`cargo-macra` detects the compiler it will drive and selects the matching layout.
-On a version it has not been verified against it skips the hook entirely rather
-than guessing — `macro_rules!` expansions still work, proc macros are simply not
-captured. Versions between 1.92 and 1.99 are in that gap.
+Two things change independently, and both were established by probing each
+compiler rather than inferred:
+
+| rustc | decls table | bridge RPC tags |
+| --- | --- | --- |
+| 1.86 – 1.94 | `&[ProcMacro]` enum | nested, two bytes |
+| 1.95 – 1.97 | `&[ProcMacro]` enum | flat, `ts_to_string` = 10 |
+| 1.98 – 1.99 | `&[Client]` slice | flat, `ts_to_string` = 10 |
+| 1.100 | `&[Client]` slice | flat, `ts_to_string` = 9 |
+
+`cargo-macra` detects the compiler it will drive and selects the matching pair. On
+a version it has not been verified against it skips the hook entirely rather than
+guessing — `macro_rules!` expansions still work, proc macros are simply not
+captured. Guessing is not a safe default: the wrong table stride hands rustc
+garbage pointers and the wrong tag invokes the wrong bridge method, and both abort
+the compiler.
 
 ## Install
 

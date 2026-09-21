@@ -5,29 +5,15 @@
 use std::marker::PhantomData;
 use std::sync::atomic::AtomicU32;
 
-/// The decls table layouts this hook can read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TableAbi {
-    /// `&[ProcMacro]`, the enum carrying name and kind inline, with a two-pointer
-    /// `Client`. Up to rustc 1.91.
-    ProcMacroEnum,
-    /// `&[Client]`, one `run` pointer per macro. Names and kinds moved into crate
-    /// metadata; see `intercept_client_slice_table`. From rustc 1.100.
-    ClientSlice,
-}
-
-/// Which table layout cargo-macra told us to expect, if any.
+/// The bridge shape cargo-macra told us to expect, if any.
 ///
 /// `MACRA_ABI` is set only for compilers macra has been verified against, so an
-/// absent or unrecognised value means "do not touch the table". The layouts here
-/// mirror compiler internals with no stability guarantee, and reading the wrong
-/// one corrupts rustc rather than failing cleanly.
-pub fn selected_abi() -> Option<TableAbi> {
-    match std::env::var("MACRA_ABI").as_deref() {
-        Ok("proc-macro-enum") => Some(TableAbi::ProcMacroEnum),
-        Ok("client-slice-only") => Some(TableAbi::ClientSlice),
-        _ => None,
-    }
+/// absent or unparsable value means "do not touch the table". These layouts mirror
+/// compiler internals with no stability guarantee, and getting one wrong does not
+/// fail cleanly: the wrong table stride hands rustc garbage pointers, and the wrong
+/// RPC tag invokes the wrong bridge method. Both abort the compiler.
+pub fn selected_abi() -> Option<cargo_macra::BridgeAbi> {
+    cargo_macra::BridgeAbi::from_env(std::env::var("MACRA_ABI").ok()?.as_str())
 }
 
 /// Mirror of the 1.100 `proc_macro::bridge::client::Client`.
