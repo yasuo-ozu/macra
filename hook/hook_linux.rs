@@ -70,11 +70,18 @@ pub unsafe extern "C" fn dlsym(
     // compiler uses. Without the handshake the safe move is to hand rustc its own
     // pointer back untouched: guessing walks the table at the wrong stride and
     // aborts the compiler, which surfaces as an unrelated crate failing to build.
-    if !crate::types::abi_handshake_ok() {
+    let Some(abi) = crate::types::selected_abi() else {
         return result;
-    }
+    };
 
     // result is a pointer to `static DECLS: &[ProcMacro]` (a thin pointer to a fat pointer).
     // Pass it to our interception logic which returns a pointer to a new fat pointer.
-    unsafe { trampoline::intercept_proc_macro_table(result) }
+    match abi {
+        crate::types::TableAbi::ProcMacroEnum => unsafe {
+            trampoline::intercept_proc_macro_table(result)
+        },
+        crate::types::TableAbi::ClientSlice => unsafe {
+            trampoline::intercept_client_slice_table(result)
+        },
+    }
 }
