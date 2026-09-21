@@ -126,7 +126,7 @@ jobs:
             "== greet! ==",
             '"world"',
             "---",
-            'format! ("Hello, {}!", "world")'
+            'format!("Hello, {}!", "world")'
           )
 
           foreach ($snippet in $requiredSnippets) {
