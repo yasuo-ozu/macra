@@ -21,13 +21,31 @@ unsafe fn real_dlsym(handle: *mut libc::c_void, symbol: *const libc::c_char) -> 
         ) -> *mut libc::c_void;
     }
 
-    // First get the real dlsym via dlvsym
+    // First get the real dlsym via dlvsym.
+    //
+    // The version string is glibc's *baseline* for the architecture, and it differs
+    // per target: `GLIBC_2.2.5` is x86_64 only. Hard-coding it made `dlvsym` return
+    // null everywhere else, and since the failure falls through to returning null for
+    // *every* symbol, the hook broke all `dlsym` in the process — rustc could not load
+    // any dylib. Try the known baselines and use whichever resolves.
     let dlsym_name = c"dlsym".as_ptr();
-    let glibc_version = c"GLIBC_2.2.5".as_ptr();
+    const GLIBC_BASELINES: [&std::ffi::CStr; 7] = [
+        c"GLIBC_2.34",   // every arch, glibc >= 2.34 (dlsym moved into libc)
+        c"GLIBC_2.2.5",  // x86_64
+        c"GLIBC_2.17",   // aarch64, ppc64le
+        c"GLIBC_2.27",   // riscv64
+        c"GLIBC_2.4",    // arm
+        c"GLIBC_2.2",    // s390x
+        c"GLIBC_2.0",    // i686
+    ];
 
-    let real_dlsym_ptr = unsafe {
-        dlvsym(libc::RTLD_NEXT, dlsym_name, glibc_version)
-    };
+    let mut real_dlsym_ptr = std::ptr::null_mut();
+    for version in GLIBC_BASELINES {
+        real_dlsym_ptr = unsafe { dlvsym(libc::RTLD_NEXT, dlsym_name, version.as_ptr()) };
+        if !real_dlsym_ptr.is_null() {
+            break;
+        }
+    }
 
     if real_dlsym_ptr.is_null() {
         return std::ptr::null_mut();
@@ -71,6 +89,12 @@ pub unsafe extern "C" fn dlsym(
     // pointer back untouched: guessing walks the table at the wrong stride and
     // aborts the compiler, which surfaces as an unrelated crate failing to build.
     let Some(abi) = crate::types::selected_abi() else {
+        if std::env::var_os("MACRA_HOOK_DEBUG").is_some() {
+            eprintln!(
+                "[macra-hook] saw decls symbol but MACRA_ABI is {:?}",
+                std::env::var("MACRA_ABI")
+            );
+        }
         return result;
     };
 
