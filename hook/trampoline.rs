@@ -72,6 +72,10 @@ fn trampoline_impl(idx: usize, config: BridgeConfig<'_>) -> Buffer {
         }
     };
 
+    if debug_enabled() {
+        eprintln!("[macra-hook] expanding {name} ({kind})");
+    }
+
     // Extract input handle IDs from the input buffer before it's consumed
     let input_handles = extract_input_handles(config.input.as_slice(), &kind);
 
@@ -268,5 +272,155 @@ pub unsafe fn intercept_proc_macro_table(dlsym_result: *mut libc::c_void) -> *mu
     let fat_ptr_box: Box<&'static [ProcMacro]> = Box::new(leaked_table);
     let fat_ptr_ptr: *const &'static [ProcMacro] = Box::leak(fat_ptr_box);
 
+    fat_ptr_ptr as *mut libc::c_void
+}
+
+/// Whether `MACRA_HOOK_DEBUG` is set.
+///
+/// The hook runs inside rustc and can only report through stderr, so diagnosing a
+/// layout mismatch otherwise means guessing at which check bailed.
+fn debug_enabled() -> bool {
+    std::env::var_os("MACRA_HOOK_DEBUG").is_some()
+}
+
+/// The dylib containing `addr`, and the address it was loaded at.
+///
+/// Only `dladdr`'s file fields are used: the decls table points at
+/// `selfless_reify` wrappers, which rustc emits into `.symtab` but not `.dynsym`,
+/// so `dladdr` cannot name them. The symbols are read from the file instead.
+#[cfg(unix)]
+fn owning_dylib(addr: *const libc::c_void) -> Option<(std::path::PathBuf, usize)> {
+    use std::ffi::CStr;
+    let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+    if unsafe { libc::dladdr(addr, &mut info) } == 0 || info.dli_fname.is_null() {
+        return None;
+    }
+    let path = unsafe { CStr::from_ptr(info.dli_fname) }.to_str().ok()?;
+    Some((std::path::PathBuf::from(path), info.dli_fbase as usize))
+}
+
+/// Intercept a 1.100-style table: `&[Client]`, one `run` pointer per macro.
+///
+/// The names and kinds this hook reports are no longer in the table, so they are
+/// reconstructed from two independent sources and checked against each other: the
+/// function names come from the symbols the pointers resolve to, and the macro
+/// names and kinds from the dylib's `.rustc` metadata. If they disagree — which is
+/// what a metadata encoding change looks like — rustc gets its own pointer back
+/// untouched and macra reports no proc-macro expansions, rather than mislabelling
+/// them or corrupting the compiler.
+#[cfg(unix)]
+pub unsafe fn intercept_client_slice_table(dlsym_result: *mut libc::c_void) -> *mut libc::c_void {
+    use crate::types::ClientSlim;
+    use object::{Object, ObjectSection, ObjectSymbol};
+
+    let dbg = debug_enabled();
+    let fat_ptr_location = dlsym_result as *const &'static [ClientSlim];
+    let original_table: &'static [ClientSlim] = unsafe { fat_ptr_location.read() };
+    if original_table.is_empty() {
+        return dlsym_result;
+    }
+
+    // Every entry comes from the same dylib, so locate it once from the first.
+    let first = original_table[0].run as *const libc::c_void;
+    let Some((path, base)) = owning_dylib(first) else {
+        if dbg {
+            eprintln!("[macra-hook] dladdr gave no file for the decls table");
+        }
+        return dlsym_result;
+    };
+    let Ok(data) = std::fs::read(&path) else {
+        return dlsym_result;
+    };
+    let Ok(file) = object::File::parse(&*data) else {
+        return dlsym_result;
+    };
+
+    // Resolve each `run` pointer back to the function it wraps. Runtime addresses
+    // are the load base plus the file's virtual address.
+    let mut fn_names: Vec<String> = Vec::with_capacity(original_table.len());
+    for client in original_table.iter() {
+        let vaddr = (client.run as usize).wrapping_sub(base) as u64;
+        let Some(sym) = file
+            .symbols()
+            .find(|s| s.address() == vaddr)
+            .and_then(|s| s.name().ok())
+        else {
+            if dbg {
+                eprintln!("[macra-hook] no symbol at vaddr {vaddr:#x} in {path:?}");
+            }
+            return dlsym_result;
+        };
+        let demangled = rustc_demangle::demangle(sym).to_string();
+        let Some((name, _is_attr)) = cargo_macra::rustc_meta::fn_name_from_symbol(&demangled)
+        else {
+            if dbg {
+                eprintln!("[macra-hook] symbol is not a macro entry: {demangled}");
+            }
+            return dlsym_result;
+        };
+        fn_names.push(name);
+    }
+
+    // ELF names it `.rustc`; Mach-O carries it as `__rustc`.
+    let Some(meta) = file
+        .section_by_name(".rustc")
+        .or_else(|| file.section_by_name("__rustc"))
+        .and_then(|s| s.data().ok())
+    else {
+        if dbg {
+            eprintln!("[macra-hook] no .rustc section in {path:?}");
+        }
+        return dlsym_result;
+    };
+    // Validated inside: a bang or attribute macro must be invoked by its function's
+    // name, so a mismatch means the scan latched onto the wrong strings.
+    let Some(entries) = cargo_macra::rustc_meta::proc_macro_entries(meta, &fn_names) else {
+        if dbg {
+            eprintln!("[macra-hook] metadata scan rejected, fns={fn_names:?}");
+        }
+        return dlsym_result;
+    };
+
+    let mut slots = SLOTS.lock().unwrap();
+    let base_idx = slots.len();
+    if base_idx + original_table.len() > NUM_TRAMPOLINES {
+        eprintln!(
+            "[macra-hook] Too many proc macros ({} + {} > {}), skipping interception",
+            base_idx,
+            original_table.len(),
+            NUM_TRAMPOLINES
+        );
+        return dlsym_result;
+    }
+
+    let mut new_table: Vec<ClientSlim> = Vec::with_capacity(original_table.len());
+    for (i, client) in original_table.iter().enumerate() {
+        let slot_idx = base_idx + i;
+        while slots.len() <= slot_idx {
+            slots.push(None);
+        }
+        let entry = &entries[i];
+        slots[slot_idx] = Some(TrampolineSlot {
+            original_run: client.run,
+            name: entry.name.clone(),
+            // Same spellings the older layout reports, so the driver's matching is
+            // unchanged.
+            kind: match entry.kind {
+                cargo_macra::rustc_meta::KIND_DERIVE => "CustomDerive",
+                cargo_macra::rustc_meta::KIND_ATTR => "Attr",
+                _ => "Bang",
+            }
+            .to_string(),
+        });
+        new_table.push(ClientSlim {
+            run: TRAMPOLINE_FNS[slot_idx],
+        });
+    }
+    if dbg {
+        eprintln!("[macra-hook] intercepted {} macros: {entries:?}", entries.len());
+    }
+
+    let leaked_table: &'static [ClientSlim] = Box::leak(new_table.into_boxed_slice());
+    let fat_ptr_ptr: *const &'static [ClientSlim] = Box::leak(Box::new(leaked_table));
     fat_ptr_ptr as *mut libc::c_void
 }

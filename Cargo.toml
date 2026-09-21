@@ -15,7 +15,7 @@ authors = ["Yasuo Ozu <yasuo@ozu.email>"]
 
 [features]
 default = []
-hook = ["dep:libc", "dep:windows-sys"]
+hook = ["dep:libc", "dep:windows-sys", "dep:object", "dep:rustc-demangle"]
 rustc-wrapper = ["dep:windows-sys"]
 
 [workspace]
@@ -33,6 +33,10 @@ quote = "1.0.44"
 filetime = "0.2"
 cargo_metadata = "0.23"
 libc = { version = "0.2", optional = true }
+# Used only by the hook, to read a proc-macro dylib's `.rustc` section and to
+# demangle the symbols its decls table points at.
+object = { version = "0.39", optional = true, default-features = false, features = ["read", "std"] }
+rustc-demangle = { version = "0.1", optional = true }
 prettyplease = { version = "0.2", features = ["verbatim"] }
 unicode-width = "0.2"
 
