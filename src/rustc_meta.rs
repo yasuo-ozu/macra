@@ -132,6 +132,48 @@ fn validate(entries: Vec<ProcMacroEntry>, fn_names: &[String]) -> Option<Vec<Pro
     Some(entries)
 }
 
+/// The macro function's name, and whether it is an attribute macro, taken from a
+/// demangled table-entry symbol.
+///
+/// Each entry in the 1.100 decls table points at a `selfless_reify` wrapper whose
+/// symbol names the user's function, e.g.
+/// `…::wrapper::<…Buffer, <…Client>::expand1<krate::the_fn>::{closure#0}>`.
+/// `expand2` takes two token streams, so it is an attribute macro; `expand1` is a
+/// bang or a derive and only the metadata can say which.
+pub fn fn_name_from_symbol(demangled: &str) -> Option<(String, bool)> {
+    let (at, is_attr) = match (demangled.find("::expand1<"), demangled.find("::expand2<")) {
+        (Some(i), _) => (i + "::expand1<".len(), false),
+        (_, Some(i)) => (i + "::expand2<".len(), true),
+        _ => return None,
+    };
+    // Take the path up to the matching `>`, tracking nesting so a generic argument
+    // inside it cannot end the span early.
+    let rest = &demangled[at..];
+    let mut depth = 0usize;
+    let mut end = None;
+    for (i, c) in rest.char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' if depth == 0 => {
+                end = Some(i);
+                break;
+            }
+            '>' => depth -= 1,
+            _ => {}
+        }
+    }
+    let path = rest[..end?].trim();
+    let name = path.rsplit("::").next()?.trim();
+    // Guard against a closure or shim leaking through instead of a real function.
+    let first = name.as_bytes().first().copied()?;
+    if !(first == b'_' || first.is_ascii_alphabetic())
+        || !name.bytes().all(|b| b == b'_' || b.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    Some((name.to_string(), is_attr))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,6 +286,35 @@ mod tests {
         let got = proc_macro_entries(&bytes, &fns);
         println!("entries: {:#?}", got);
         assert!(got.is_some(), "scan failed on a real section");
+    }
+
+    /// Real symbols taken from a proc-macro dylib built with 1.100.0-nightly.
+    #[test]
+    fn reads_the_function_name_out_of_a_table_symbol() {
+        let bang = "proc_macro::bridge::selfless_reify::reify_to_extern_c_fn_hrt_bridge::\
+                    wrapper::<proc_macro::bridge::buffer::Buffer, \
+                    <proc_macro::bridge::client::Client>::expand1<probe::m1>::{closure#0}>";
+        assert_eq!(fn_name_from_symbol(bang), Some(("m1".to_string(), false)));
+
+        // `expand2` takes two token streams, so it is an attribute macro.
+        let attr = "proc_macro::bridge::selfless_reify::reify_to_extern_c_fn_hrt_bridge::\
+                    wrapper::<proc_macro::bridge::buffer::Buffer, \
+                    <proc_macro::bridge::client::Client>::expand2<probe::a1>::{closure#0}>";
+        assert_eq!(fn_name_from_symbol(attr), Some(("a1".to_string(), true)));
+
+        // A derive still reports its *function* name here; the trait name comes
+        // from the metadata scan.
+        let derive = "…::expand1<probe2::derive_ser>::{closure#0}>";
+        assert_eq!(
+            fn_name_from_symbol(derive),
+            Some(("derive_ser".to_string(), false))
+        );
+
+        // Unrelated symbols must not be mistaken for entries.
+        assert_eq!(fn_name_from_symbol("core::ptr::drop_in_place<Foo>"), None);
+        assert_eq!(fn_name_from_symbol(""), None);
+        // Truncated generic span.
+        assert_eq!(fn_name_from_symbol("x::expand1<probe::m1"), None);
     }
 
     #[test]
