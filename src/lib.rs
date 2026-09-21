@@ -349,21 +349,25 @@ pub fn parse_rustc_version(output: &str) -> Option<RustcVersion> {
 /// rustc garbage pointers and the wrong tag numbering invokes the wrong bridge
 /// method, and both abort the compiler.
 pub fn bridge_abi_for(v: RustcVersion) -> Option<BridgeAbi> {
-    // The 1.95 flattening kept these indices; 1.100 removed a method and shifted them.
+    // The 1.95 flattening kept these indices. 1.100 removed a bridge method and
+    // shifted them to 8/9; that is recorded in the table in `RpcTags` but unused
+    // while 1.98+ is unmapped.
     const FLAT_95: RpcTags = RpcTags::Flat {
         from_str: 9,
         to_string: 10,
-    };
-    const FLAT_100: RpcTags = RpcTags::Flat {
-        from_str: 8,
-        to_string: 9,
     };
     let abi = |table, rpc| Some(BridgeAbi { table, rpc });
     match (v.major, v.minor) {
         (1, 86..=94) => abi(TableLayout::ProcMacroEnum, RpcTags::Nested),
         (1, 95..=97) => abi(TableLayout::ProcMacroEnum, FLAT_95),
-        (1, 98..=99) => abi(TableLayout::ClientSlice, FLAT_95),
-        (1, 100) => abi(TableLayout::ClientSlice, FLAT_100),
+        // 1.98 onwards moved macro names and kinds out of the table into crate
+        // metadata, and recovering them from there is not trustworthy yet: the scan
+        // in `rustc_meta` cannot tell a derive's trait name from an identifier in a
+        // crate attribute, so `#![cfg_attr(docsrs, ..)]` alone makes it report
+        // `docsrs` as a derive and drop a real one. Only bang and attribute names are
+        // validated against the symbol table; derives are unchecked, which is exactly
+        // the common case. Until that is fixed these compilers get no hook: losing
+        // proc-macro capture is recoverable, showing the wrong macro name is not.
         _ => None,
     }
 }
@@ -403,10 +407,6 @@ mod abi_tests {
             from_str: 9,
             to_string: 10,
         };
-        let flat_100 = RpcTags::Flat {
-            from_str: 8,
-            to_string: 9,
-        };
 
         // The table stayed an enum through 1.97, but 1.95 flattened the RPC tags —
         // the two move independently, which is why they are tracked separately.
@@ -420,23 +420,16 @@ mod abi_tests {
             assert_eq!(abi.table, TableLayout::ProcMacroEnum);
             assert_eq!(abi.rpc, flat_95);
         }
-        // 1.98 changed the table while keeping 1.95's tag numbering. Sending
-        // 1.100's numbering here invokes the wrong bridge method and panics rustc.
-        for minor in 98..=99 {
-            let abi = bridge_abi_for(v(minor, false)).expect("supported");
-            assert_eq!(abi.table, TableLayout::ClientSlice);
-            assert_eq!(abi.rpc, flat_95);
+        // 1.98 onwards is deliberately unsupported: its table carries no names, and
+        // recovering them from crate metadata mislabels derives (see `bridge_abi_for`).
+        for minor in [98, 99, 100, 101] {
+            assert_eq!(
+                bridge_abi_for(v(minor, false)),
+                None,
+                "1.{minor} must not select an ABI while the metadata scan is unsound"
+            );
+            assert_eq!(bridge_abi_for(v(minor, true)), None);
         }
-        let abi = bridge_abi_for(v(100, true)).expect("supported");
-        assert_eq!(abi.table, TableLayout::ClientSlice);
-        assert_eq!(abi.rpc, flat_100);
-
-        // A beta or nightly of a verified version reads the same bridge as its
-        // release: 1.99.0-beta was probed directly.
-        assert_eq!(bridge_abi_for(v(99, true)), bridge_abi_for(v(99, false)));
-
-        // Nothing outside the probed range guesses.
-        assert_eq!(bridge_abi_for(v(101, true)), None);
         assert_eq!(bridge_abi_for(v(85, false)), None);
         assert_eq!(
             bridge_abi_for(RustcVersion {
@@ -450,7 +443,7 @@ mod abi_tests {
 
     #[test]
     fn abi_round_trips_through_the_handshake() {
-        for minor in [86, 95, 98, 100] {
+        for minor in [86, 95, 97] {
             let abi = bridge_abi_for(RustcVersion {
                 major: 1,
                 minor,

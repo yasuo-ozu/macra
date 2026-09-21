@@ -41,19 +41,25 @@ context, which is useful for:
 Expanding `macro_rules!` macros only needs `-Z trace-macros`, so it works on any
 supported compiler. Capturing *procedural* macros additionally reads rustc's
 internal proc-macro table, which carries no stability guarantee and has already
-changed shape once: through 1.91 it is an enum holding each macro's name and kind
-inline, and from 1.100 it is a bare array of function pointers with the names moved
+changed shape: through 1.97 it is an enum holding each macro's name and kind
+inline, and from 1.98 it is a bare array of function pointers with the names moved
 into crate metadata.
+
+Proc-macro capture therefore covers **1.86 through 1.97**. On 1.98 and later the
+names would have to be recovered from crate metadata, which is not reliable enough
+to ship — an ordinary crate attribute such as `#![cfg_attr(docsrs, ..)]` is
+indistinguishable from a derive name there — so those compilers get no hook and
+`macro_rules!` expansion only.
 
 Two things change independently, and both were established by probing each
 compiler rather than inferred:
 
-| rustc | decls table | bridge RPC tags |
-| --- | --- | --- |
-| 1.86 – 1.94 | `&[ProcMacro]` enum | nested, two bytes |
-| 1.95 – 1.97 | `&[ProcMacro]` enum | flat, `ts_to_string` = 10 |
-| 1.98 – 1.99 | `&[Client]` slice | flat, `ts_to_string` = 10 |
-| 1.100 | `&[Client]` slice | flat, `ts_to_string` = 9 |
+| rustc | decls table | bridge RPC tags | proc-macro capture |
+| --- | --- | --- | --- |
+| 1.86 – 1.94 | `&[ProcMacro]` enum | nested, two bytes | yes |
+| 1.95 – 1.97 | `&[ProcMacro]` enum | flat, `ts_to_string` = 10 | yes |
+| 1.98 – 1.99 | `&[Client]` slice | flat, `ts_to_string` = 10 | no |
+| 1.100 | `&[Client]` slice | flat, `ts_to_string` = 9 | no |
 
 `cargo-macra` detects the compiler it will drive and selects the matching pair. On
 a version it has not been verified against it skips the hook entirely rather than
