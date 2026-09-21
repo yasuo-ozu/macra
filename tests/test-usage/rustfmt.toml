@@ -1,0 +1,4 @@
+# `MultiDeriveTwoAttr` carries two separate `#[derive]` attributes on purpose: the
+# tests check that expanding the first leaves the second in the input. The default
+# `merge_derives` collapses them into one and silently deletes that case.
+merge_derives = false
