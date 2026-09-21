@@ -11,6 +11,9 @@ pub const HOOK_LINE_PREFIX: &str = "__MACRA_HOOK__:";
 #[derive(Serialize)]
 pub struct ExpansionRecord {
     pub name: String,
+    /// Crate that defines the macro, kept separate from `name` so every existing
+    /// comparison against a bare macro name keeps working.
+    pub krate: String,
     pub kind: String,
     pub arguments: String,
     pub input: String,

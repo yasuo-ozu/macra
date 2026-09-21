@@ -132,15 +132,15 @@ fn validate(entries: Vec<ProcMacroEntry>, fn_names: &[String]) -> Option<Vec<Pro
     Some(entries)
 }
 
-/// The macro function's name, and whether it is an attribute macro, taken from a
-/// demangled table-entry symbol.
+/// The defining crate, the macro function's name, and whether it is an attribute
+/// macro, taken from a demangled table-entry symbol.
 ///
 /// Each entry in the 1.100 decls table points at a `selfless_reify` wrapper whose
 /// symbol names the user's function, e.g.
 /// `…::wrapper::<…Buffer, <…Client>::expand1<krate::the_fn>::{closure#0}>`.
 /// `expand2` takes two token streams, so it is an attribute macro; `expand1` is a
 /// bang or a derive and only the metadata can say which.
-pub fn fn_name_from_symbol(demangled: &str) -> Option<(String, bool)> {
+pub fn fn_name_from_symbol(demangled: &str) -> Option<(String, String, bool)> {
     let (at, is_attr) = match (demangled.find("::expand1<"), demangled.find("::expand2<")) {
         (Some(i), _) => (i + "::expand1<".len(), false),
         (_, Some(i)) => (i + "::expand2<".len(), true),
@@ -163,15 +163,70 @@ pub fn fn_name_from_symbol(demangled: &str) -> Option<(String, bool)> {
         }
     }
     let path = rest[..end?].trim();
-    let name = path.rsplit("::").next()?.trim();
-    // Guard against a closure or shim leaking through instead of a real function.
-    let first = name.as_bytes().first().copied()?;
-    if !(first == b'_' || first.is_ascii_alphabetic())
-        || !name.bytes().all(|b| b == b'_' || b.is_ascii_alphanumeric())
-    {
+    // A proc macro must be declared at its crate's root, so the path is always
+    // `krate::function` — which makes the defining crate recoverable even though the
+    // decls table and the metadata both record bare names.
+    // v0 mangling carries a crate disambiguator, so a segment demangles as
+    // `probe2[7119de0192789d9]`; the hash is not part of the name.
+    fn strip_disambiguator(seg: &str) -> &str {
+        seg.split('[').next().unwrap_or(seg).trim()
+    }
+    let mut segments = path.rsplit("::");
+    let name = strip_disambiguator(segments.next()?);
+    let krate = strip_disambiguator(segments.next().unwrap_or(""));
+    let plausible = |s: &str| {
+        s.as_bytes()
+            .first()
+            .is_some_and(|b| *b == b'_' || b.is_ascii_alphabetic())
+            && s.bytes().all(|b| b == b'_' || b.is_ascii_alphanumeric())
+    };
+    if !plausible(name) || (!krate.is_empty() && !plausible(krate)) {
         return None;
     }
-    Some((name.to_string(), is_attr))
+    Some((krate.to_string(), name.to_string(), is_attr))
+}
+
+/// The crate name in a proc-macro dylib's file name, e.g. `libserde_derive-9f3.so`.
+///
+/// Needed because only v0 mangling keeps the generic arguments that name the macro
+/// function; a toolchain using the legacy scheme emits bare
+/// `…::wrapper::h47303a70604cc30b` symbols with the crate erased. The file name is
+/// the one place it survives on every toolchain.
+pub fn crate_from_dylib_name(file_name: &str) -> Option<String> {
+    let stem = file_name
+        .rsplit_once('.')
+        .map(|(stem, _ext)| stem)
+        .unwrap_or(file_name);
+    let stem = stem.strip_prefix("lib").unwrap_or(stem);
+    // Cargo appends `-<metadata hash>`; the crate name itself may contain `_` but
+    // never `-`, so the last such segment is the hash.
+    let name = match stem.rsplit_once('-') {
+        Some((name, hash)) if !hash.is_empty() && hash.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            name
+        }
+        _ => stem,
+    };
+    let plausible = name
+        .bytes()
+        .next()
+        .is_some_and(|b| b == b'_' || b.is_ascii_alphabetic())
+        && name.bytes().all(|b| b == b'_' || b.is_ascii_alphanumeric());
+    plausible.then(|| name.to_string())
+}
+
+/// Qualify a macro name with the crate that defines it, as `krate::Name`.
+///
+/// The existing matcher compares only the last segment, so this adds information
+/// without changing what matches. It is deliberately *not* used to require a crate
+/// match: a derive is routinely invoked through a re-export, as
+/// `#[derive(serde::Serialize)]` for a macro that lives in `serde_derive`, so the
+/// path written in source need not name the defining crate at all.
+pub fn qualified(krate: &str, name: &str) -> String {
+    if krate.is_empty() {
+        name.to_string()
+    } else {
+        format!("{krate}::{name}")
+    }
 }
 
 #[cfg(test)]
@@ -294,21 +349,66 @@ mod tests {
         let bang = "proc_macro::bridge::selfless_reify::reify_to_extern_c_fn_hrt_bridge::\
                     wrapper::<proc_macro::bridge::buffer::Buffer, \
                     <proc_macro::bridge::client::Client>::expand1<probe::m1>::{closure#0}>";
-        assert_eq!(fn_name_from_symbol(bang), Some(("m1".to_string(), false)));
+        assert_eq!(
+            fn_name_from_symbol(bang),
+            Some(("probe".to_string(), "m1".to_string(), false))
+        );
 
         // `expand2` takes two token streams, so it is an attribute macro.
         let attr = "proc_macro::bridge::selfless_reify::reify_to_extern_c_fn_hrt_bridge::\
                     wrapper::<proc_macro::bridge::buffer::Buffer, \
                     <proc_macro::bridge::client::Client>::expand2<probe::a1>::{closure#0}>";
-        assert_eq!(fn_name_from_symbol(attr), Some(("a1".to_string(), true)));
+        assert_eq!(
+            fn_name_from_symbol(attr),
+            Some(("probe".to_string(), "a1".to_string(), true))
+        );
 
         // A derive still reports its *function* name here; the trait name comes
         // from the metadata scan.
         let derive = "…::expand1<probe2::derive_ser>::{closure#0}>";
         assert_eq!(
             fn_name_from_symbol(derive),
-            Some(("derive_ser".to_string(), false))
+            Some(("probe2".to_string(), "derive_ser".to_string(), false))
         );
+        // A derive reached through a re-export still reports the crate that defines
+        // it, which is why the crate is informational rather than a match condition.
+        assert_eq!(qualified("probe2", "SerializeLike"), "probe2::SerializeLike");
+        assert_eq!(qualified("", "SerializeLike"), "SerializeLike");
+
+        // Real `rustc_demangle` output carries crate disambiguators, which are not
+        // part of the crate or function name.
+        let hashed = "proc_macro[602e4fb18ec88a0a]::bridge::selfless_reify::\
+                      reify_to_extern_c_fn_hrt_bridge::wrapper::<…, \
+                      <proc_macro[602e4fb18ec88a0a]::bridge::client::Client>::\
+                      expand1<probe2[7119de0192789d9]::bang_one>::{closure#0}>";
+        assert_eq!(
+            fn_name_from_symbol(hashed),
+            Some(("probe2".to_string(), "bang_one".to_string(), false))
+        );
+
+        // Legacy mangling drops the generic arguments entirely, so the crate has to
+        // come from the file name instead.
+        assert_eq!(
+            fn_name_from_symbol(
+                "proc_macro::bridge::selfless_reify::reify_to_extern_c_fn_hrt_bridge::\
+                 wrapper::h47303a70604cc30b"
+            ),
+            None
+        );
+        assert_eq!(
+            crate_from_dylib_name("libprobe2-c3da34014c3bf847.so").as_deref(),
+            Some("probe2")
+        );
+        assert_eq!(
+            crate_from_dylib_name("libserde_derive-9f3ab.so").as_deref(),
+            Some("serde_derive")
+        );
+        // A dylib without cargo's hash suffix, and one that is not a crate at all.
+        assert_eq!(
+            crate_from_dylib_name("libprobe2.so").as_deref(),
+            Some("probe2")
+        );
+        assert_eq!(crate_from_dylib_name("lib-.so"), None);
 
         // Unrelated symbols must not be mistaken for entries.
         assert_eq!(fn_name_from_symbol("core::ptr::drop_in_place<Foo>"), None);

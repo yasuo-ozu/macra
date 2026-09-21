@@ -462,13 +462,19 @@ impl ExpansionCache {
             if candidates.iter().any(|c| c.output == exp.to) {
                 continue;
             }
-            let label = exp
+            let summary = exp
                 .to
                 .lines()
                 .map(str::trim)
                 .find(|l| !l.is_empty())
-                .unwrap_or("(empty expansion)")
-                .to_string();
+                .unwrap_or("(empty expansion)");
+            // Naming the defining crate is usually what tells two colliding macros
+            // apart — the same derive name coming from two different crates.
+            let label = if exp.krate.is_empty() {
+                summary.to_string()
+            } else {
+                format!("[{}] {}", exp.krate, summary)
+            };
             candidates.push(TraceCandidate {
                 label,
                 output: exp.to.clone(),
@@ -4478,6 +4484,7 @@ struct B;
     #[test]
     fn expansion_matches_falls_back_for_truncated_bang_input() {
         let exp = MacroExpansion {
+            krate: String::new(),
             expanding: "impl_char!".to_string(),
             arguments: String::new(),
             to: "impl ...".to_string(),
@@ -4500,6 +4507,7 @@ struct B;
     #[test]
     fn expansion_matches_keeps_strict_input_when_present() {
         let exp = MacroExpansion {
+            krate: String::new(),
             expanding: "foo! { a }".to_string(),
             arguments: String::new(),
             to: "b".to_string(),
@@ -4524,6 +4532,7 @@ struct B;
         // rustc normalizes `mystruct_hello!()` to `mystruct_hello! { }` in trace,
         // so expanding doesn't end with `!`. Both inputs are empty → should match.
         let exp = MacroExpansion {
+            krate: String::new(),
             expanding: "mystruct_hello! { }".to_string(),
             arguments: String::new(),
             to: "println!(\"hello\");".to_string(),
@@ -4549,6 +4558,7 @@ struct B;
     #[test]
     fn attribute_input_is_compared_strictly_first_then_ignored() {
         let exp = MacroExpansion {
+            krate: String::new(),
             expanding: "#[my_attr] fn a() {}".to_string(),
             arguments: String::new(),
             to: "fn a() {}".to_string(),
@@ -4578,6 +4588,7 @@ struct B;
 
     fn bang_expansion(name: &str, input: &str, to: &str) -> MacroExpansion {
         MacroExpansion {
+            krate: String::new(),
             expanding: format!("{}! {{ {} }}", name, input),
             arguments: String::new(),
             to: to.to_string(),
@@ -4679,6 +4690,19 @@ struct B;
         assert_eq!(both[0].label, "one");
         assert_eq!(both[1].label, "two");
         assert_ne!(both[0].label, both[1].label);
+
+        // When the defining crate is known it leads the label, which is what
+        // actually distinguishes a collision between two same-named derives.
+        let mut from_crates = cache_inner_of(vec![
+            bang_expansion("foo", "a", "same text"),
+            bang_expansion("foo", "a", "same text"),
+        ]);
+        from_crates.expansions[0].krate = "alpha".to_string();
+        from_crates.expansions[1].krate = "beta".to_string();
+        let labelled = ExpansionCache::distinct_candidates(&from_crates, &[0, 1]);
+        // Identical output still collapses: the crate is shown, not matched on.
+        assert_eq!(labelled.len(), 1);
+        assert_eq!(labelled[0].label, "[alpha] same text");
         assert_eq!(
             both.iter().map(|c| c.output.as_str()).collect::<Vec<_>>(),
             vec!["one", "two"]
@@ -4738,6 +4762,7 @@ struct B;
         // Proc-macro crates like decycle generate mangled helper macros
         // (e.g. `__Parse_temporal_<hash>!`). Relaxed matching should find them.
         let exp = MacroExpansion {
+            krate: String::new(),
             expanding: "__Parse_temporal_9874485626140785372! { args }".to_string(),
             arguments: String::new(),
             to: "expanded".to_string(),
@@ -4760,6 +4785,7 @@ struct B;
         // or `Parse` silently expands `__Parser_<hash>`.
         assert!(!ExpansionCache::expansion_matches(
             &MacroExpansion {
+                krate: String::new(),
                 name: "__Parser_9874485626140785372".to_string(),
                 ..exp.clone()
             },
