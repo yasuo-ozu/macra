@@ -605,8 +605,15 @@ impl ExpansionCache {
                 }
                 // Rescan from the start: the watermark would exclude the hits found
                 // above, and every candidate has to be considered together.
-                let hits =
-                    Self::search_expansions(&inner, input, &norm_input, &norm_arguments, name, kind, 0);
+                let hits = Self::search_expansions(
+                    &inner,
+                    input,
+                    &norm_input,
+                    &norm_arguments,
+                    name,
+                    kind,
+                    0,
+                );
                 let mut candidates = Self::distinct_candidates(&inner, &hits);
                 return match candidates.len() {
                     // Unreachable: entries are only ever appended, so the hits found
@@ -1579,7 +1586,6 @@ impl App {
     /// Expand `node_id`, either resolving the trace now or using one the user already
     /// picked out of an ambiguity popup.
     fn expand_node(&mut self, node_id: usize, chosen: Option<String>) {
-
         // Get node info
         let (
             name,
@@ -1640,9 +1646,9 @@ impl App {
                     }
                     wait_cancelled()
                 };
-                let lookup =
-                    self.expansion_cache
-                        .find_trace_for_tokens(&input, &arguments, &name, kind, &mut wait);
+                let lookup = self
+                    .expansion_cache
+                    .find_trace_for_tokens(&input, &arguments, &name, kind, &mut wait);
                 // The notice went straight to the terminal, so ratatui's buffer does
                 // not know that row changed and its diff would leave it on screen.
                 if notified.get() {
@@ -2058,8 +2064,7 @@ impl App {
                     // `derive_line` keys the column span of derive nodes and can differ
                     // from `line` for a multi-line `#[derive(...)]`; leaving it behind
                     // silently breaks h/l stepping and the selection highlight.
-                    node.call.derive_line =
-                        (node.call.derive_line as isize + lines_added) as usize;
+                    node.call.derive_line = (node.call.derive_line as isize + lines_added) as usize;
                 }
             }
         }
@@ -2361,8 +2366,7 @@ impl App {
                     node.call.line_end = (node.call.line_end as isize - lines_delta) as usize;
                     node.call.item_line_end =
                         (node.call.item_line_end as isize - lines_delta) as usize;
-                    node.call.derive_line =
-                        (node.call.derive_line as isize - lines_delta) as usize;
+                    node.call.derive_line = (node.call.derive_line as isize - lines_delta) as usize;
                 }
             }
         }
@@ -3227,8 +3231,8 @@ fn ui(frame: &mut Frame, app: &mut App) {
 
     // `source_lines` already starts at the viewport's first display row and holds at
     // most one screenful, so the widget needs no scroll of its own.
-    let paragraph = Paragraph::new(source_lines)
-        .block(Block::default().borders(Borders::ALL).title(title));
+    let paragraph =
+        Paragraph::new(source_lines).block(Block::default().borders(Borders::ALL).title(title));
 
     frame.render_widget(paragraph, main_chunks[1]);
 
@@ -3993,9 +3997,8 @@ mod tests {
     fn split_block_rows_all_have_the_same_width() {
         use unicode_width::UnicodeWidthStr;
 
-        let row_width = |line: &Line<'static>| -> usize {
-            line.spans.iter().map(|s| s.content.width()).sum()
-        };
+        let row_width =
+            |line: &Line<'static>| -> usize { line.spans.iter().map(|s| s.content.width()).sum() };
 
         for content_w in [20usize, 41, 80, 81] {
             let mut out = Vec::new();
@@ -4118,10 +4121,7 @@ mod tests {
     #[test]
     fn attribute_tail_rescues_an_item_sharing_the_attribute_line() {
         // Column 9 is inside `Debug`.
-        assert_eq!(
-            attribute_tail("#[derive(Debug)] struct S;", 9),
-            "struct S;"
-        );
+        assert_eq!(attribute_tail("#[derive(Debug)] struct S;", 9), "struct S;");
         // Nested brackets must not end the attribute early.
         assert_eq!(
             attribute_tail("#[derive(Debug)] struct S([u8; 4]);", 9),
@@ -4748,7 +4748,10 @@ struct B;
             stdout: String::new(),
             stderr: String::new(),
         };
-        assert_eq!(ExpansionCache::check_result_to_build_error(Ok(Ok(ok))), None);
+        assert_eq!(
+            ExpansionCache::check_result_to_build_error(Ok(Ok(ok))),
+            None
+        );
         assert_eq!(
             ExpansionCache::check_result_to_build_error(Err(std::sync::mpsc::RecvError)),
             None

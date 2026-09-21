@@ -90,7 +90,10 @@ fn main() {
         panic!("cargo build --example macra-hook failed");
     }
 
-    let built_lib = hook_target_dir.join(&profile).join("examples").join(lib_name);
+    let built_lib = hook_target_dir
+        .join(&profile)
+        .join("examples")
+        .join(lib_name);
     let dest = Path::new(&out_dir).join(lib_name);
 
     std::fs::copy(&built_lib, &dest).unwrap_or_else(|e| {

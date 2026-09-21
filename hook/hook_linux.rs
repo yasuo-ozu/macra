@@ -30,13 +30,13 @@ unsafe fn real_dlsym(handle: *mut libc::c_void, symbol: *const libc::c_char) -> 
     // any dylib. Try the known baselines and use whichever resolves.
     let dlsym_name = c"dlsym".as_ptr();
     const GLIBC_BASELINES: [&std::ffi::CStr; 7] = [
-        c"GLIBC_2.34",   // every arch, glibc >= 2.34 (dlsym moved into libc)
-        c"GLIBC_2.2.5",  // x86_64
-        c"GLIBC_2.17",   // aarch64, ppc64le
-        c"GLIBC_2.27",   // riscv64
-        c"GLIBC_2.4",    // arm
-        c"GLIBC_2.2",    // s390x
-        c"GLIBC_2.0",    // i686
+        c"GLIBC_2.34",  // every arch, glibc >= 2.34 (dlsym moved into libc)
+        c"GLIBC_2.2.5", // x86_64
+        c"GLIBC_2.17",  // aarch64, ppc64le
+        c"GLIBC_2.27",  // riscv64
+        c"GLIBC_2.4",   // arm
+        c"GLIBC_2.2",   // s390x
+        c"GLIBC_2.0",   // i686
     ];
 
     let mut real_dlsym_ptr = std::ptr::null_mut();

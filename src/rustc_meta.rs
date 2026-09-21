@@ -376,7 +376,10 @@ mod tests {
         );
         // A derive reached through a re-export still reports the crate that defines
         // it, which is why the crate is informational rather than a match condition.
-        assert_eq!(qualified("probe2", "SerializeLike"), "probe2::SerializeLike");
+        assert_eq!(
+            qualified("probe2", "SerializeLike"),
+            "probe2::SerializeLike"
+        );
         assert_eq!(qualified("", "SerializeLike"), "SerializeLike");
 
         // Real `rustc_demangle` output carries crate disambiguators, which are not

@@ -250,8 +250,14 @@ pub unsafe fn intercept_proc_macro_table(dlsym_result: *mut libc::c_void) -> *mu
                 slots[slot_idx] = Some(TrampolineSlot {
                     original_run: unsafe {
                         std::mem::transmute::<
-                            for<'a> extern "C" fn(crate::types::BridgeConfig<'a>) -> crate::types::Buffer,
-                            for<'a> extern "C" fn(crate::types::BridgeConfig<'a>) -> crate::types::Buffer,
+                            for<'a> extern "C" fn(
+                                crate::types::BridgeConfig<'a>,
+                            )
+                                -> crate::types::Buffer,
+                            for<'a> extern "C" fn(
+                                crate::types::BridgeConfig<'a>,
+                            )
+                                -> crate::types::Buffer,
                         >(client.run)
                     },
                     name: name.to_string(),
@@ -504,7 +510,10 @@ pub unsafe fn intercept_client_slice_table(dlsym_result: *mut libc::c_void) -> *
         });
     }
     if dbg {
-        eprintln!("[macra-hook] intercepted {} macros: {entries:?}", entries.len());
+        eprintln!(
+            "[macra-hook] intercepted {} macros: {entries:?}",
+            entries.len()
+        );
     }
 
     let leaked_table: &'static [ClientSlim] = Box::leak(new_table.into_boxed_slice());
