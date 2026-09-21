@@ -31,11 +31,10 @@ jobs:
     name: Test ( ${{ matrix.os }} ${{ matrix.rust }})
     runs-on: ${{ matrix.os }}
     # Nightly is non-gating: the hook reads rustc internals, so it breaks when
-    # upstream moves rather than when this repository does. 1.98 is non-gating for
-    # the same reason from the other direction — it moved macro names out of the
-    # table into crate metadata, macra does not capture proc macros there yet, and
-    # the external-crate tests assert expansions only the hook produces.
-    continue-on-error: ${{ matrix.rust == 'nightly' || matrix.rust == '1.98' }}
+    # upstream moves rather than when this repository does. 1.98 gates again now that
+    # the proc-macro tests skip instead of fail on a compiler with no mapped bridge
+    # ABI, so a red 1.98 means something other than the known unmapped table layout.
+    continue-on-error: ${{ matrix.rust == 'nightly' }}
     strategy:
       fail-fast: false
       matrix:
@@ -51,8 +50,6 @@ jobs:
           - windows-11-arm
         rust:
           - "1.86"
-          - "1.93"
-          - "1.94"
           - "1.95"
           - "1.96"
           - "1.97"
