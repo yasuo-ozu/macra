@@ -203,11 +203,20 @@ pub unsafe fn call_to_string_on_handle(handle: u32) -> Option<String> {
 
     let resp_data = response.as_slice();
     // Response format: [0x00 Ok marker] [usize_le len] [UTF-8 string]
-    if resp_data.first() == Some(&0x00) {
+    let parsed = if resp_data.first() == Some(&0x00) {
         extract_string(resp_data, 1)
     } else {
         None
+    };
+
+    // The server hands back a buffer it grew for us; nothing else frees it, and the
+    // mirror type has no Drop. Without this every intercepted expansion leaked a
+    // buffer holding the whole token-stream text, inside rustc.
+    if let Some(drop_fn) = response.drop {
+        drop_fn(response);
     }
+
+    parsed
 }
 
 /// Take the captured strings from the current invocation, resetting the state.
