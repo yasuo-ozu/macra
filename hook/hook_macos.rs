@@ -31,8 +31,21 @@ unsafe extern "C" fn hooked_dlsym(
         return result;
     }
 
+    // Only touch the table when cargo-macra has said which layout this compiler
+    // uses; guessing aborts rustc rather than failing cleanly.
+    let Some(abi) = crate::types::selected_abi() else {
+        return result;
+    };
+
     // result is a pointer to `static DECLS: &[ProcMacro]` (a thin pointer to a fat pointer).
-    unsafe { trampoline::intercept_proc_macro_table(result) }
+    match abi.table {
+        cargo_macra::TableLayout::ProcMacroEnum => unsafe {
+            trampoline::intercept_proc_macro_table(result)
+        },
+        cargo_macra::TableLayout::ClientSlice => unsafe {
+            trampoline::intercept_client_slice_table(result)
+        },
+    }
 }
 
 /// DYLD_INTERPOSE structure for macOS dyld interposition.

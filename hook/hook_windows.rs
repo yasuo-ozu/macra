@@ -399,6 +399,14 @@ unsafe extern "system" fn hooked_get_proc_address(
         return Some(result);
     }
 
+    // Only touch the table when cargo-macra has said which layout this compiler
+    // uses. The 1.98 slice layout needs the symbol and metadata reads that only the
+    // unix path implements, so it is left alone here rather than misread.
+    match crate::types::selected_abi().map(|abi| abi.table) {
+        Some(cargo_macra::TableLayout::ProcMacroEnum) => {}
+        _ => return Some(result),
+    }
+
     // Intercept the proc macro table
     let intercepted =
         unsafe { trampoline::intercept_proc_macro_table(result as *mut libc::c_void) };

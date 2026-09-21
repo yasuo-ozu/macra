@@ -351,6 +351,13 @@ fn defining_crates(runs: &[*const libc::c_void]) -> Vec<String> {
         .collect()
 }
 
+/// No `dladdr` outside unix, so the defining crate is not resolved there. Callers
+/// treat an empty crate as "unknown" and report the macro name alone.
+#[cfg(not(unix))]
+fn defining_crates(runs: &[*const libc::c_void]) -> Vec<String> {
+    vec![String::new(); runs.len()]
+}
+
 /// Whether `MACRA_HOOK_DEBUG` is set.
 ///
 /// The hook runs inside rustc and can only report through stderr, so diagnosing a
