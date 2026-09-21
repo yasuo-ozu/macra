@@ -5,6 +5,19 @@
 use std::marker::PhantomData;
 use std::sync::atomic::AtomicU32;
 
+/// Which table layout cargo-macra told us to expect, if any.
+///
+/// `MACRA_ABI` is set only for compilers macra has been verified against, so an
+/// absent or unrecognised value means "do not touch the table". The layouts here
+/// mirror compiler internals with no stability guarantee, and reading the wrong
+/// one corrupts rustc rather than failing cleanly.
+pub fn abi_handshake_ok() -> bool {
+    matches!(
+        std::env::var("MACRA_ABI").as_deref(),
+        Ok("proc-macro-enum")
+    )
+}
+
 /// Mirror of `proc_macro::bridge::buffer::Buffer`
 #[repr(C)]
 pub struct Buffer {

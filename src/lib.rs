@@ -237,3 +237,145 @@ pub fn find_hook_lib(current_exe: Option<&Path>) -> Option<PathBuf> {
     // Fallback: extract embedded library to cache
     ensure_hook_lib()
 }
+
+/// The proc-macro bridge ABI a given rustc exposes.
+///
+/// The hook reinterprets rustc's `__rustc_proc_macro_decls_*` table using
+/// hand-written mirrors of `proc_macro::bridge` types. Those are compiler
+/// internals with no stability guarantee, so the layout has to be selected per
+/// compiler rather than assumed — reading the wrong one walks the table at the
+/// wrong stride and aborts rustc, which is what "could not compile <some
+/// unrelated crate>" used to mean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BridgeAbi {
+    /// `ProcMacro` enum carrying name/kind, with a two-pointer `Client`
+    /// (`handle_counters` + `run`). Verified for 1.86 through 1.91.
+    ProcMacroEnum,
+    /// The table is a bare `&[Client]` of single `run` pointers; names and kinds
+    /// live in crate metadata instead. Seen from 1.100.0-nightly.
+    ClientSliceOnly,
+}
+
+impl BridgeAbi {
+    /// Name used for the `MACRA_ABI` handshake with the hook.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BridgeAbi::ProcMacroEnum => "proc-macro-enum",
+            BridgeAbi::ClientSliceOnly => "client-slice-only",
+        }
+    }
+
+    /// Named `from_name` rather than `from_str` so it is not mistaken for
+    /// `std::str::FromStr`, which this deliberately is not — an unknown value means
+    /// "no ABI", not a parse error to be surfaced.
+    pub fn from_name(s: &str) -> Option<Self> {
+        match s {
+            "proc-macro-enum" => Some(BridgeAbi::ProcMacroEnum),
+            "client-slice-only" => Some(BridgeAbi::ClientSliceOnly),
+            _ => None,
+        }
+    }
+}
+
+/// A rustc version as (major, minor), plus whether it is a pre-release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RustcVersion {
+    pub major: u32,
+    pub minor: u32,
+    pub prerelease: bool,
+}
+
+/// Parse the `rustc -vV`/`--version` first line, e.g.
+/// `rustc 1.90.0 (abc 2025-01-01)` or `rustc 1.100.0-nightly (cea 2026-09-07)`.
+pub fn parse_rustc_version(output: &str) -> Option<RustcVersion> {
+    let line = output.lines().next()?;
+    let rest = line.strip_prefix("rustc ")?.trim_start();
+    let ver = rest.split_whitespace().next()?;
+    // Split off a `-nightly` / `-beta` suffix before parsing the numbers.
+    let (numbers, prerelease) = match ver.split_once('-') {
+        Some((n, _)) => (n, true),
+        None => (ver, false),
+    };
+    let mut parts = numbers.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some(RustcVersion {
+        major,
+        minor,
+        prerelease,
+    })
+}
+
+/// Which bridge ABI this rustc exposes, or `None` when it is outside every range
+/// macra has been verified against.
+///
+/// Deliberately conservative: an unknown compiler gets `None` so the caller can
+/// refuse, rather than guessing a layout and corrupting rustc's macro table.
+pub fn bridge_abi_for(v: RustcVersion) -> Option<BridgeAbi> {
+    match (v.major, v.minor) {
+        (1, 86..=91) if !v.prerelease => Some(BridgeAbi::ProcMacroEnum),
+        (1, 100) => Some(BridgeAbi::ClientSliceOnly),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod abi_tests {
+    use super::*;
+
+    #[test]
+    fn parses_stable_and_prerelease_versions() {
+        let stable = parse_rustc_version("rustc 1.90.0 (1159e78c4 2025-09-14)\n").unwrap();
+        assert_eq!((stable.major, stable.minor, stable.prerelease), (1, 90, false));
+
+        let nightly =
+            parse_rustc_version("rustc 1.100.0-nightly (cea272fa3 2026-09-07)\n").unwrap();
+        assert_eq!((nightly.major, nightly.minor, nightly.prerelease), (1, 100, true));
+
+        // `rustc -vV` puts the same first line above a details block.
+        let verbose = parse_rustc_version("rustc 1.88.0 (abc 2025-06-01)\nbinary: rustc\n");
+        assert_eq!(verbose.unwrap().minor, 88);
+
+        assert!(parse_rustc_version("not rustc at all").is_none());
+        assert!(parse_rustc_version("").is_none());
+    }
+
+    /// An unverified compiler must select no ABI at all. Guessing one walks rustc's
+    /// macro table at the wrong stride and aborts it, which is how an unsupported
+    /// toolchain used to surface as an unrelated crate failing to compile.
+    #[test]
+    fn only_verified_versions_select_an_abi() {
+        let v = |minor, prerelease| RustcVersion {
+            major: 1,
+            minor,
+            prerelease,
+        };
+
+        for minor in 86..=91 {
+            assert_eq!(
+                bridge_abi_for(v(minor, false)),
+                Some(BridgeAbi::ProcMacroEnum),
+                "1.{minor} is covered by CI and must be supported"
+            );
+        }
+        assert_eq!(
+            bridge_abi_for(v(100, true)),
+            Some(BridgeAbi::ClientSliceOnly)
+        );
+
+        // Between the two known windows the layout changed without us verifying it.
+        assert_eq!(bridge_abi_for(v(96, false)), None);
+        assert_eq!(bridge_abi_for(v(92, false)), None);
+        assert_eq!(bridge_abi_for(v(85, false)), None);
+        // A pre-release of an otherwise-supported version is not the same compiler.
+        assert_eq!(bridge_abi_for(v(90, true)), None);
+    }
+
+    #[test]
+    fn abi_names_round_trip() {
+        for abi in [BridgeAbi::ProcMacroEnum, BridgeAbi::ClientSliceOnly] {
+            assert_eq!(BridgeAbi::from_name(abi.as_str()), Some(abi));
+        }
+        assert_eq!(BridgeAbi::from_name("something-else"), None);
+    }
+}
