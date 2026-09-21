@@ -35,10 +35,12 @@ pub fn version_string(meta: &[u8]) -> Option<String> {
     // Skip the magic and the 8-byte length that follows the format version, then
     // look for the length-prefixed version string within the next few bytes.
     for i in at..meta.len().min(at + 64) {
-        if let Some(s) = ident_like_at(meta, i, |b| b != 0)
-            && s.starts_with("rustc ")
-        {
-            return Some(s.to_string());
+        // Written without a let-chain: those are stable only from 1.88, and this
+        // crate supports 1.86.
+        if let Some(s) = ident_like_at(meta, i, |b| b != 0) {
+            if s.starts_with("rustc ") {
+                return Some(s.to_string());
+            }
         }
     }
     None
@@ -95,16 +97,18 @@ pub fn proc_macro_entries(meta: &[u8], fn_names: &[String]) -> Option<Vec<ProcMa
     let mut i = cursor;
     while i + 1 < meta.len() && entries.len() < fn_names.len() {
         let kind = meta[i];
-        if matches!(kind, KIND_DERIVE | KIND_ATTR | KIND_BANG)
-            && let Some(name) = rust_ident_at(meta, i + 1)
-            && !entries.iter().any(|e| e.name == name)
-        {
-            entries.push(ProcMacroEntry {
-                kind,
-                name: name.to_string(),
-            });
-            i += 2 + name.len();
-            continue;
+        // Not a let-chain: stable only from 1.88, and this crate supports 1.86.
+        if matches!(kind, KIND_DERIVE | KIND_ATTR | KIND_BANG) {
+            if let Some(name) = rust_ident_at(meta, i + 1) {
+                if !entries.iter().any(|e| e.name == name) {
+                    entries.push(ProcMacroEntry {
+                        kind,
+                        name: name.to_string(),
+                    });
+                    i += 2 + name.len();
+                    continue;
+                }
+            }
         }
         i += 1;
     }
