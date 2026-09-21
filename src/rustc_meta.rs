@@ -1,6 +1,6 @@
 //! Recovering proc-macro names and kinds from a dylib's `.rustc` metadata.
 //!
-//! From rustc 1.100 the `__rustc_proc_macro_decls_*` table is a bare slice of
+//! From rustc 1.98 the `__rustc_proc_macro_decls_*` table is a bare slice of
 //! `run` function pointers: the names and kinds that older layouts carried inline
 //! moved into crate metadata. The pointers still resolve to symbols naming the
 //! user's function (`…::expand1<krate::the_fn>`), so function names come from the
@@ -91,8 +91,31 @@ pub fn proc_macro_entries(meta: &[u8], fn_names: &[String]) -> Option<Vec<ProcMa
         cursor = found?;
     }
 
-    // Past that, each macro is recorded as `<kind> <len> <name>`. Derives appear
-    // again without a kind byte, so keep the first sighting of each name.
+    // Past that, each macro is recorded as `<kind> <len> <name>`, and later echoed by
+    // its def_key; the echo opens with the `SYMBOL_STR` tag, which is also `0x00`, so
+    // keep the first sighting of each name.
+    //
+    // KNOWN BROKEN, both directions — this is why `bridge_abi_for` maps 1.98+ to
+    // `None`. Verified against real dylibs built with 1.98.0, beta and nightly:
+    //
+    //   * False positives. `KIND_DERIVE` is `0x00` and so is `SYMBOL_STR`, so every
+    //     first-occurrence identifier string reads as a well-formed derive record.
+    //     A doc comment (`///Frobnicate` -> `#[doc = "Frobnicate"]`), a
+    //     `#[doc(alias = "..")]` or a `#[deprecated(note = "..")]` on the macro is
+    //     enough; on 1.99+ crate-level cfg names such as `docsrs` join them. Because
+    //     the loop stops at `fn_names.len()` entries, each phantom also drops a real
+    //     macro off the end.
+    //   * False negatives. `i += 2 + name.len()` below lands on the `0xC1` string
+    //     sentinel, so the next byte read as a kind is really a derive's helper-attribute
+    //     count: 1 or 2 helpers masquerade as `KIND_ATTR`/`KIND_BANG` with the first
+    //     helper as the name. `#[proc_macro_derive(Serialize, attributes(serde))]` —
+    //     serde_derive's own shape — makes the whole scan return `None`.
+    //
+    // Repairing this needs more than a bigger identifier filter: the def_key echo
+    // cannot name a trait whose symbol rustc predefines (`Display`, `Clone`, `Debug`
+    // and friends encode as an index, not a string). The name-independent check is the
+    // `macros: LazyArray<(DefIndex, LazyValue<ProcMacroKind>)>` array rustc writes
+    // right after this loop, whose positions point back at exactly the real records.
     let mut entries: Vec<ProcMacroEntry> = Vec::new();
     let mut i = cursor;
     while i + 1 < meta.len() && entries.len() < fn_names.len() {

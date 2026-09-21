@@ -361,13 +361,17 @@ pub fn bridge_abi_for(v: RustcVersion) -> Option<BridgeAbi> {
         (1, 86..=94) => abi(TableLayout::ProcMacroEnum, RpcTags::Nested),
         (1, 95..=97) => abi(TableLayout::ProcMacroEnum, FLAT_95),
         // 1.98 onwards moved macro names and kinds out of the table into crate
-        // metadata, and recovering them from there is not trustworthy yet: the scan
-        // in `rustc_meta` cannot tell a derive's trait name from an identifier in a
-        // crate attribute, so `#![cfg_attr(docsrs, ..)]` alone makes it report
-        // `docsrs` as a derive and drop a real one. Only bang and attribute names are
-        // validated against the symbol table; derives are unchecked, which is exactly
-        // the common case. Until that is fixed these compilers get no hook: losing
-        // proc-macro capture is recoverable, showing the wrong macro name is not.
+        // metadata, and recovering them from there is not trustworthy: a derive record
+        // and an interned string share the tag byte `0x00`, so the scan in
+        // `rustc_meta` reports a doc comment, a `#[doc(alias)]` or a
+        // `#[deprecated(note = "..")]` as a derive and drops a real macro off the end
+        // — reproduced on stable 1.98.0 with no `cfg_attr` involved. It also misreads
+        // a derive's helper-attribute count as the next kind byte, so
+        // `#[proc_macro_derive(Serialize, attributes(serde))]` makes the scan fail
+        // outright. Only bang and attribute names are validated against the symbol
+        // table; derives are unchecked, which is exactly the common case. Until that
+        // is fixed these compilers get no hook: losing proc-macro capture is
+        // recoverable, showing the wrong macro name is not.
         _ => None,
     }
 }
