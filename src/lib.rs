@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 pub mod parse_normal;
 pub mod parse_trace;
+pub mod rustc_meta;
 pub mod trace_macros;
 
 /// Normalize token-like text for resilient comparisons.
