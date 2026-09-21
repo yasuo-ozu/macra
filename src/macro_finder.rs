@@ -8,6 +8,15 @@ use syn::{Attribute, Expr, ExprMacro, Item, ItemMacro, Macro, Stmt, StmtMacro};
 pub struct MacroCall {
     /// The name of the macro (e.g., "println", "derive", "test")
     pub name: String,
+    /// The crate a path-qualified call names, e.g. `serde` for
+    /// `#[derive(serde::Serialize)]`. Empty for a bare call, and for a path rooted at
+    /// `crate`/`self`/`super`/`$crate`, none of which name an external crate.
+    ///
+    /// Used to tell two same-named macros apart when a lookup would otherwise be
+    /// ambiguous. It is a preference, not a filter: a macro re-exported by one crate
+    /// but defined in another reports the defining crate, so requiring a match would
+    /// break the common `serde::Serialize` case.
+    pub krate: String,
     /// The type of macro
     pub kind: MacroKind,
     /// The line number (1-indexed)
@@ -51,6 +60,31 @@ impl MacroKind {
             MacroKind::Derive => "derive",
         }
     }
+}
+
+/// The crate a macro path names, or empty when the path is bare or crate-relative.
+///
+/// Only the first segment of a multi-segment path can name a crate; `serde::de::Foo`
+/// is still `serde`. A single-segment path names no crate.
+fn crate_qualifier(mut segments: impl Iterator<Item = String>) -> String {
+    let Some(first) = segments.next() else {
+        return String::new();
+    };
+    if segments.next().is_none() {
+        return String::new();
+    }
+    match first.as_str() {
+        "crate" | "self" | "super" | "$crate" => String::new(),
+        _ => first,
+    }
+}
+
+/// `crate_qualifier` for a path already rendered as text, as the derive fallback has.
+///
+/// Token-stream text spaces the separator (`test_proc_macros :: Greet`), so the
+/// segments are trimmed.
+fn crate_qualifier_from_str(path: &str) -> String {
+    crate_qualifier(path.split("::").map(|s| s.trim().to_string()))
 }
 
 /// Get a mutable reference to the attributes of an `Item`.
@@ -103,6 +137,7 @@ impl MacroVisitor {
             .last()
             .map(|s| s.ident.to_string())
             .unwrap_or_default();
+        let krate = crate_qualifier(mac.path.segments.iter().map(|s| s.ident.to_string()));
 
         // Get span of the entire macro call
         let start_span = mac.path.segments.first().map(|s| s.ident.span());
@@ -123,6 +158,7 @@ impl MacroVisitor {
             let input = mac.tokens.to_string();
             self.macros.push(MacroCall {
                 name,
+                krate,
                 kind,
                 line,
                 col_start,
@@ -149,6 +185,7 @@ impl MacroVisitor {
                 .last()
                 .map(|s| s.ident.to_string())
                 .unwrap_or_default();
+            let krate = crate_qualifier(attr.path().segments.iter().map(|s| s.ident.to_string()));
 
             // Get span of the entire attribute
             let attr_span = attr.span();
@@ -196,6 +233,7 @@ impl MacroVisitor {
                         derives.iter().map(|(n, ..)| n.clone()).collect();
                     for (derive_name, d_line, d_col_start, d_col_end) in derives {
                         self.macros.push(MacroCall {
+                            krate: crate_qualifier_from_str(&derive_name),
                             name: derive_name,
                             kind: MacroKind::Derive,
                             line,
@@ -221,6 +259,7 @@ impl MacroVisitor {
                 };
                 self.macros.push(MacroCall {
                     name,
+                    krate,
                     kind: MacroKind::Attribute,
                     line,
                     col_start,
@@ -384,6 +423,63 @@ pub fn find_macros(source: &str) -> Vec<MacroCall> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crate_qualifier_takes_only_the_leading_segment_of_a_real_path() {
+        let q = |p: &str| crate_qualifier_from_str(p);
+        // A multi-segment path names its first segment, however deep.
+        assert_eq!(q("serde::Serialize"), "serde");
+        assert_eq!(q("serde::de::value::Foo"), "serde");
+        // Token-stream text spaces the separator.
+        assert_eq!(q("test_proc_macros :: Greet"), "test_proc_macros");
+        // A bare name names no crate.
+        assert_eq!(q("Serialize"), "");
+        assert_eq!(q(""), "");
+        // Crate-relative roots are not crate names.
+        for rooted in ["crate::m", "self::m", "super::m", "$crate::m"] {
+            assert_eq!(q(rooted), "", "{rooted} does not name an external crate");
+        }
+        // ... but a crate that merely starts with those letters does.
+        assert_eq!(q("crateish::m"), "crateish");
+    }
+
+    #[test]
+    fn finds_the_crate_of_a_path_qualified_call() {
+        let source = r#"
+test_proc_macros::make_answer!(x);
+bare_call!(y);
+crate::local_call!(z);
+
+#[test_proc_macros::tag_item]
+#[bare_attr]
+#[derive(test_proc_macros::Greet, Describe)]
+struct S;
+"#;
+        let macros = find_macros(source);
+        let krate_of = |name: &str| {
+            macros
+                .iter()
+                .find(|m| m.name.ends_with(name))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "no macro matching {name}: {:?}",
+                        macros
+                            .iter()
+                            .map(|m| (&m.name, &m.krate))
+                            .collect::<Vec<_>>()
+                    )
+                })
+                .krate
+                .clone()
+        };
+        assert_eq!(krate_of("make_answer"), "test_proc_macros");
+        assert_eq!(krate_of("bare_call"), "");
+        assert_eq!(krate_of("local_call"), "");
+        assert_eq!(krate_of("tag_item"), "test_proc_macros");
+        assert_eq!(krate_of("bare_attr"), "");
+        assert_eq!(krate_of("Greet"), "test_proc_macros");
+        assert_eq!(krate_of("Describe"), "");
+    }
 
     #[test]
     fn test_find_functional_macros() {

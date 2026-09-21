@@ -229,6 +229,9 @@ struct TraceCandidate {
     /// requires both to be equal — so every candidate would carry the same label and
     /// the list could not be chosen from. The output is what actually differs.
     label: String,
+    /// The crate that defines the macro this expansion came from, or empty when the
+    /// hook could not resolve it (a `macro_rules!` trace, or a non-unix host).
+    krate: String,
     /// The expansion this candidate would inline.
     output: String,
 }
@@ -477,10 +480,39 @@ impl ExpansionCache {
             };
             candidates.push(TraceCandidate {
                 label,
+                krate: exp.krate.clone(),
                 output: exp.to.clone(),
             });
         }
         candidates
+    }
+
+    /// Narrow an ambiguous candidate list to the crate a path-qualified call named.
+    ///
+    /// `test_proc_macros::Greet` and a bare `Greet` from another crate expand
+    /// differently, and the source says which one was meant — so a collision that the
+    /// output alone cannot resolve often is resolved by the path.
+    ///
+    /// Deliberately a preference, not a filter. The hook reports the crate that
+    /// *defines* a macro, while the path names the crate it was *reached through*, and
+    /// those differ for every re-export — `serde::Serialize` is defined in
+    /// `serde_derive`. So a qualifier that matches nothing leaves the list untouched
+    /// and the user still gets the popup; it can only ever remove a wrong answer, never
+    /// the only right one.
+    fn narrow_by_crate(candidates: Vec<TraceCandidate>, krate: &str) -> Vec<TraceCandidate> {
+        if krate.is_empty() || candidates.len() < 2 {
+            return candidates;
+        }
+        let matching: Vec<TraceCandidate> = candidates
+            .iter()
+            .filter(|c| c.krate == krate)
+            .cloned()
+            .collect();
+        if matching.len() == 1 {
+            matching
+        } else {
+            candidates
+        }
     }
 
     /// Every cached expansion matching this query at the most specific pass that
@@ -557,6 +589,7 @@ impl ExpansionCache {
         input: &str,
         arguments: &str,
         name: &str,
+        krate: &str,
         kind: MacroKind,
         should_abort: &mut dyn FnMut() -> bool,
     ) -> TraceLookup {
@@ -614,7 +647,8 @@ impl ExpansionCache {
                     kind,
                     0,
                 );
-                let mut candidates = Self::distinct_candidates(&inner, &hits);
+                let mut candidates =
+                    Self::narrow_by_crate(Self::distinct_candidates(&inner, &hits), krate);
                 return match candidates.len() {
                     // Unreachable: entries are only ever appended, so the hits found
                     // above are still present.
@@ -1589,6 +1623,7 @@ impl App {
         // Get node info
         let (
             name,
+            krate,
             input,
             arguments,
             kind,
@@ -1608,6 +1643,7 @@ impl App {
             };
             (
                 node.call.name.clone(),
+                node.call.krate.clone(),
                 node.call.input.clone(),
                 node.call.arguments.clone(),
                 node.call.kind,
@@ -1648,7 +1684,7 @@ impl App {
                 };
                 let lookup = self
                     .expansion_cache
-                    .find_trace_for_tokens(&input, &arguments, &name, kind, &mut wait);
+                    .find_trace_for_tokens(&input, &arguments, &name, &krate, kind, &mut wait);
                 // The notice went straight to the terminal, so ratatui's buffer does
                 // not know that row changed and its diff would leave it on screen.
                 if notified.get() {
@@ -2185,6 +2221,7 @@ impl App {
                 derive_group: child_derive_group,
                 call: MacroCall {
                     name: child_mac.name,
+                    krate: child_mac.krate,
                     kind: child_mac.kind,
                     line: adjusted_line,
                     col_start: child_mac.col_start,
@@ -3872,6 +3909,7 @@ mod tests {
         MacroNode {
             call: MacroCall {
                 name: "X".to_string(),
+                krate: String::new(),
                 kind,
                 line,
                 col_start,
@@ -4627,6 +4665,46 @@ struct B;
             MacroKind::Functional,
             min_idx,
         )
+    }
+
+    #[test]
+    fn narrow_by_crate_resolves_a_collision_the_output_cannot() {
+        let cand = |krate: &str, output: &str| TraceCandidate {
+            label: format!("[{krate}] {output}"),
+            krate: krate.to_string(),
+            output: output.to_string(),
+        };
+        let two = vec![cand("alpha", "fn a() {}"), cand("beta", "fn b() {}")];
+
+        // The path named one of them: that one wins outright, no popup.
+        let picked = ExpansionCache::narrow_by_crate(two.clone(), "beta");
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].output, "fn b() {}");
+
+        // A qualifier naming a crate that defines none of them changes nothing. This
+        // is the re-export case (`serde::Serialize` is defined in `serde_derive`), and
+        // narrowing to zero would turn a popup into a wrong answer.
+        assert_eq!(
+            ExpansionCache::narrow_by_crate(two.clone(), "serde").len(),
+            2
+        );
+
+        // No qualifier, or nothing to choose between: untouched.
+        assert_eq!(ExpansionCache::narrow_by_crate(two.clone(), "").len(), 2);
+        assert_eq!(
+            ExpansionCache::narrow_by_crate(vec![cand("alpha", "fn a() {}")], "beta").len(),
+            1
+        );
+
+        // Two candidates from the *same* crate stay ambiguous: the crate does not
+        // distinguish them, so the user still has to choose.
+        let same = vec![cand("alpha", "fn a() {}"), cand("alpha", "fn b() {}")];
+        assert_eq!(ExpansionCache::narrow_by_crate(same, "alpha").len(), 2);
+
+        // An unresolved crate (non-unix host, or a `macro_rules!` trace) never matches
+        // a qualifier, so those candidates are never silently preferred away.
+        let unknown = vec![cand("", "fn a() {}"), cand("", "fn b() {}")];
+        assert_eq!(ExpansionCache::narrow_by_crate(unknown, "alpha").len(), 2);
     }
 
     #[test]
