@@ -157,12 +157,26 @@ impl TraceMacros {
     /// Resolved through the same `PATH` and rustup settings cargo itself uses, so a
     /// directory override or `RUSTUP_TOOLCHAIN` is honoured.
     pub fn detect_rustc_version(&self) -> Option<crate::RustcVersion> {
+        self.rustc_version_line()
+            .as_deref()
+            .and_then(crate::parse_rustc_version)
+    }
+
+    /// The first line of `rustc -vV`, e.g. `rustc 1.98.1 (48a229cea 2026-09-01)`.
+    ///
+    /// Passed to the hook so it can confirm, from the proc-macro dylib's own
+    /// metadata, that the compiler loading it really is the one whose ABI we
+    /// selected. rustc records this exact string in the dylib's `.rustc` section.
+    pub fn rustc_version_line(&self) -> Option<String> {
         let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
         let out = Command::new(rustc).arg("-vV").output().ok()?;
         if !out.status.success() {
             return None;
         }
-        crate::parse_rustc_version(&String::from_utf8_lossy(&out.stdout))
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .next()
+            .map(|l| l.trim().to_string())
     }
 
     pub fn run(&self) -> io::Result<TraceRun> {
@@ -204,9 +218,14 @@ impl TraceMacros {
         // loaded into a compiler whose layout macra actually knows. On anything else
         // it is left out entirely: `-Z trace-macros` still yields bang macros, which
         // degrades the feature instead of aborting the build.
-        let abi = self
-            .detect_rustc_version()
-            .and_then(crate::bridge_abi_for);
+        let detected = self.detect_rustc_version();
+        let abi = detected.and_then(crate::bridge_abi_for);
+        if std::env::var_os("MACRA_HOOK_DEBUG").is_some() {
+            eprintln!(
+                "[macra] detected rustc {detected:?} -> abi {abi:?}; hook_lib {:?}",
+                self.args.hook_lib
+            );
+        }
 
         // Set up macra-hook via LD_PRELOAD if available
         if abi.is_some() && !self.args.hook_lib.as_os_str().is_empty() {
@@ -263,9 +282,25 @@ impl TraceMacros {
             // output reaches cargo's stderr pipe just like on Linux/macOS.
         }
 
-        if let Some(abi) = abi {
-            // Explicit handshake: the hook refuses to touch the table without it.
-            cmd.env("MACRA_ABI", abi.as_env());
+        match abi {
+            Some(abi) => {
+                // Explicit handshake: the hook refuses to touch the table without it.
+                cmd.env("MACRA_ABI", abi.as_env());
+                // And a second, independent check: the hook compares this against the
+                // version recorded in each proc-macro dylib's own metadata, so a
+                // compiler we mis-detected — or a nested cargo invoking a different
+                // toolchain, which inherits this environment — is caught there rather
+                // than being handed a table it cannot read.
+                if let Some(line) = self.rustc_version_line() {
+                    cmd.env("MACRA_RUSTC_VERSION", line);
+                }
+            }
+            // Never let a value inherited from the caller stand in for a decision
+            // this run did not make.
+            None => {
+                cmd.env_remove("MACRA_ABI");
+                cmd.env_remove("MACRA_RUSTC_VERSION");
+            }
         }
 
         cmd.env("RUSTFLAGS", rustflags);
