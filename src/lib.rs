@@ -239,42 +239,74 @@ pub fn find_hook_lib(current_exe: Option<&Path>) -> Option<PathBuf> {
     ensure_hook_lib()
 }
 
-/// The proc-macro bridge ABI a given rustc exposes.
-///
-/// The hook reinterprets rustc's `__rustc_proc_macro_decls_*` table using
-/// hand-written mirrors of `proc_macro::bridge` types. Those are compiler
-/// internals with no stability guarantee, so the layout has to be selected per
-/// compiler rather than assumed — reading the wrong one walks the table at the
-/// wrong stride and aborts rustc, which is what "could not compile <some
-/// unrelated crate>" used to mean.
+/// How a rustc lays out its `__rustc_proc_macro_decls_*` table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BridgeAbi {
-    /// `ProcMacro` enum carrying name/kind, with a two-pointer `Client`
-    /// (`handle_counters` + `run`). Verified for 1.86 through 1.91.
+pub enum TableLayout {
+    /// `&[ProcMacro]`, the enum carrying each macro's name and kind inline, with a
+    /// two-pointer `Client`. Through 1.97.
     ProcMacroEnum,
-    /// The table is a bare `&[Client]` of single `run` pointers; names and kinds
-    /// live in crate metadata instead. Seen from 1.100.0-nightly.
-    ClientSliceOnly,
+    /// `&[Client]`, one `run` pointer per macro; names and kinds moved into crate
+    /// metadata. From 1.98.
+    ClientSlice,
+}
+
+/// How a rustc encodes a bridge RPC request tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpcTags {
+    /// `with_api!` nested methods under a type, so a request began with a group byte
+    /// and a method byte. Through 1.94.
+    Nested,
+    /// One flat `#[repr(u8)] enum ApiTags` encoded as a single byte. From 1.95 — but
+    /// the indices shift as methods are added or removed, so they are carried rather
+    /// than assumed.
+    Flat { from_str: u8, to_string: u8 },
+}
+
+/// What a given rustc's proc-macro bridge looks like.
+///
+/// The table layout and the RPC encoding change independently — 1.95 flattened the
+/// tags while keeping the old table, and 1.98 changed the table while keeping the
+/// 1.95 tags — so they are tracked separately. Conflating them is not harmless:
+/// sending 1.100's tag numbering to a 1.98 server invokes the wrong bridge method
+/// and panics the compiler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BridgeAbi {
+    pub table: TableLayout,
+    pub rpc: RpcTags,
 }
 
 impl BridgeAbi {
-    /// Name used for the `MACRA_ABI` handshake with the hook.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            BridgeAbi::ProcMacroEnum => "proc-macro-enum",
-            BridgeAbi::ClientSliceOnly => "client-slice-only",
+    /// Serialised for the `MACRA_ABI` handshake with the hook.
+    pub fn as_env(self) -> String {
+        let table = match self.table {
+            TableLayout::ProcMacroEnum => "enum",
+            TableLayout::ClientSlice => "slice",
+        };
+        match self.rpc {
+            RpcTags::Nested => format!("{table},nested"),
+            RpcTags::Flat {
+                from_str,
+                to_string,
+            } => format!("{table},flat,{from_str},{to_string}"),
         }
     }
 
-    /// Named `from_name` rather than `from_str` so it is not mistaken for
-    /// `std::str::FromStr`, which this deliberately is not — an unknown value means
-    /// "no ABI", not a parse error to be surfaced.
-    pub fn from_name(s: &str) -> Option<Self> {
-        match s {
-            "proc-macro-enum" => Some(BridgeAbi::ProcMacroEnum),
-            "client-slice-only" => Some(BridgeAbi::ClientSliceOnly),
-            _ => None,
-        }
+    pub fn from_env(s: &str) -> Option<Self> {
+        let mut parts = s.split(',');
+        let table = match parts.next()? {
+            "enum" => TableLayout::ProcMacroEnum,
+            "slice" => TableLayout::ClientSlice,
+            _ => return None,
+        };
+        let rpc = match parts.next()? {
+            "nested" => RpcTags::Nested,
+            "flat" => RpcTags::Flat {
+                from_str: parts.next()?.parse().ok()?,
+                to_string: parts.next()?.parse().ok()?,
+            },
+            _ => return None,
+        };
+        parts.next().is_none().then_some(BridgeAbi { table, rpc })
     }
 }
 
@@ -307,19 +339,31 @@ pub fn parse_rustc_version(output: &str) -> Option<RustcVersion> {
     })
 }
 
-/// Which bridge ABI this rustc exposes, or `None` when it is outside every range
-/// macra has been verified against.
+/// Which bridge shape this rustc exposes, or `None` when it is one macra has not
+/// been verified against.
 ///
-/// Deliberately conservative: an unknown compiler gets `None` so the caller can
-/// refuse, rather than guessing a layout and corrupting rustc's macro table.
+/// Every bound here was established by building a probe crate with that compiler and
+/// reading the emitted table, and by reading the `with_api!` definition it ships.
+/// Deliberately conservative: an unknown compiler gets `None` so the caller can skip
+/// the hook, because guessing does not fail cleanly — the wrong table stride hands
+/// rustc garbage pointers and the wrong tag numbering invokes the wrong bridge
+/// method, and both abort the compiler.
 pub fn bridge_abi_for(v: RustcVersion) -> Option<BridgeAbi> {
+    // The 1.95 flattening kept these indices; 1.100 removed a method and shifted them.
+    const FLAT_95: RpcTags = RpcTags::Flat {
+        from_str: 9,
+        to_string: 10,
+    };
+    const FLAT_100: RpcTags = RpcTags::Flat {
+        from_str: 8,
+        to_string: 9,
+    };
+    let abi = |table, rpc| Some(BridgeAbi { table, rpc });
     match (v.major, v.minor) {
-        // Verified by CI across this whole range.
-        (1, 86..=91) => Some(BridgeAbi::ProcMacroEnum),
-        // The `ProcMacro` enum was replaced by a bare `&[Client]` somewhere in
-        // 1.92..=1.100; exactly where is unverified, so nothing in the gap selects a
-        // layout and those compilers simply get no hook.
-        (1, 100..) => Some(BridgeAbi::ClientSliceOnly),
+        (1, 86..=94) => abi(TableLayout::ProcMacroEnum, RpcTags::Nested),
+        (1, 95..=97) => abi(TableLayout::ProcMacroEnum, FLAT_95),
+        (1, 98..=99) => abi(TableLayout::ClientSlice, FLAT_95),
+        (1, 100) => abi(TableLayout::ClientSlice, FLAT_100),
         _ => None,
     }
 }
@@ -345,9 +389,9 @@ mod abi_tests {
         assert!(parse_rustc_version("").is_none());
     }
 
-    /// An unverified compiler must select no ABI at all. Guessing one walks rustc's
-    /// macro table at the wrong stride and aborts it, which is how an unsupported
-    /// toolchain used to surface as an unrelated crate failing to compile.
+    /// Every bound below was established by probing the real compiler; an
+    /// unverified one must select nothing, because guessing aborts rustc rather
+    /// than failing cleanly.
     #[test]
     fn only_verified_versions_select_an_abi() {
         let v = |minor, prerelease| RustcVersion {
@@ -355,45 +399,76 @@ mod abi_tests {
             minor,
             prerelease,
         };
+        let flat_95 = RpcTags::Flat {
+            from_str: 9,
+            to_string: 10,
+        };
+        let flat_100 = RpcTags::Flat {
+            from_str: 8,
+            to_string: 9,
+        };
 
-        for minor in 86..=91 {
-            assert_eq!(
-                bridge_abi_for(v(minor, false)),
-                Some(BridgeAbi::ProcMacroEnum),
-                "1.{minor} is covered by CI and must be supported"
-            );
+        // The table stayed an enum through 1.97, but 1.95 flattened the RPC tags —
+        // the two move independently, which is why they are tracked separately.
+        for minor in 86..=94 {
+            let abi = bridge_abi_for(v(minor, false)).expect("1.{minor} is supported");
+            assert_eq!(abi.table, TableLayout::ProcMacroEnum);
+            assert_eq!(abi.rpc, RpcTags::Nested, "1.{minor} predates the flattening");
         }
-        // A beta or nightly of a supported version reads the same table.
-        assert_eq!(
-            bridge_abi_for(v(90, true)),
-            Some(BridgeAbi::ProcMacroEnum)
-        );
-        // 1.100 onwards, including later releases that keep this layout.
-        for minor in [100, 101, 120] {
-            assert_eq!(
-                bridge_abi_for(v(minor, true)),
-                Some(BridgeAbi::ClientSliceOnly)
-            );
+        for minor in 95..=97 {
+            let abi = bridge_abi_for(v(minor, false)).expect("supported");
+            assert_eq!(abi.table, TableLayout::ProcMacroEnum);
+            assert_eq!(abi.rpc, flat_95);
         }
+        // 1.98 changed the table while keeping 1.95's tag numbering. Sending
+        // 1.100's numbering here invokes the wrong bridge method and panics rustc.
+        for minor in 98..=99 {
+            let abi = bridge_abi_for(v(minor, false)).expect("supported");
+            assert_eq!(abi.table, TableLayout::ClientSlice);
+            assert_eq!(abi.rpc, flat_95);
+        }
+        let abi = bridge_abi_for(v(100, true)).expect("supported");
+        assert_eq!(abi.table, TableLayout::ClientSlice);
+        assert_eq!(abi.rpc, flat_100);
 
-        // The layout changed somewhere in this gap and we have not verified where,
-        // so nothing in it selects a layout.
-        for minor in [92, 95, 96, 99] {
-            assert_eq!(
-                bridge_abi_for(v(minor, false)),
-                None,
-                "1.{minor} is unverified and must not guess a layout"
-            );
-        }
+        // A beta or nightly of a verified version reads the same bridge as its
+        // release: 1.99.0-beta was probed directly.
+        assert_eq!(bridge_abi_for(v(99, true)), bridge_abi_for(v(99, false)));
+
+        // Nothing outside the probed range guesses.
+        assert_eq!(bridge_abi_for(v(101, true)), None);
         assert_eq!(bridge_abi_for(v(85, false)), None);
-        assert_eq!(bridge_abi_for(RustcVersion { major: 2, minor: 0, prerelease: false }), None);
+        assert_eq!(
+            bridge_abi_for(RustcVersion {
+                major: 2,
+                minor: 0,
+                prerelease: false
+            }),
+            None
+        );
     }
 
     #[test]
-    fn abi_names_round_trip() {
-        for abi in [BridgeAbi::ProcMacroEnum, BridgeAbi::ClientSliceOnly] {
-            assert_eq!(BridgeAbi::from_name(abi.as_str()), Some(abi));
+    fn abi_round_trips_through_the_handshake() {
+        for minor in [86, 95, 98, 100] {
+            let abi = bridge_abi_for(RustcVersion {
+                major: 1,
+                minor,
+                prerelease: false,
+            })
+            .expect("supported");
+            assert_eq!(BridgeAbi::from_env(&abi.as_env()), Some(abi), "1.{minor}");
         }
-        assert_eq!(BridgeAbi::from_name("something-else"), None);
+        // The tag numbering has to survive the round trip, not just the shape.
+        assert_eq!(
+            BridgeAbi::from_env("slice,flat,8,9").map(|a| a.rpc),
+            Some(RpcTags::Flat {
+                from_str: 8,
+                to_string: 9
+            })
+        );
+        for junk in ["", "enum", "enum,flat", "enum,flat,9", "what,nested", "enum,nested,extra"] {
+            assert_eq!(BridgeAbi::from_env(junk), None, "{junk:?} must not parse");
+        }
     }
 }
