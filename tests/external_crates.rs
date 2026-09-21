@@ -84,7 +84,8 @@ fn min_rustc_for_crate(repo: &str) -> u32 {
 fn proc_macro_capture_supported() -> bool {
     static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *SUPPORTED.get_or_init(|| {
-        let supported = cargo_macra::proc_macro_capture_supported();
+        let supported = cargo_macra::proc_macro_capture_supported()
+            .expect("could not probe `rustc -vV`; refusing to skip the suite silently");
         if !supported {
             eprintln!(
                 "skipping external_crate proc-macro tests: rustc 1.{} has no mapped bridge ABI",
