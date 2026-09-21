@@ -23,6 +23,8 @@ struct TrampolineSlot {
     original_run: extern "C" fn(BridgeConfig<'_>) -> Buffer,
     /// Macro name (from the ProcMacro table)
     name: String,
+    /// Crate that defines it, when resolvable.
+    krate: String,
     /// Macro kind string
     kind: String,
 }
@@ -61,12 +63,17 @@ fn extract_input_handles(input_buf: &[u8], kind: &str) -> Vec<u32> {
 /// 3. Calls the original `run` function with the modified config
 /// 4. Extracts output handle from result and calls to_string (after run, still in session)
 fn trampoline_impl(idx: usize, config: BridgeConfig<'_>) -> Buffer {
-    let (original_run, name, kind) = {
+    let (original_run, name, krate, kind) = {
         let slots = SLOTS.lock().unwrap();
         match slots.get(idx).and_then(|s| s.as_ref()) {
-            Some(slot) => (slot.original_run, slot.name.clone(), slot.kind.clone()),
+            Some(slot) => (
+                slot.original_run,
+                slot.name.clone(),
+                slot.krate.clone(),
+                slot.kind.clone(),
+            ),
             None => {
-                eprintln!("[macra-hook] No slot for trampoline index {}", idx);
+                eprintln!("[macra-hook] No slot for trampoline index {idx}");
                 return Buffer::from_vec(Vec::new());
             }
         }
@@ -145,6 +152,7 @@ fn trampoline_impl(idx: usize, config: BridgeConfig<'_>) -> Buffer {
     if !input.is_empty() || !output.is_empty() {
         logging::log_expansion(&ExpansionRecord {
             name,
+            krate,
             kind,
             arguments,
             input,
@@ -187,6 +195,20 @@ pub unsafe fn intercept_proc_macro_table(dlsym_result: *mut libc::c_void) -> *mu
         return dlsym_result;
     }
 
+    // The table records bare names, but each `run` pointer resolves to a symbol
+    // naming the defining crate. Qualifying the record lets colliding macros from
+    // different crates be told apart; the driver still matches on the last segment,
+    // so an unresolved crate simply leaves the name as it was.
+    let runs: Vec<*const libc::c_void> = original_table
+        .iter()
+        .map(|pm| match pm {
+            ProcMacro::CustomDerive { client, .. } => client.run as *const libc::c_void,
+            ProcMacro::Attr { client, .. } => client.run as *const libc::c_void,
+            ProcMacro::Bang { client, .. } => client.run as *const libc::c_void,
+        })
+        .collect();
+    let crates = defining_crates(&runs);
+
     // Build new table with replaced run function pointers
     let mut new_table: Vec<ProcMacro> = Vec::with_capacity(original_table.len());
 
@@ -208,6 +230,7 @@ pub unsafe fn intercept_proc_macro_table(dlsym_result: *mut libc::c_void) -> *mu
                 slots[slot_idx] = Some(TrampolineSlot {
                     original_run: client.run,
                     name: trait_name.to_string(),
+                    krate: crates.get(i).cloned().unwrap_or_default(),
                     kind: "CustomDerive".to_string(),
                 });
 
@@ -232,6 +255,7 @@ pub unsafe fn intercept_proc_macro_table(dlsym_result: *mut libc::c_void) -> *mu
                         >(client.run)
                     },
                     name: name.to_string(),
+                    krate: crates.get(i).cloned().unwrap_or_default(),
                     kind: "Attr".to_string(),
                 });
 
@@ -248,6 +272,7 @@ pub unsafe fn intercept_proc_macro_table(dlsym_result: *mut libc::c_void) -> *mu
                 slots[slot_idx] = Some(TrampolineSlot {
                     original_run: client.run,
                     name: name.to_string(),
+                    krate: crates.get(i).cloned().unwrap_or_default(),
                     kind: "Bang".to_string(),
                 });
 
@@ -273,6 +298,57 @@ pub unsafe fn intercept_proc_macro_table(dlsym_result: *mut libc::c_void) -> *mu
     let fat_ptr_ptr: *const &'static [ProcMacro] = Box::leak(fat_ptr_box);
 
     fat_ptr_ptr as *mut libc::c_void
+}
+
+/// The defining crate for each `run` pointer, resolved through the owning dylib's
+/// symbol table.
+///
+/// Returns an empty crate for any entry it cannot resolve, so callers that only
+/// want to enrich a name they already have are never blocked by a lookup failure.
+#[cfg(unix)]
+fn defining_crates(runs: &[*const libc::c_void]) -> Vec<String> {
+    let unresolved = || vec![String::new(); runs.len()];
+    let Some(first) = runs.first().copied() else {
+        return Vec::new();
+    };
+    let Some((path, base)) = owning_dylib(first) else {
+        return unresolved();
+    };
+    let Ok(data) = std::fs::read(&path) else {
+        return unresolved();
+    };
+    let Ok(file) = object::File::parse(&*data) else {
+        return unresolved();
+    };
+    // Only v0 mangling keeps the generic argument naming the macro function, so on a
+    // legacy-mangling toolchain the crate comes from the dylib's file name instead.
+    let from_file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(cargo_macra::rustc_meta::crate_from_dylib_name)
+        .unwrap_or_default();
+    if debug_enabled() {
+        eprintln!("[macra-hook] crate lookup in {path:?} (file name says {from_file_name:?})");
+    }
+    use object::{Object, ObjectSymbol};
+    runs.iter()
+        .map(|run| {
+            let vaddr = (*run as usize).wrapping_sub(base) as u64;
+            let found = file
+                .symbols()
+                .find(|s| s.address() == vaddr)
+                .and_then(|s| s.name().ok());
+            if debug_enabled() && found.is_none() {
+                eprintln!("[macra-hook] no symbol at vaddr {vaddr:#x}");
+            }
+            found
+                .map(|sym| rustc_demangle::demangle(sym).to_string())
+                .and_then(|d| cargo_macra::rustc_meta::fn_name_from_symbol(&d))
+                .map(|(krate, _, _)| krate)
+                .filter(|krate| !krate.is_empty())
+                .unwrap_or_else(|| from_file_name.clone())
+        })
+        .collect()
 }
 
 /// Whether `MACRA_HOOK_DEBUG` is set.
@@ -338,6 +414,7 @@ pub unsafe fn intercept_client_slice_table(dlsym_result: *mut libc::c_void) -> *
     // Resolve each `run` pointer back to the function it wraps. Runtime addresses
     // are the load base plus the file's virtual address.
     let mut fn_names: Vec<String> = Vec::with_capacity(original_table.len());
+    let mut crates: Vec<String> = Vec::with_capacity(original_table.len());
     for client in original_table.iter() {
         let vaddr = (client.run as usize).wrapping_sub(base) as u64;
         let Some(sym) = file
@@ -351,7 +428,8 @@ pub unsafe fn intercept_client_slice_table(dlsym_result: *mut libc::c_void) -> *
             return dlsym_result;
         };
         let demangled = rustc_demangle::demangle(sym).to_string();
-        let Some((name, _is_attr)) = cargo_macra::rustc_meta::fn_name_from_symbol(&demangled)
+        let Some((krate, name, _is_attr)) =
+            cargo_macra::rustc_meta::fn_name_from_symbol(&demangled)
         else {
             if dbg {
                 eprintln!("[macra-hook] symbol is not a macro entry: {demangled}");
@@ -359,6 +437,7 @@ pub unsafe fn intercept_client_slice_table(dlsym_result: *mut libc::c_void) -> *
             return dlsym_result;
         };
         fn_names.push(name);
+        crates.push(krate);
     }
 
     // ELF names it `.rustc`; Mach-O carries it as `__rustc`.
@@ -403,6 +482,7 @@ pub unsafe fn intercept_client_slice_table(dlsym_result: *mut libc::c_void) -> *
         slots[slot_idx] = Some(TrampolineSlot {
             original_run: client.run,
             name: entry.name.clone(),
+            krate: crates.get(i).cloned().unwrap_or_default(),
             // Same spellings the older layout reports, so the driver's matching is
             // unchanged.
             kind: match entry.kind {

@@ -19,6 +19,12 @@ pub struct MacroExpansion {
     pub to: String,
     /// Macro name (e.g. `"println"`, `"derive"`, `"test"`).
     pub name: String,
+    /// Crate that defines the macro, when known. Empty for `-Z trace-macros`
+    /// output, which does not report it. Deliberately separate from `name`: two
+    /// same-named macros from different crates are told apart by this, but a derive
+    /// is routinely invoked through a re-export — `#[derive(serde::Serialize)]` for
+    /// a macro defined in `serde_derive` — so it can never be a match requirement.
+    pub krate: String,
     /// Kind of macro invocation.
     pub kind: MacroExpansionKind,
     /// Raw input token stream that the macro receives.
@@ -216,6 +222,8 @@ impl<R: Read> TraceParser<R> {
                         let input = Self::extract_arguments(&expanding);
                         let name = Self::extract_macro_name(&expanding);
                         expansions.push(MacroExpansion {
+                            // `-Z trace-macros` does not report a defining crate.
+                            krate: String::new(),
                             expanding,
                             arguments: String::new(),
                             to,

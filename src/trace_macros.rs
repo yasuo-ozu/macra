@@ -95,6 +95,8 @@ static LINKER_WRAPPER_CACHE: Mutex<Option<PathBuf>> = Mutex::new(None);
 #[derive(serde::Deserialize)]
 struct HookRecord {
     name: String,
+    #[serde(default)]
+    krate: String,
     kind: String,
     #[serde(default)]
     arguments: String,
@@ -123,6 +125,7 @@ fn parse_hook_json(json: &str) -> Option<MacroExpansion> {
     };
 
     Some(MacroExpansion {
+        krate: record.krate,
         expanding,
         arguments: record.arguments,
         to: record.output,
