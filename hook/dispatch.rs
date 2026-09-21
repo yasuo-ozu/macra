@@ -46,6 +46,62 @@ const METHOD_TOKEN_STREAM: u8 = 0x01;
 const TS_FROM_STR: u8 = 0x04;
 const TS_TO_STRING: u8 = 0x05;
 
+/// Flat `ApiTags` indices used from rustc 1.100.
+///
+/// `with_api!` used to nest methods under a type (`TokenStream { .. }`), so a
+/// request began with a group tag and a method tag. It is now one flat list
+/// declared as `#[repr(u8)] enum ApiTags`, encoded as a single byte:
+///
+/// ```text
+/// 0 track_env_var  2 literal_from_str  4 ts_drop   6 ts_is_empty     8 ts_from_str
+/// 1 track_path     3 emit_diagnostic   5 ts_clone  7 ts_expand_expr  9 ts_to_string
+/// ```
+const FLAT_TS_FROM_STR: u8 = 8;
+const FLAT_TS_TO_STRING: u8 = 9;
+
+/// How the running compiler encodes an RPC request tag.
+fn flat_tags() -> bool {
+    matches!(
+        crate::types::selected_abi(),
+        Some(crate::types::TableAbi::ClientSlice)
+    )
+}
+
+/// Split a request into `(from_str, to_string)` predicates for the ABI in use.
+///
+/// Older compilers prefix the tag with a group byte; newer ones do not, so the
+/// argument payload also starts one byte earlier.
+fn classify_request(data: &[u8]) -> (bool, bool, usize) {
+    if flat_tags() {
+        let tag = data.first().copied();
+        (
+            tag == Some(FLAT_TS_FROM_STR),
+            tag == Some(FLAT_TS_TO_STRING),
+            1,
+        )
+    } else {
+        let group = data.first().copied();
+        let index = data.get(1).copied();
+        let is_ts = group == Some(METHOD_TOKEN_STREAM);
+        (
+            is_ts && index == Some(TS_FROM_STR),
+            is_ts && index == Some(TS_TO_STRING),
+            2,
+        )
+    }
+}
+
+/// Encode a `ts_to_string` request for the ABI in use.
+fn ts_to_string_request(handle: u32) -> Vec<u8> {
+    let mut request = if flat_tags() {
+        vec![FLAT_TS_TO_STRING]
+    } else {
+        vec![METHOD_TOKEN_STREAM, TS_TO_STRING]
+    };
+    request.extend_from_slice(&handle.to_le_bytes());
+    request
+}
+
 /// Read a usize in little-endian from a byte slice at the given offset.
 /// On 64-bit systems, usize is 8 bytes.
 fn read_usize_le(data: &[u8], offset: usize) -> Option<usize> {
@@ -73,8 +129,7 @@ fn extract_string(data: &[u8], offset: usize) -> Option<String> {
 /// The wrapped dispatch function that intercepts bridge RPC calls
 unsafe extern "C" fn wrapped_dispatch(env: *mut u8, request: Buffer) -> Buffer {
     let request_data = request.as_slice().to_vec();
-    let method_group = request_data.first().copied();
-    let method_index = request_data.get(1).copied();
+    let (is_from_str, is_to_string, arg_offset) = classify_request(&request_data);
 
     // Forward to original dispatch
     let response = ORIGINAL_DISPATCH.with(|orig| {
@@ -84,15 +139,15 @@ unsafe extern "C" fn wrapped_dispatch(env: *mut u8, request: Buffer) -> Buffer {
     });
 
     // POST-FORWARD: Check the method tags and capture strings
-    if method_group == Some(METHOD_TOKEN_STREAM) {
-        if method_index == Some(TS_FROM_STR) {
-            // ts_from_str: request = [0x01] [0x04] [usize_le len] [UTF-8 string]
-            if let Some(s) = extract_string(&request_data, 2) {
+    {
+        if is_from_str {
+            // ts_from_str request: [tag(s)] [usize_le len] [UTF-8 string]
+            if let Some(s) = extract_string(&request_data, arg_offset) {
                 CAPTURED.with(|c| {
                     c.borrow_mut().from_str_calls.push(s);
                 });
             }
-        } else if method_index == Some(TS_TO_STRING) {
+        } else if is_to_string {
             // ts_to_string: response = [0x00 Ok] [usize_le len] [UTF-8 string]
             let response_data = response.as_slice();
             if response_data.first() == Some(&0x00) {
@@ -146,9 +201,7 @@ pub unsafe fn install_dispatch_interceptor<'a>(
 /// # Safety
 /// The dispatch closure's env pointer must still be valid.
 pub unsafe fn call_to_string_on_handle(handle: u32) -> Option<String> {
-    let mut request = vec![METHOD_TOKEN_STREAM, TS_TO_STRING];
-    request.extend_from_slice(&handle.to_le_bytes());
-    let buf = Buffer::from_vec(request);
+    let buf = Buffer::from_vec(ts_to_string_request(handle));
 
     let response = ORIGINAL_DISPATCH.with(|orig| {
         let orig = orig.borrow();
