@@ -2586,24 +2586,22 @@ impl App {
         let line = self.source_lines.get(self.cursor_line.saturating_sub(1))?;
         let trimmed = line.trim();
         // Match patterns: `mod foo;`, `pub mod foo;`, `pub(crate) mod foo;`, etc.
-        let rest = if let Some(rest) = trimmed.strip_prefix("mod ") {
-            rest
-        } else if let Some(after_pub) = trimmed.strip_prefix("pub ") {
+        let rest = match trimmed.strip_prefix("mod ") {
+            Some(rest) => rest,
             // Handle `pub mod`, `pub(crate) mod`, `pub(super) mod`, etc.
-            if let Some(rest) = after_pub.strip_prefix("mod ") {
-                rest
-            } else if after_pub.starts_with('(') {
-                // Find closing paren then look for `mod `
-                if let Some(close) = after_pub.find(')') {
-                    after_pub[close + 1..].trim_start().strip_prefix("mod ")?
-                } else {
-                    return None;
+            None => {
+                let after_pub = trimmed.strip_prefix("pub ")?;
+                match after_pub.strip_prefix("mod ") {
+                    Some(rest) => rest,
+                    // A visibility qualifier: skip past its closing paren.
+                    None => after_pub
+                        .strip_prefix('(')?
+                        .split_once(')')?
+                        .1
+                        .trim_start()
+                        .strip_prefix("mod ")?,
                 }
-            } else {
-                return None;
             }
-        } else {
-            return None;
         };
         // `rest` should be `name;` or `name ;`
         let rest = rest.trim();
@@ -3942,7 +3940,7 @@ mod tests {
         let mut child = node(MacroKind::Functional, 12, 4, 12);
         child.depth = 1;
         child.id = 2;
-        let nodes = vec![parent, child];
+        let nodes = [parent, child];
         let refs: Vec<&MacroNode> = nodes.iter().collect();
         assert_eq!(App::pick_node_at(&refs, 12, 4), Some(1));
         // Off the child's line, the parent still owns the range.

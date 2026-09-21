@@ -232,7 +232,7 @@ fn show_expansion() {
     // ---------------------------------------------------------------
     let ma = find_expansions(&expansions, "make_answer!");
     assert!(
-        ma.len() >= 1,
+        !ma.is_empty(),
         "Expected at least 1 make_answer! expansion, found {}.",
         ma.len(),
     );
@@ -253,7 +253,7 @@ fn show_expansion() {
     // ---------------------------------------------------------------
     let ahm = find_expansions(&expansions, "#[add_hello_method]");
     assert!(
-        ahm.len() >= 1,
+        !ahm.is_empty(),
         "Expected at least 1 #[add_hello_method] expansion, found {}.",
         ahm.len(),
     );

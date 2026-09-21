@@ -211,10 +211,7 @@ impl<R: Read> TraceParser<R> {
 
                 // Now look for the corresponding "to" line
                 loop {
-                    let to_line = match self.peek_line() {
-                        Some(l) => l.to_string(),
-                        None => return None,
-                    };
+                    let to_line = self.peek_line()?.to_string();
 
                     if to_line.contains("= note: to `") {
                         self.read_line(); // consume the line
