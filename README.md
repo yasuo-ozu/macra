@@ -33,8 +33,8 @@ context, which is useful for:
 
 | Category | Supported |
 | --- | --- |
-| rustc versions (CI) | `1.86.0`, `1.87.0`, `1.88.0`, `1.89.0`, `1.90.0`, `1.91.0`, plus `nightly` (non-blocking) |
-| Platforms (CI) | `ubuntu-latest`, `windows-latest`, `macos-latest` (Apple Silicon), `macos-15-intel` (Intel) |
+| rustc versions (CI) | `1.86` through `1.98`, plus `nightly` (non-blocking) |
+| Platforms (CI) | `ubuntu-latest`, `ubuntu-24.04-arm`, `windows-latest`, `windows-11-arm`, `macos-latest` (Apple Silicon), `macos-15-intel` (Intel) |
 
 ### Proc-macro capture and the compiler
 
