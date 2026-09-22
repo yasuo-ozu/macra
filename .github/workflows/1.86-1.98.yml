@@ -1,7 +1,7 @@
 # The release channels macra claims to support. Every cell gates: 1.98 included, since
 # the proc-macro tests skip rather than fail on a compiler with no mapped bridge ABI,
 # so a red 1.98 means something other than the known unmapped table layout.
-name: Test
+name: "1.86-1.98"
 
 on:
   push:
