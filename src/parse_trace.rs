@@ -82,7 +82,12 @@ impl<R: Read> TraceParser<R> {
         match self.reader.read_line(&mut self.current_line) {
             Ok(0) => None,
             Ok(_) => {
-                let line = self.current_line.trim_end_matches('\n');
+                // Also drop a '\r' so a CRLF-converted capture still ends its
+                // lines in the closing backtick.
+                let line = self
+                    .current_line
+                    .trim_end_matches('\n')
+                    .trim_end_matches('\r');
                 Some(Self::strip_ansi_escape_sequences(line))
             }
             Err(_) => None,
@@ -96,41 +101,76 @@ impl<R: Read> TraceParser<R> {
         self.peeked_line.as_deref()
     }
 
-    /// Extract content between backticks, handling multi-line content.
-    /// Returns the content and consumes lines as needed.
+    /// Extract the backtick-delimited text of a `= note: expanding` / `= note: to`
+    /// note, consuming continuation lines as needed.  `first_line` is the line
+    /// holding the `= note:` prefix; it has already been consumed.
     ///
-    /// The rustc trace-macros output wraps expanding/to content in backticks:
-    ///   `= note: to \`CONTENT\``
-    /// Content may itself contain backticks (e.g. doc comments with markdown
-    /// links like `` [`something`] ``).  For single-line content the closing
-    /// backtick is the *last* backtick on the line.  For multi-line content
-    /// the closing backtick is the last character on the final line.
+    /// rustc wraps the text in backticks and the text may itself contain
+    /// backticks: a `macro_rules!` that emits a documented item produces
+    ///
+    ///   = note: to `/// Wraps a [`Vec`] of items; see also [`String`] and [`Option`] for the general idea.
+    ///           pub struct Foo
+    ///           { ... }
+    ///           impl Foo { pub const N : u32 = inner! (); }`
+    ///
+    /// so neither "the last backtick on the first line" nor "the first line that
+    /// ends in a backtick" locates the closing delimiter: the first line ends in
+    /// one and the note goes on for three more.  What is reliable is the shape
+    /// of rustc's emitter output: every continuation line of a multi-line note
+    /// is padded with spaces up to the column where the note text starts, i.e.
+    /// right after `= note: ` (10 spaces for a one-digit line-number gutter, 11
+    /// for two digits, 13 for four; verified on 1.86, 1.97 and nightly).  That
+    /// padding is applied even to an empty line inside a raw string literal.
+    /// Nothing that can follow a note is indented that deeply: the next
+    /// `= note:` sits 8 columns to the left, `note: trace_macro`, `warning:` and
+    /// `error:` start at column 0, and cargo's right-aligned status words
+    /// (`    Finished`, `     Running`) never exceed 7 spaces.
+    ///
+    /// So a line ends the note iff it ends with a backtick *and* the next line
+    /// is not a continuation line (or there is no next line).  A line that does
+    /// not end in a backtick is never terminal, whatever follows it, which keeps
+    /// the behaviour for ordinary notes identical to before.  EOF before the
+    /// closing backtick yields `None`.
     fn extract_backtick_content(&mut self, first_line: &str) -> Option<String> {
-        // Find the opening backtick
+        // Find the opening backtick.  It is ASCII, so `start_idx + 1` is a char
+        // boundary.
         let start_idx = first_line.find('`')?;
-        let after_backtick = &first_line[start_idx + 1..];
 
-        // Check if content ends on the same line (use rfind to skip inner backticks)
-        if let Some(end_idx) = after_backtick.rfind('`') {
-            return Some(after_backtick[..end_idx].to_string());
-        }
+        // Column at which rustc pads continuation lines: the text column of the
+        // note, i.e. just past `= note: `.  Callers only pass lines that contain
+        // `= note: `, so the fallback is never hit in practice; the opening
+        // backtick's column is the closest stand-in if it ever is.
+        let pad = first_line
+            .find("note: ")
+            .map(|i| i + "note: ".len())
+            .unwrap_or(start_idx + 1);
 
-        // Multi-line content: collect until closing backtick at end of line
-        let mut content = after_backtick.to_string();
-
+        let mut content = String::new();
+        let mut line = first_line[start_idx + 1..].to_string();
         loop {
-            let line = self.read_line()?;
-            if line.ends_with('`') {
-                content.push('\n');
+            if line.ends_with('`') && !self.next_line_is_continuation(pad) {
+                // '`' is one byte, so `len() - 1` is a char boundary.
                 content.push_str(&line[..line.len() - 1]);
-                break;
-            } else {
-                content.push('\n');
-                content.push_str(&line);
+                return Some(content);
             }
+            content.push_str(&line);
+            content.push('\n');
+            line = self.read_line()?;
         }
+    }
 
-        Some(content)
+    /// Whether the next line (without consuming it) is a continuation line of
+    /// the current note, i.e. starts with at least `pad` spaces.  EOF is not a
+    /// continuation.  Compares bytes, so multibyte content after the padding is
+    /// irrelevant.
+    fn next_line_is_continuation(&mut self, pad: usize) -> bool {
+        match self.peek_line() {
+            Some(next) => {
+                let bytes = next.as_bytes();
+                bytes.len() >= pad && bytes[..pad].iter().all(|&b| b == b' ')
+            }
+            None => false,
+        }
     }
 
     /// Extract macro name from an `expanding` string.
@@ -523,5 +563,283 @@ note: trace_macro
         assert_eq!(groups[2].expansions.len(), 1);
         assert_eq!(groups[2].expansions[0].expanding, "Token! { = }");
         assert_eq!(groups[2].expansions[0].to, "$crate :: token :: Eq");
+    }
+
+    /// Real output of `RUSTFLAGS="-Z trace-macros" cargo +1.97.0 check` for a
+    /// `macro_rules!` that emits a documented item.  The first line of the `to`
+    /// note contains intra-doc links, so it has backticks of its own; the closing
+    /// backtick is on the fourth line.  Before the fix `to` was cut at the last
+    /// backtick of the first line and the nested `inner!` expansion was dropped.
+    #[test]
+    fn test_first_line_backtick_does_not_end_multiline_to() {
+        let input = r#"note: trace_macro
+  --> src/lib.rs:39:1
+   |
+39 | documented!();
+   | ^^^^^^^^^^^^^
+   |
+   = note: expanding `documented! {  }`
+   = note: to `/// Wraps a [`Vec`] of items; see also [`String`] and [`Option`] for the general idea.
+           pub struct Foo
+           { pub items : Vec < u32 > , pub name : String, pub extra : Option < u64 > , }
+           impl Foo { pub const N : u32 = inner! (); }`
+   = note: expanding `inner! {  }`
+   = note: to `42u32`
+
+note: trace_macro
+  --> src/lib.rs:40:1
+   |
+40 | trailing_tick!();
+   | ^^^^^^^^^^^^^^^^
+   |
+   = note: expanding `trailing_tick! {  }`
+   = note: to `pub struct Bar
+           {
+               pub a : u32, /// See [`Bar`]
+               pub b : u32,
+           }`
+
+note: trace_macro
+  --> src/lib.rs:41:1
+   |
+41 | one_line_tick!();
+   | ^^^^^^^^^^^^^^^^
+   |
+   = note: expanding `one_line_tick! {  }`
+   = note: to `/// a [`b`] c
+           pub const C : u32 = 1;`
+
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.01s
+"#;
+
+        let groups: Vec<_> = parse_trace(input.as_bytes()).collect();
+        assert_eq!(groups.len(), 3);
+
+        // The nested `inner!` expansion must survive.
+        assert_eq!(groups[0].expansions.len(), 2);
+        assert_eq!(groups[0].expansions[0].expanding, "documented! {  }");
+        assert_eq!(
+            groups[0].expansions[0].to,
+            r#"/// Wraps a [`Vec`] of items; see also [`String`] and [`Option`] for the general idea.
+           pub struct Foo
+           { pub items : Vec < u32 > , pub name : String, pub extra : Option < u64 > , }
+           impl Foo { pub const N : u32 = inner! (); }"#
+        );
+        assert_eq!(groups[0].expansions[1].expanding, "inner! {  }");
+        assert_eq!(groups[0].expansions[1].to, "42u32");
+
+        // Backticks on an inner line only.
+        assert_eq!(groups[1].expansions.len(), 1);
+        assert_eq!(
+            groups[1].expansions[0].to,
+            r#"pub struct Bar
+           {
+               pub a : u32, /// See [`Bar`]
+               pub b : u32,
+           }"#
+        );
+
+        // Backticks on the first line, which does not itself end in one.
+        assert_eq!(groups[2].expansions.len(), 1);
+        assert_eq!(
+            groups[2].expansions[0].to,
+            r#"/// a [`b`] c
+           pub const C : u32 = 1;"#
+        );
+    }
+
+    /// Real output (cargo +1.97.0, identical on 1.86.0 and nightly) with a
+    /// four-digit line-number gutter, so continuation lines carry 13 spaces of
+    /// padding rather than 11.  Three shapes rustc actually produces:
+    /// a `to` whose last content line ends in `";` right before the closing
+    /// backtick; a `to` whose first line ends in `]` after an intra-doc link and
+    /// whose closing backtick stands alone on the last line (the pretty-printer
+    /// emits a newline after a trailing doc comment); and a nested expansion.
+    #[test]
+    fn test_wide_gutter_and_closing_backtick_alone_on_last_line() {
+        let input = r#"note: trace_macro
+    --> src/lib.rs:1025:1
+     |
+1025 | documented!();
+     | ^^^^^^^^^^^^^
+     |
+     = note: expanding `documented! {  }`
+     = note: to `/// Wraps a [`Vec`] of items; see also [`String`] and [`Option`] for the general idea.
+             pub struct Foo
+             { pub items : Vec < u32 > , pub name : String, pub extra : Option < u64 > }
+             impl Foo { pub const N : u32 = inner! (); }`
+     = note: expanding `inner! {  }`
+     = note: to `42u32`
+
+note: trace_macro
+    --> src/lib.rs:1026:1
+     |
+1026 | raw_str!();
+     | ^^^^^^^^^^
+     |
+     = note: expanding `raw_str! {  }`
+     = note: to `pub const R : & str = r"first line
+             second line ends in `tick`";`
+
+note: trace_macro
+    --> src/lib.rs:1027:1
+     |
+1027 | tail_doc!();
+     | ^^^^^^^^^^^
+     |
+     = note: expanding `tail_doc! {  }`
+     = note: to `pub struct Baz; /// dangling [`Baz`]
+             `
+
+error: could not compile `probe2` (lib) due to 3 previous errors
+"#;
+
+        let groups: Vec<_> = parse_trace(input.as_bytes()).collect();
+        assert_eq!(groups.len(), 3);
+
+        assert_eq!(groups[0].expansions.len(), 2);
+        assert_eq!(
+            groups[0].expansions[0].to,
+            r#"/// Wraps a [`Vec`] of items; see also [`String`] and [`Option`] for the general idea.
+             pub struct Foo
+             { pub items : Vec < u32 > , pub name : String, pub extra : Option < u64 > }
+             impl Foo { pub const N : u32 = inner! (); }"#
+        );
+        assert_eq!(groups[0].expansions[1].to, "42u32");
+
+        assert_eq!(groups[1].expansions.len(), 1);
+        assert_eq!(
+            groups[1].expansions[0].to,
+            r#"pub const R : & str = r"first line
+             second line ends in `tick`";"#
+        );
+
+        assert_eq!(groups[2].expansions.len(), 1);
+        assert_eq!(
+            groups[2].expansions[0].to,
+            "pub struct Baz; /// dangling [`Baz`]\n             "
+        );
+    }
+
+    /// Real output (cargo +1.97.0) with a one-digit gutter: continuation lines
+    /// carry only 10 spaces, and here it is the `expanding` note, not `to`,
+    /// that spans two lines.
+    #[test]
+    fn test_one_digit_gutter_multiline_expanding() {
+        let input = r#"note: trace_macro
+ --> src/lib.rs:4:1
+  |
+4 | long_in!(aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb [`tick`] cccc);
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: expanding `long_in! { aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb [tick] cccc }`
+  = note: to `pub struct LongIn;`
+
+"#;
+
+        let groups: Vec<_> = parse_trace(input.as_bytes()).collect();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].expansions.len(), 1);
+        assert_eq!(
+            groups[0].expansions[0].expanding,
+            r#"long_in! { aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb [tick] cccc }"#
+        );
+        assert_eq!(groups[0].expansions[0].name, "long_in");
+        assert_eq!(groups[0].expansions[0].to, "pub struct LongIn;");
+    }
+
+    /// Real output (cargo +1.97.0) for a raw string literal containing an empty
+    /// line.  rustc pads the empty line to the note's text column instead of
+    /// emitting a genuinely blank line, and the line before it ends in a
+    /// backtick.  A "blank line ends the note" rule would cut the note there.
+    #[test]
+    fn test_padded_blank_line_inside_expansion() {
+        let input = r#"note: trace_macro
+ --> src/lib.rs:6:1
+  |
+6 | blank_inside!();
+  | ^^^^^^^^^^^^^^^
+  |
+  = note: expanding `blank_inside! {  }`
+  = note: to `pub const R : & str = r"code span `x`
+          
+          after blank";`
+
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.07s
+"#;
+
+        let groups: Vec<_> = parse_trace(input.as_bytes()).collect();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].expansions.len(), 1);
+        assert_eq!(
+            groups[0].expansions[0].to,
+            "pub const R : & str = r\"code span `x`\n          \n          after blank\";"
+        );
+    }
+
+    /// The same real notes when they are the very last thing in the input and
+    /// there is no trailing newline: the single-line and the multi-line shape
+    /// must both terminate at EOF, and a note cut off mid-way must be dropped
+    /// rather than returned truncated.
+    #[test]
+    fn test_note_at_eof() {
+        let single = "note: trace_macro\n  --> src/lib.rs:39:1\n   |\n   = note: expanding `inner! {  }`\n   = note: to `42u32`";
+        let groups: Vec<_> = parse_trace(single.as_bytes()).collect();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].expansions.len(), 1);
+        assert_eq!(groups[0].expansions[0].to, "42u32");
+
+        let multi = "note: trace_macro\n  --> src/lib.rs:41:1\n   |\n   = note: expanding `one_line_tick! {  }`\n   = note: to `/// a [`b`] c\n           pub const C : u32 = 1;`";
+        let groups: Vec<_> = parse_trace(multi.as_bytes()).collect();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].expansions.len(), 1);
+        assert_eq!(
+            groups[0].expansions[0].to,
+            "/// a [`b`] c\n           pub const C : u32 = 1;"
+        );
+
+        let truncated = "note: trace_macro\n  --> src/lib.rs:41:1\n   |\n   = note: expanding `one_line_tick! {  }`\n   = note: to `/// a [`b`] c\n           pub const C : u32 = 1;";
+        let groups: Vec<_> = parse_trace(truncated.as_bytes()).collect();
+        assert!(groups.is_empty());
+    }
+    /// Real output of `cargo +1.97.0 check --color=always`, byte for byte.  The
+    /// `= note:` prefix is split across CSI colour sequences that must be stripped
+    /// before the prefix or the padding column can be recognised, the doc comment
+    /// is multibyte text, and cargo's `Finished` line carries an OSC 8 hyperlink
+    /// (`ESC ] 8 ; ;` ... `ESC \`), which is not a CSI sequence and is left in the
+    /// line; it starts with four spaces so it can never be mistaken for a note
+    /// continuation.
+    #[test]
+    fn test_colored_output_with_multibyte_content() {
+        let input = "\u{1b}[1m\u{1b}[92mnote\u{1b}[0m\u{1b}[1m: trace_macro\u{1b}[0m\n\
+ \u{1b}[1m\u{1b}[94m--> \u{1b}[0msrc/lib.rs:9:1\n\
+  \u{1b}[1m\u{1b}[94m|\u{1b}[0m\n\
+\u{1b}[1m\u{1b}[94m9\u{1b}[0m \u{1b}[1m\u{1b}[94m|\u{1b}[0m documented!();\n\
+  \u{1b}[1m\u{1b}[94m|\u{1b}[0m \u{1b}[1m\u{1b}[92m^^^^^^^^^^^^^\u{1b}[0m\n\
+  \u{1b}[1m\u{1b}[94m|\u{1b}[0m\n\
+  \u{1b}[1m\u{1b}[94m= \u{1b}[0m\u{1b}[1mnote\u{1b}[0m: expanding `documented! {  }`\n\
+  \u{1b}[1m\u{1b}[94m= \u{1b}[0m\u{1b}[1mnote\u{1b}[0m: to `/// 日本語の説明: [`Vec`] を包む。詳細は [`String`] と [`Option`] を参照。\n\
+          pub struct Foo { pub items : Vec < u32 > } impl Foo\n\
+          { pub const N : u32 = inner! (); }`\n\
+  \u{1b}[1m\u{1b}[94m= \u{1b}[0m\u{1b}[1mnote\u{1b}[0m: expanding `inner! {  }`\n\
+  \u{1b}[1m\u{1b}[94m= \u{1b}[0m\u{1b}[1mnote\u{1b}[0m: to `42u32`\n\
+\n\
+\u{1b}[1m\u{1b}[92m    Finished\u{1b}[0m \u{1b}]8;;https://doc.rust-lang.org/cargo/reference/profiles.html#default-profiles\u{1b}\\`dev` profile [unoptimized + debuginfo]\u{1b}]8;;\u{1b}\\ target(s) in 0.07s\n\
+";
+
+        let groups: Vec<_> = parse_trace(input.as_bytes()).collect();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].expansions.len(), 2);
+        assert_eq!(groups[0].expansions[0].expanding, "documented! {  }");
+        assert_eq!(
+            groups[0].expansions[0].to,
+            "/// 日本語の説明: [`Vec`] を包む。詳細は [`String`] と [`Option`] を参照。\n\
+          pub struct Foo { pub items : Vec < u32 > } impl Foo\n\
+          { pub const N : u32 = inner! (); }"
+        );
+        assert_eq!(groups[0].expansions[1].expanding, "inner! {  }");
+        assert_eq!(groups[0].expansions[1].to, "42u32");
     }
 }
