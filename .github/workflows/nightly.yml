@@ -1,0 +1,43 @@
+# Nightly is split out of CI because it is non-gating for a different reason than
+# anything in that file: the hook reads rustc internals, so it breaks when upstream
+# moves rather than when this repository does. A red run here is a heads-up that the
+# bridge ABI shifted, not a defect in the commit that triggered it.
+name: Nightly
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  # Upstream moves on its own schedule, so check even when nothing lands here.
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test ( ${{ matrix.os }} nightly)
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every environment CI covers: those internals move per platform as well as
+        # per version, so an early warning is only useful if it spans the platforms
+        # we ship.
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+          - macos-15-intel
+          - ubuntu-24.04-arm
+          - windows-11-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - uses: ./.github/action
+        with:
+          rust: nightly

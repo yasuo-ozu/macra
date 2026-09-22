@@ -1,0 +1,114 @@
+name: Build and test macra
+description: >
+  Install a toolchain, run the workspace suite, then package the crate and smoke-test
+  the installed binary. Shared by the release-channel and nightly workflows so the two
+  cannot drift apart — the only thing that differs between them is the toolchain and
+  whether a failure gates.
+
+inputs:
+  rust:
+    description: Toolchain to install, as dtolnay/rust-toolchain names it.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Install Rust ${{ inputs.rust }}
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ inputs.rust }}
+
+    - name: Cache cargo registry and build artifacts
+      uses: Swatinem/rust-cache@v2
+
+    - name: remove Cargo.lock
+      shell: bash
+      run: rm -f Cargo.lock
+
+    - name: Run tests
+      shell: bash
+      # Without this a failure in external_crates stops show_expansion from
+      # running at all, hiding whatever else broke.
+      run: cargo test --workspace --all-targets --no-fail-fast
+
+    - name: Package and install from crate tarball
+      shell: pwsh
+      if: ${{ always() }}
+      run: |
+        cargo package --locked --allow-dirty
+
+        $crate = Get-ChildItem "target/package/cargo-macra-*.crate" | Select-Object -First 1
+        if (-not $crate) {
+          throw "crate tarball was not generated"
+        }
+
+        $work = Get-Location
+        $archive = Join-Path $env:RUNNER_TEMP "cargo-macra.crate"
+        $src = Join-Path $env:RUNNER_TEMP "cargo-macra-src"
+        Copy-Item $crate.FullName $archive -Force
+
+        Get-ChildItem -Force $work |
+          Where-Object { $_.Name -notin @(".", "..") } |
+          Remove-Item -Recurse -Force
+
+        New-Item -ItemType Directory -Path $src -Force | Out-Null
+        tar -xf $archive -C $src
+        $pkgDir = Get-ChildItem $src -Directory | Select-Object -First 1
+        if (-not $pkgDir) {
+          throw "failed to unpack crate source directory"
+        }
+
+        cargo install --path $pkgDir.FullName --locked --force
+
+        # Create a minimal smoke-test project (tests/test-usage is not in the package)
+        $testDir = Join-Path $env:RUNNER_TEMP "macra-smoke-test"
+        New-Item -ItemType Directory -Path $testDir -Force | Out-Null
+        @('[package]', 'name = "smoke-test"', 'version = "0.1.0"', 'edition = "2021"') |
+          Set-Content -Path (Join-Path $testDir "Cargo.toml")
+        New-Item -ItemType Directory -Path (Join-Path $testDir "src") -Force | Out-Null
+        @('macro_rules! greet {', '    ($name:expr) => { format!("Hello, {}!", $name) };', '}', 'pub fn hello() -> String { greet!("world") }') |
+          Set-Content -Path (Join-Path $testDir "src" "lib.rs")
+
+        $showExpansion = cargo-macra --show-expansion --manifest-path (Join-Path $testDir "Cargo.toml") --lib 2>&1
+        if ($LASTEXITCODE -ne 0) {
+          $showExpansion | Out-Host
+          throw "cargo-macra --show-expansion failed"
+        }
+
+        $requiredSnippets = @(
+          "== greet! ==",
+          '"world"',
+          "---",
+          'format!("Hello, {}!", "world")'
+        )
+
+        foreach ($snippet in $requiredSnippets) {
+          if (-not ($showExpansion | Select-String -SimpleMatch -Pattern $snippet)) {
+            $showExpansion | Out-Host
+            throw "Expected snippet not found in show-expansion output: $snippet"
+          }
+        }
+
+    - name: Debug show-expansion for known failing external crates
+      if: ${{ failure() }}
+      shell: pwsh
+      run: |
+        $cases = @(
+          @{ manifest = "tests/external_crates/coinduction/Cargo.toml"; test = "coinduction_integration_test" },
+          @{ manifest = "tests/external_crates/coinduction/Cargo.toml"; test = "complex" },
+          @{ manifest = "tests/external_crates/discriminant/Cargo.toml"; test = "test" },
+          @{ manifest = "tests/external_crates/newer-type/Cargo.toml"; test = "multi_self" },
+          @{ manifest = "tests/external_crates/parametrized/Cargo.toml"; test = "recursive" },
+          @{ manifest = "tests/external_crates/parametrized/Cargo.toml"; test = "test" },
+          @{ manifest = "tests/external_crates/parametrized/Cargo.toml"; test = "test_enum" },
+          @{ manifest = "tests/external_crates/parametrized/Cargo.toml"; test = "tuple" }
+        )
+
+        foreach ($case in $cases) {
+          Write-Host "=== show-expansion: manifest=$($case.manifest) test=$($case.test) ==="
+          cargo run -- --show-expansion --manifest-path $case.manifest --test $case.test
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "show-expansion failed for manifest=$($case.manifest) test=$($case.test)"
+          }
+        }
+        exit 0
