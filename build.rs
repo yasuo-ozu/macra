@@ -35,20 +35,32 @@ extern "C" fn trampoline_{i}(config: crate::types::BridgeConfig<'_>) -> crate::t
     fs::write(dest_path, code).expect("failed to write trampolines_generated.rs");
 }
 
+/// The file name rustc gives the hook cdylib on `target_os`.
+fn hook_lib_name(target_os: &str) -> &'static str {
+    match target_os {
+        "macos" => "libmacra_hook.dylib",
+        "windows" => "macra_hook.dll",
+        _ => "libmacra_hook.so",
+    }
+}
+
 fn main() {
     let out_dir = env::var("OUT_DIR").unwrap();
     write_trampolines(Path::new(&out_dir));
 
+    // A build script is compiled for the host, so `cfg!(target_os = ..)` here names
+    // the machine doing the building, not the one the crate is for; the crate's
+    // target arrives through these variables. Choosing the name from `cfg!` made
+    // `cargo check --target aarch64-pc-windows-msvc` build `libmacra_hook.so` and
+    // then fail in `src/lib.rs`, whose `include_bytes!` (a real target cfg) wanted
+    // `macra_hook.dll`.
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
+    let target = env::var("TARGET").unwrap();
+    let lib_name = hook_lib_name(&target_os);
+
     if env::var_os("MACRA_NESTED_BUILD").is_some() {
-        let lib_name = if cfg!(target_os = "macos") {
-            "libmacra_hook.dylib"
-        } else if cfg!(target_os = "windows") {
-            "macra_hook.dll"
-        } else {
-            "libmacra_hook.so"
-        };
         let _ = fs::write(Path::new(&out_dir).join(lib_name), []);
-        if cfg!(target_os = "windows") {
+        if target_os == "windows" {
             let _ = fs::write(Path::new(&out_dir).join("macra-rustc-wrapper.exe"), []);
         }
         return;
@@ -60,21 +72,26 @@ fn main() {
     // Use a separate target-dir to avoid cargo lock contention
     let hook_target_dir = Path::new(&out_dir).join("macra-hook-target");
 
-    // Determine the platform-specific library name
-    let lib_name = if cfg!(target_os = "macos") {
-        "libmacra_hook.dylib"
-    } else if cfg!(target_os = "windows") {
-        "macra_hook.dll"
-    } else {
-        "libmacra_hook.so"
-    };
-
+    // The nested build is told its target explicitly, native builds included. Left
+    // to itself it built for its own host, so `--target` on the outer command never
+    // reached the hook: for a same-OS foreign arch that meant a host-arch hook
+    // embedded into the binary, which the dynamic loader then rejected and
+    // proc-macro capture was simply absent, with nothing failing. It also read its
+    // output from `<dir>/<profile>/`, which is only where cargo puts it when no
+    // target is in play: with `CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu` in the
+    // environment the nested cargo emitted into `<dir>/<triple>/<profile>/` and the
+    // copy below died with "No such file". An explicit `--target` fixes the layout to
+    // `<dir>/<triple>/<profile>/` whatever the environment says, and it cannot
+    // disagree with an inherited `CARGO_BUILD_TARGET`, since that is where this
+    // script's own `TARGET` came from.
     let status = Command::new(&cargo)
         .arg("build")
         .arg("--example")
         .arg("macra-hook")
         .arg("--features")
         .arg("hook")
+        .arg("--target")
+        .arg(&target)
         .arg("--target-dir")
         .arg(&hook_target_dir)
         .args(if profile == "release" {
@@ -91,6 +108,7 @@ fn main() {
     }
 
     let built_lib = hook_target_dir
+        .join(&target)
         .join(&profile)
         .join("examples")
         .join(lib_name);
@@ -106,7 +124,7 @@ fn main() {
     });
 
     // On Windows, also build the RUSTC_WRAPPER binary
-    if cfg!(target_os = "windows") {
+    if target_os == "windows" {
         let wrapper_target_dir = Path::new(&out_dir).join("macra-rustc-wrapper-target");
 
         let status = Command::new(&cargo)
@@ -115,6 +133,8 @@ fn main() {
             .arg("macra-rustc-wrapper")
             .arg("--features")
             .arg("rustc-wrapper")
+            .arg("--target")
+            .arg(&target)
             .arg("--target-dir")
             .arg(&wrapper_target_dir)
             .env("MACRA_NESTED_BUILD", "1")
@@ -131,7 +151,10 @@ fn main() {
         }
 
         let wrapper_name = "macra-rustc-wrapper.exe";
-        let built_wrapper = wrapper_target_dir.join(&profile).join(wrapper_name);
+        let built_wrapper = wrapper_target_dir
+            .join(&target)
+            .join(&profile)
+            .join(wrapper_name);
         let wrapper_dest = Path::new(&out_dir).join(wrapper_name);
 
         std::fs::copy(&built_wrapper, &wrapper_dest).unwrap_or_else(|e| {
