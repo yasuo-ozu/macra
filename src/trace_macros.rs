@@ -273,7 +273,16 @@ impl TraceMacros {
             // hook (but with the same -Z trace-macros flag) would leave cached
             // artifacts that cargo considers "Fresh", causing it to replay
             // the cached stderr — which lacks hook output.
-            rustflags.extend(["--cfg", "macra_hook_active"].map(String::from));
+            //
+            // The id makes that true between two *different* hooks as well, not just
+            // hook versus no hook. Both report through stderr, so a crate built by an
+            // older hook stays Fresh and cargo replays its records verbatim: after the
+            // metadata scan was fixed, a stale `target/` still served the old scan's
+            // wrong macro names, which reads exactly like the fix not working.
+            rustflags.extend([
+                "--cfg".to_string(),
+                format!("macra_hook_active_{:016x}", crate::hook_build_id()),
+            ]);
 
             // All platforms use stderr for hook output.  The hook library
             // writes JSON lines to stderr with a `__MACRA_HOOK__:` prefix.

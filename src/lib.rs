@@ -481,6 +481,27 @@ pub fn bridge_abi_for(v: RustcVersion) -> Option<BridgeAbi> {
     }
 }
 
+/// A short id for the embedded hook's contents.
+///
+/// Cargo replays the cached stderr of a "Fresh" crate, and the hook's expansion
+/// records travel on stderr — so a crate compiled by an older hook keeps reporting
+/// that hook's output until something makes cargo consider it dirty. Folding this
+/// into the `--cfg` the driver passes does exactly that: a different hook is a
+/// different fingerprint. Without it, editing the hook and re-running showed the
+/// previous hook's macro names, which is indistinguishable from the hook being wrong.
+///
+/// Not cryptographic and not stable across releases; it only has to differ when the
+/// bytes differ.
+pub fn hook_build_id() -> u64 {
+    use std::hash::{Hash, Hasher};
+    static ID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *ID.get_or_init(|| {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        HOOK_LIB_BYTES.hash(&mut h);
+        h.finish()
+    })
+}
+
 /// Whether the rustc that will run the build is one macra has a bridge ABI for, or
 /// `None` when the compiler could not be probed at all.
 ///
