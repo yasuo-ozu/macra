@@ -1,7 +1,11 @@
-# Nightly is split out of CI because it is non-gating for a different reason than
-# anything in that file: the hook reads rustc internals, so it breaks when upstream
-# moves rather than when this repository does. A red run here is a heads-up that the
-# bridge ABI shifted, not a defect in the commit that triggered it.
+# Nightly gates. It can, because an unmapped compiler now skips the proc-macro
+# assertions instead of failing them: `bridge_abi_for` returns None for 1.98+ and for
+# prereleases at an ABI boundary, so a nightly the hook cannot safely drive still runs
+# the `macro_rules!` half, the build and the package smoke test. A red run therefore
+# means something this repository can act on, not merely that upstream moved.
+#
+# Kept in its own file because it is the one workflow whose input changes on someone
+# else's schedule, so it also runs on a timer rather than only on our commits.
 name: Nightly
 
 on:
@@ -18,7 +22,6 @@ jobs:
   test:
     name: Test ( ${{ matrix.os }} nightly)
     runs-on: ${{ matrix.os }}
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
