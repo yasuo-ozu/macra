@@ -89,30 +89,57 @@ fn ensure_hook_lib() -> Option<PathBuf> {
         cache_dir.join(format!("libmacra_hook-{}.so", arch))
     };
 
-    // If cached file exists with the right size, reuse it
-    if let Ok(meta) = std::fs::metadata(&dest) {
-        if meta.len() == HOOK_LIB_BYTES.len() as u64 {
-            // Ensure the arch-specific alias copy exists too.
-            if !dest_plain.exists() {
-                let _ = std::fs::copy(&dest, &dest_plain);
-            }
-            // Keep backward compatibility with the legacy plain file name.
-            let _ = std::fs::copy(&dest, cache_dir.join(lib_name));
-            return Some(dest_plain);
-        }
-    }
-
-    // Write the embedded bytes
-    if std::fs::create_dir_all(&cache_dir).is_err() {
-        return None;
-    }
-    if std::fs::write(&dest, HOOK_LIB_BYTES).is_err() {
-        return None;
-    }
-    let _ = std::fs::copy(&dest, &dest_plain);
-    let _ = std::fs::copy(&dest, cache_dir.join(lib_name));
+    install_bytes(&dest, HOOK_LIB_BYTES)?;
+    // The arch alias is the path handed out, so it has to carry this build too, not
+    // merely exist. The legacy plain name is kept for older cargo-macra binaries.
+    install_bytes(&dest_plain, HOOK_LIB_BYTES)?;
+    let _ = install_bytes(&cache_dir.join(lib_name), HOOK_LIB_BYTES);
 
     Some(dest_plain)
+}
+
+/// Make `dest` hold exactly `bytes`, replacing it atomically when it does not.
+///
+/// The comparison is on content, not size. This cache is what the test suite runs
+/// the hook from, and a hook edit that keeps the byte count — a changed constant, a
+/// same-length string such as the `GLIBC_2.xx` version names in `hook_linux.rs` —
+/// produces a same-sized file, which a size check kept serving from the previous
+/// build: the edit appeared to do nothing, in the tests and in the tool. (A stale
+/// embedded hook once caused the same symptom; `build.rs` explains that half.)
+/// Reading the ~12 MB back costs nothing next to the `cargo check` that follows.
+///
+/// The write goes to a private temp file that is then `rename`d over `dest`. The
+/// tests call this from several threads at once, and a plain `fs::write` truncates
+/// in place, so a thread that had already returned could hand rustc a path another
+/// thread was in the middle of rewriting. `rename` replaces the target atomically on
+/// the same filesystem, so every observer sees either the old complete file or the
+/// new one.
+fn install_bytes(dest: &Path, bytes: &[u8]) -> Option<()> {
+    let up_to_date = || std::fs::read(dest).is_ok_and(|have| have == bytes);
+    if up_to_date() {
+        return Some(());
+    }
+    let dir = dest.parent()?;
+    std::fs::create_dir_all(dir).ok()?;
+    // Unique per writer: threads of one process share a pid.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp = dir.join(format!(
+        ".{}.{}.{}.tmp",
+        dest.file_name()?.to_string_lossy(),
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    if std::fs::write(&tmp, bytes).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return None;
+    }
+    if std::fs::rename(&tmp, dest).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        // Windows refuses to replace a DLL some rustc still has mapped. The file in
+        // place is then usable only if a concurrent writer already put this build there.
+        return up_to_date().then_some(());
+    }
+    Some(())
 }
 
 /// Extract the embedded RUSTC_WRAPPER executable to the cache directory (Windows only).
@@ -126,22 +153,8 @@ fn ensure_wrapper_exe() -> Option<PathBuf> {
     let dest = cache_dir.join(&file_name);
     let dest_plain = cache_dir.join(format!("macra-rustc-wrapper-{}.exe", arch));
 
-    if let Ok(meta) = std::fs::metadata(&dest) {
-        if meta.len() == WRAPPER_EXE_BYTES.len() as u64 {
-            if !dest_plain.exists() {
-                let _ = std::fs::copy(&dest, &dest_plain);
-            }
-            return Some(dest_plain);
-        }
-    }
-
-    if std::fs::create_dir_all(&cache_dir).is_err() {
-        return None;
-    }
-    if std::fs::write(&dest, WRAPPER_EXE_BYTES).is_err() {
-        return None;
-    }
-    let _ = std::fs::copy(&dest, &dest_plain);
+    install_bytes(&dest, WRAPPER_EXE_BYTES)?;
+    install_bytes(&dest_plain, WRAPPER_EXE_BYTES)?;
 
     Some(dest_plain)
 }
@@ -358,6 +371,25 @@ pub fn bridge_abi_for(v: RustcVersion) -> Option<BridgeAbi> {
     };
     let abi = |table, rpc| Some(BridgeAbi { table, rpc });
     match (v.major, v.minor) {
+        // A pre-release's number does not say which side of an ABI change it is on.
+        // rustc's master bumps its minor when the previous beta branches, so every
+        // nightly of a six-week cycle reports the same `1.N.0-nightly`, and a change
+        // that lands mid-cycle splits that one number across two ABIs. Reproduced:
+        // `nightly-2026-01-22` and `nightly-2026-02-05` both say `1.95.0-nightly`, yet
+        // the former still has the nested tags (no `enum ApiTags` in its
+        // `library/proc_macro/src/bridge/mod.rs`) and the latter the flat ones.
+        // Driving the former with the flat numbering exits 101 with zero
+        // expansions, `thread 'rustc' panicked at library/proc_macro/src/bridge/
+        // mod.rs:190` and "the compiler unexpectedly panicked" — to the user an ICE
+        // in their own crate. So a pre-release gets nothing at a minor where the ABI
+        // moved: 95 (tags) and 98 (table; unmapped for everyone below anyway).
+        // Minors between boundaries are unambiguous — an early `1.94.0-nightly`
+        // carries 1.93's bridge, which is the same one — and stay mapped, including
+        // 86: 1.85's and 1.86's `bridge/` differ only in `pub` becoming `pub(crate)`.
+        // A beta is in fact safe, since it branches after the cycle's changes have
+        // landed, but `prerelease` does not tell the two apart and the loss is only
+        // proc-macro capture on a boundary beta, so both are treated the same.
+        (1, 95) | (1, 98) if v.prerelease => None,
         (1, 86..=94) => abi(TableLayout::ProcMacroEnum, RpcTags::Nested),
         (1, 95..=97) => abi(TableLayout::ProcMacroEnum, FLAT_95),
         // 1.98 onwards moved macro names and kinds out of the table into crate
@@ -395,6 +427,64 @@ pub fn proc_macro_capture_supported() -> Option<bool> {
     }
     let version = parse_rustc_version(&String::from_utf8_lossy(&out.stdout))?;
     Some(bridge_abi_for(version).is_some())
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("cargo-macra-{name}-{}", std::process::id()))
+    }
+
+    /// A size-only check served the old build whenever a hook edit kept the byte
+    /// count, so the edit looked like a no-op in the tests and the tool.
+    #[test]
+    fn same_length_content_change_replaces_the_cached_file() {
+        let dir = scratch("cache");
+        let dest = dir.join("sub").join("hook.bin");
+        install_bytes(&dest, b"GLIBC_2.34").expect("first install");
+        install_bytes(&dest, b"GLIBC_2.35").expect("second install");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"GLIBC_2.35");
+        // Nothing but the installed file may be left behind.
+        let names: Vec<_> = std::fs::read_dir(dest.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["hook.bin"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Concurrent writers each replace the file whole; no reader ever sees a
+    /// truncated or half-written one.
+    #[test]
+    fn concurrent_installs_never_expose_a_partial_file() {
+        let dir = scratch("cache-concurrent");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("hook.bin");
+        let a = vec![0xAAu8; 1 << 20];
+        let b = vec![0xBBu8; 1 << 20];
+        let writers: Vec<_> = (0..8)
+            .map(|i| {
+                let (dest, a, b) = (dest.clone(), a.clone(), b.clone());
+                std::thread::spawn(move || {
+                    for _ in 0..10 {
+                        install_bytes(&dest, if i % 2 == 0 { &a } else { &b }).expect("install");
+                        let seen = std::fs::read(&dest).unwrap();
+                        assert!(
+                            seen == a || seen == b,
+                            "partial file of {} bytes",
+                            seen.len()
+                        );
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 #[cfg(test)]
@@ -454,6 +544,27 @@ mod abi_tests {
             let abi = bridge_abi_for(v(minor, false)).expect("supported");
             assert_eq!(abi.table, TableLayout::ProcMacroEnum);
             assert_eq!(abi.rpc, flat_95);
+        }
+        // Every nightly of a cycle carries the same number, so `1.95.0-nightly` names
+        // both a nested-tag and a flat-tag compiler (nightly-2026-01-22 vs
+        // nightly-2026-02-05); the flat numbering panics the former inside the bridge.
+        assert_eq!(
+            bridge_abi_for(v(95, true)),
+            None,
+            "a 1.95 pre-release may predate the tag flattening"
+        );
+        // Between boundaries the number is unambiguous: an early 1.N nightly has
+        // 1.(N-1)'s bridge, and that is the same one. Disabling those too would turn
+        // off capture on every nightly, which is not the goal.
+        for (minor, rpc) in [
+            (86, RpcTags::Nested),
+            (94, RpcTags::Nested),
+            (96, flat_95),
+            (97, flat_95),
+        ] {
+            let abi = bridge_abi_for(v(minor, true))
+                .unwrap_or_else(|| panic!("1.{minor} pre-release is not at an ABI boundary"));
+            assert_eq!(abi.rpc, rpc, "1.{minor}-nightly");
         }
         // 1.98 onwards is deliberately unsupported: its table carries no names, and
         // recovering them from crate metadata mislabels derives (see `bridge_abi_for`).
