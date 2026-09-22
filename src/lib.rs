@@ -323,12 +323,19 @@ impl BridgeAbi {
     }
 }
 
-/// A rustc version as (major, minor), plus whether it is a pre-release.
+/// A rustc version as (major, minor), whether it is a pre-release, and the date of
+/// the commit it was built from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RustcVersion {
     pub major: u32,
     pub minor: u32,
     pub prerelease: bool,
+    /// The `commit-date` from the parenthesised build info, as `(year, month, day)`,
+    /// or `None` when the line carries none (a from-source build without git prints
+    /// `(unknown)`). A pre-release's number does not say which side of a mid-cycle
+    /// ABI change it is on; the date of the commit it was built from does — see the
+    /// 1.100 arm of [`bridge_abi_for`].
+    pub commit_date: Option<(u32, u32, u32)>,
 }
 
 /// Parse the `rustc -vV`/`--version` first line, e.g.
@@ -345,11 +352,27 @@ pub fn parse_rustc_version(output: &str) -> Option<RustcVersion> {
     let mut parts = numbers.split('.');
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next()?.parse().ok()?;
+    // `(<hash> <YYYY-MM-DD>)` follows the version; the date is its last word.
+    let commit_date = rest
+        .split_once('(')
+        .and_then(|(_, tail)| tail.split_once(')'))
+        .and_then(|(info, _)| info.split_whitespace().last())
+        .and_then(parse_ymd);
     Some(RustcVersion {
         major,
         minor,
         prerelease,
+        commit_date,
     })
+}
+
+/// `YYYY-MM-DD` as a tuple, so that `<`/`>=` order chronologically.
+fn parse_ymd(s: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = s.split('-');
+    let year = parts.next()?.parse().ok()?;
+    let month = parts.next()?.parse().ok()?;
+    let day = parts.next()?.parse().ok()?;
+    parts.next().is_none().then_some((year, month, day))
 }
 
 /// Which bridge shape this rustc exposes, or `None` when it is one macra has not
@@ -362,13 +385,43 @@ pub fn parse_rustc_version(output: &str) -> Option<RustcVersion> {
 /// rustc garbage pointers and the wrong tag numbering invokes the wrong bridge
 /// method, and both abort the compiler.
 pub fn bridge_abi_for(v: RustcVersion) -> Option<BridgeAbi> {
-    // The 1.95 flattening kept these indices. 1.100 removed a bridge method and
-    // shifted them to 8/9; that is recorded in the table in `RpcTags` but unused
-    // while 1.98+ is unmapped.
+    // The 1.95 flattening put `ts_from_str` and `ts_to_string` here, and they held
+    // through 1.99. Counting `with_api!` in the `library/proc_macro/src/bridge/mod.rs`
+    // shipped by 1.98.0 and by 1.99.0-beta.7 (rust-src component) gives, from 0:
+    // injected_env_var, track_env_var, track_path, literal_from_str, emit_diagnostic,
+    // ts_drop, ts_clone, ts_is_empty, ts_expand_expr, ts_from_str = 9,
+    // ts_to_string = 10. `declare_tags` turns that list into `enum ApiTags` in
+    // declaration order and `rpc_encode_decode!(enum ..)` sends `Tag::$variant as u8`.
     const FLAT_95: RpcTags = RpcTags::Flat {
         from_str: 9,
         to_string: 10,
     };
+    // 1.100 removed `injected_env_var`, the first method in the list (rust-lang/rust
+    // fadc7c6a3d, "Remove experimental `--env-set` option"), so everything after it
+    // moved down one: the same count in the 1.100.0-nightly (cea272fa3 2026-09-07)
+    // source starts at track_env_var = 0 and gives ts_from_str = 8, ts_to_string = 9.
+    // Confirmed by hand-driving the hook on that nightly: 8/9 intercepts all fourteen
+    // expansions of the probe crate with exit 0 and no panic, while 9/10 makes each
+    // one print `thread 'rustc' panicked at .../bridge/rpc.rs:118` ("range end index
+    // 4 out of range for slice of length 1"), then `.../bridge/mod.rs:412` ("entered
+    // unreachable code") and "the compiler unexpectedly panicked" — the hook's own
+    // `ts_to_string` request lands on `ts_from_token_tree`, which cannot decode a
+    // handle. The bridge catches those, so cargo still exits 0; the user sees 33
+    // ICE reports in their build.
+    const FLAT_100: RpcTags = RpcTags::Flat {
+        from_str: 8,
+        to_string: 9,
+    };
+    // The day the shift reached master, as `rustc -vV`'s `commit-date` reports it.
+    // fadc7c6a3d merged in rollup #162035 at 2026-08-31T04:41Z (merge 5321a4f40c).
+    // The official channel manifests place the shipped nightlies either side of it:
+    // nightly-2026-08-31 was built from 908501772 (commit-date 2026-08-30), 37 commits
+    // behind the merge; nightly-2026-09-01 from 0dfb098f3 (commit-date 2026-08-31),
+    // 40 commits ahead of it. So a `1.100.0-nightly` whose commit-date is on or after
+    // this day has the shift, and one dated earlier does not. (A from-source build of
+    // a master commit made in the four hours before the merge on this day would be
+    // misjudged; rustup never shipped one.)
+    const FLAT_100_LANDED: (u32, u32, u32) = (2026, 8, 31);
     let abi = |table, rpc| Some(BridgeAbi { table, rpc });
     match (v.major, v.minor) {
         // A pre-release's number does not say which side of an ABI change it is on.
@@ -382,28 +435,48 @@ pub fn bridge_abi_for(v: RustcVersion) -> Option<BridgeAbi> {
         // expansions, `thread 'rustc' panicked at library/proc_macro/src/bridge/
         // mod.rs:190` and "the compiler unexpectedly panicked" — to the user an ICE
         // in their own crate. So a pre-release gets nothing at a minor where the ABI
-        // moved: 95 (tags) and 98 (table; unmapped for everyone below anyway).
-        // Minors between boundaries are unambiguous — an early `1.94.0-nightly`
-        // carries 1.93's bridge, which is the same one — and stay mapped, including
-        // 86: 1.85's and 1.86's `bridge/` differ only in `pub` becoming `pub(crate)`.
-        // A beta is in fact safe, since it branches after the cycle's changes have
-        // landed, but `prerelease` does not tell the two apart and the loss is only
-        // proc-macro capture on a boundary beta, so both are treated the same.
+        // moved: 95 (tags) and 98 (table). Minors between boundaries are unambiguous
+        // — an early `1.94.0-nightly` carries 1.93's bridge, which is the same one —
+        // and stay mapped, including 86: 1.85's and 1.86's `bridge/` differ only in
+        // `pub` becoming `pub(crate)`. A beta is in fact safe, since it branches
+        // after the cycle's changes have landed, but `prerelease` does not tell the
+        // two apart and the loss is only proc-macro capture on a boundary beta, so
+        // both are treated the same. (1.100 is a boundary too, but one whose landing
+        // day is known, so it gets its own arm below instead of a blanket `None`.)
         (1, 95) | (1, 98) if v.prerelease => None,
         (1, 86..=94) => abi(TableLayout::ProcMacroEnum, RpcTags::Nested),
         (1, 95..=97) => abi(TableLayout::ProcMacroEnum, FLAT_95),
-        // 1.98 onwards moved macro names and kinds out of the table into crate
-        // metadata, and recovering them from there is not trustworthy: a derive record
-        // and an interned string share the tag byte `0x00`, so the scan in
-        // `rustc_meta` reports a doc comment, a `#[doc(alias)]` or a
-        // `#[deprecated(note = "..")]` as a derive and drops a real macro off the end
-        // — reproduced on stable 1.98.0 with no `cfg_attr` involved. It also misreads
-        // a derive's helper-attribute count as the next kind byte, so
-        // `#[proc_macro_derive(Serialize, attributes(serde))]` makes the scan fail
-        // outright. Only bang and attribute names are validated against the symbol
-        // table; derives are unchecked, which is exactly the common case. Until that
-        // is fixed these compilers get no hook: losing proc-macro capture is
-        // recoverable, showing the wrong macro name is not.
+        // 1.98 replaced the `&[ProcMacro]` table with a slice of bare `Client`s
+        // (rust-lang/rust 7edb1c086b "Remove ProcMacro enum from proc macro ABI",
+        // merged 2026-06-10 in #157683, inside the 1.98 cycle master began on
+        // 2026-05-22) and kept the 1.95 tags. Macro names and kinds now come from
+        // crate metadata, which is `rustc_meta`'s concern, not the bridge's. 1.99
+        // changed nothing here: GitHub's history of `library/proc_macro/src/bridge`
+        // jumps from 2026-06-15 straight to 2026-08-21, past both the 1.99 bump
+        // (merged 2026-07-05) and the 1.100 bump (merged 2026-08-15), so every
+        // `1.99.0-nightly` carries 1.98's bridge and stays mapped. Verified by
+        // hand-driving the hook with `slice,flat,9,10`: 1.98.0 and 1.99.0-beta.7 both
+        // exit 0 with all fourteen bang, attribute and derive expansions intercepted
+        // and no panic.
+        (1, 98..=99) => abi(TableLayout::ClientSlice, FLAT_95),
+        // A 1.100 pre-release is a boundary case like 95: the tag shift landed sixteen
+        // days into the cycle, so `1.100.0-nightly` names both numberings. Unlike 95
+        // the landing is pinned to a day (`FLAT_100_LANDED`), so the commit-date
+        // decides. Nightlies from before it are left unmapped rather than given the
+        // 1.99 numbering they carry: nothing installed can confirm that side, and a
+        // nightly from those sixteen days is not one anybody is still building with.
+        // An undated line (`(unknown)`) is unmapped for the same reason.
+        (1, 100) if v.prerelease => match v.commit_date {
+            Some(date) if date >= FLAT_100_LANDED => abi(TableLayout::ClientSlice, FLAT_100),
+            _ => None,
+        },
+        // A stable 1.100 necessarily contains the merge — its beta branches from master
+        // weeks after it — and nothing else has touched `bridge/` on master through
+        // 2026-09-23 (e4d8f07417, 16-bit support, changes only `arena.rs` and
+        // `fxhash.rs`, neither on the wire). Not yet released, so this is the one arm
+        // established from source alone; the nightly above is the same code.
+        (1, 100) => abi(TableLayout::ClientSlice, FLAT_100),
+        // Anything newer is unverified. Guessing does not fail cleanly, see above.
         _ => None,
     }
 }
@@ -499,16 +572,35 @@ mod abi_tests {
             (1, 90, false)
         );
 
+        assert_eq!(stable.commit_date, Some((2025, 9, 14)));
+
         let nightly =
             parse_rustc_version("rustc 1.100.0-nightly (cea272fa3 2026-09-07)\n").unwrap();
         assert_eq!(
             (nightly.major, nightly.minor, nightly.prerelease),
             (1, 100, true)
         );
+        // The commit-date is what places a 1.100 nightly relative to the tag shift.
+        assert_eq!(nightly.commit_date, Some((2026, 9, 7)));
+
+        let beta = parse_rustc_version("rustc 1.99.0-beta.7 (aa0593682 2026-09-19)\n").unwrap();
+        assert_eq!((beta.minor, beta.prerelease), (99, true));
+        assert_eq!(beta.commit_date, Some((2026, 9, 19)));
 
         // `rustc -vV` puts the same first line above a details block.
         let verbose = parse_rustc_version("rustc 1.88.0 (abc 2025-06-01)\nbinary: rustc\n");
         assert_eq!(verbose.unwrap().minor, 88);
+
+        // A build without git info, or one printing no build info at all, still
+        // parses; it just has no date to place it with.
+        let unknown = parse_rustc_version("rustc 1.100.0-dev (unknown)\n").unwrap();
+        assert_eq!((unknown.minor, unknown.prerelease), (100, true));
+        assert_eq!(unknown.commit_date, None);
+        let bare = parse_rustc_version("rustc 1.86.0\n").unwrap();
+        assert_eq!(
+            (bare.minor, bare.prerelease, bare.commit_date),
+            (86, false, None)
+        );
 
         assert!(parse_rustc_version("not rustc at all").is_none());
         assert!(parse_rustc_version("").is_none());
@@ -523,10 +615,19 @@ mod abi_tests {
             major: 1,
             minor,
             prerelease,
+            commit_date: None,
         };
         let flat_95 = RpcTags::Flat {
             from_str: 9,
             to_string: 10,
+        };
+        let flat_100 = RpcTags::Flat {
+            from_str: 8,
+            to_string: 9,
+        };
+        let slice = |rpc| BridgeAbi {
+            table: TableLayout::ClientSlice,
+            rpc,
         };
 
         // The table stayed an enum through 1.97, but 1.95 flattened the RPC tags —
@@ -545,6 +646,17 @@ mod abi_tests {
             assert_eq!(abi.table, TableLayout::ProcMacroEnum);
             assert_eq!(abi.rpc, flat_95);
         }
+        // 1.98 swapped the table for a slice of `Client`s and kept the 1.95 tags; 1.99
+        // touched neither. 1.100 dropped `injected_env_var` and both tags moved down.
+        for minor in 98..=99 {
+            assert_eq!(
+                bridge_abi_for(v(minor, false)),
+                Some(slice(flat_95)),
+                "1.{minor}"
+            );
+        }
+        assert_eq!(bridge_abi_for(v(100, false)), Some(slice(flat_100)));
+
         // Every nightly of a cycle carries the same number, so `1.95.0-nightly` names
         // both a nested-tag and a flat-tag compiler (nightly-2026-01-22 vs
         // nightly-2026-02-05); the flat numbering panics the former inside the bridge.
@@ -552,6 +664,13 @@ mod abi_tests {
             bridge_abi_for(v(95, true)),
             None,
             "a 1.95 pre-release may predate the tag flattening"
+        );
+        // Likewise `1.98.0-nightly` names both table layouts (the slice landed
+        // 2026-06-10, nineteen days into the cycle).
+        assert_eq!(
+            bridge_abi_for(v(98, true)),
+            None,
+            "a 1.98 pre-release may predate the slice table"
         );
         // Between boundaries the number is unambiguous: an early 1.N nightly has
         // 1.(N-1)'s bridge, and that is the same one. Disabling those too would turn
@@ -561,27 +680,62 @@ mod abi_tests {
             (94, RpcTags::Nested),
             (96, flat_95),
             (97, flat_95),
+            (99, flat_95),
         ] {
             let abi = bridge_abi_for(v(minor, true))
                 .unwrap_or_else(|| panic!("1.{minor} pre-release is not at an ABI boundary"));
             assert_eq!(abi.rpc, rpc, "1.{minor}-nightly");
         }
-        // 1.98 onwards is deliberately unsupported: its table carries no names, and
-        // recovering them from crate metadata mislabels derives (see `bridge_abi_for`).
-        for minor in [98, 99, 100, 101] {
+        // 1.100 is a boundary whose landing day is known (the shift merged on
+        // 2026-08-31; nightly-2026-08-31 is dated 08-30 and predates it,
+        // nightly-2026-09-01 is dated 08-31 and has it), so the commit-date decides:
+        // nothing without one, nothing before the day, the new tags from it on.
+        let dated = |commit_date| RustcVersion {
+            major: 1,
+            minor: 100,
+            prerelease: true,
+            commit_date: Some(commit_date),
+        };
+        assert_eq!(
+            bridge_abi_for(v(100, true)),
+            None,
+            "an undated 1.100 pre-release could be on either side of the shift"
+        );
+        for date in [(2026, 8, 14), (2026, 8, 30)] {
             assert_eq!(
-                bridge_abi_for(v(minor, false)),
+                bridge_abi_for(dated(date)),
                 None,
-                "1.{minor} must not select an ABI while the metadata scan is unsound"
+                "a 1.100 nightly dated {date:?} still has the 1.99 tags"
             );
-            assert_eq!(bridge_abi_for(v(minor, true)), None);
         }
+        for date in [(2026, 8, 31), (2026, 9, 7), (2026, 10, 1)] {
+            assert_eq!(
+                bridge_abi_for(dated(date)),
+                Some(slice(flat_100)),
+                "a 1.100 pre-release dated {date:?} has the shifted tags"
+            );
+        }
+        // The date rule is specific to the 1.100 boundary; it does not vouch for a
+        // later minor just because it is recent.
+        assert_eq!(
+            bridge_abi_for(RustcVersion {
+                major: 1,
+                minor: 101,
+                prerelease: true,
+                commit_date: Some((2026, 9, 30)),
+            }),
+            None
+        );
+        // Newer minors are unverified and select nothing.
+        assert_eq!(bridge_abi_for(v(101, false)), None);
+        assert_eq!(bridge_abi_for(v(101, true)), None);
         assert_eq!(bridge_abi_for(v(85, false)), None);
         assert_eq!(
             bridge_abi_for(RustcVersion {
                 major: 2,
                 minor: 0,
-                prerelease: false
+                prerelease: false,
+                commit_date: None,
             }),
             None
         );
@@ -589,11 +743,12 @@ mod abi_tests {
 
     #[test]
     fn abi_round_trips_through_the_handshake() {
-        for minor in [86, 95, 97] {
+        for minor in [86, 95, 97, 98, 100] {
             let abi = bridge_abi_for(RustcVersion {
                 major: 1,
                 minor,
                 prerelease: false,
+                commit_date: None,
             })
             .expect("supported");
             assert_eq!(BridgeAbi::from_env(&abi.as_env()), Some(abi), "1.{minor}");
