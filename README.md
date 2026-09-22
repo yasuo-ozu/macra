@@ -1,4 +1,4 @@
-# cargo-macra [![Latest Version]][crates.io] [![Documentation]][docs.rs] [![CI]][ci] [![Nightly]][nightly] [![MSRV]][msrv] [![License]][license]
+# cargo-macra [![Latest Version]][crates.io] [![Documentation]][docs.rs] [![Check]][check] [![Test]][test] [![Nightly]][nightly] [![MSRV]][msrv] [![License]][license]
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/yasuo-ozu/macra/refs/heads/main/logo.png" alt="cargo-macra logo" width="320" />
@@ -8,8 +8,10 @@
 [crates.io]: https://crates.io/crates/cargo-macra
 [Documentation]: https://img.shields.io/docsrs/cargo-macra
 [docs.rs]: https://docs.rs/cargo-macra/latest/cargo_macra/
-[CI]: https://github.com/yasuo-ozu/macra/actions/workflows/ci.yml/badge.svg
-[ci]: https://github.com/yasuo-ozu/macra/actions/workflows/ci.yml
+[Check]: https://github.com/yasuo-ozu/macra/actions/workflows/check.yml/badge.svg
+[check]: https://github.com/yasuo-ozu/macra/actions/workflows/check.yml
+[Test]: https://github.com/yasuo-ozu/macra/actions/workflows/test.yml/badge.svg
+[test]: https://github.com/yasuo-ozu/macra/actions/workflows/test.yml
 [Nightly]: https://github.com/yasuo-ozu/macra/actions/workflows/nightly.yml/badge.svg
 [nightly]: https://github.com/yasuo-ozu/macra/actions/workflows/nightly.yml
 [MSRV]: https://img.shields.io/badge/MSRV-1.86-blue.svg

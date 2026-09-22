@@ -1,4 +1,7 @@
-name: CI
+# The release channels macra claims to support. Every cell gates: 1.98 included, since
+# the proc-macro tests skip rather than fail on a compiler with no mapped bridge ABI,
+# so a red 1.98 means something other than the known unmapped table layout.
+name: Test
 
 on:
   push:
@@ -7,26 +10,6 @@ on:
   pull_request:
 
 jobs:
-  check:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: stable
-
-      - name: clippy
-        run: cargo clippy --workspace --no-deps -- -D warnings
-
-      - name: Generate docs
-        env:
-          RUSTDOCFLAGS: -D warnings
-        run: cargo doc --workspace --all-features --no-deps
   test:
     name: Test ( ${{ matrix.os }} ${{ matrix.rust }})
     runs-on: ${{ matrix.os }}
@@ -48,9 +31,6 @@ jobs:
           - "1.95"
           - "1.96"
           - "1.97"
-          # 1.98 gates like the rest: the proc-macro tests skip instead of fail on a
-          # compiler with no mapped bridge ABI, so a red 1.98 means something other
-          # than the known unmapped table layout.
           - "1.98"
     steps:
       - name: Checkout

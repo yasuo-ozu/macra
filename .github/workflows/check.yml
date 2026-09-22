@@ -1,0 +1,32 @@
+# Lint and docs: host- and toolchain-independent, so one runner on stable covers it.
+# Kept apart from the test matrix because it answers a different question — whether the
+# source is clean — and it should stay readable when a platform cell is red.
+name: Check
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+
+      - name: clippy
+        run: cargo clippy --workspace --no-deps -- -D warnings
+
+      - name: Generate docs
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --all-features --no-deps
