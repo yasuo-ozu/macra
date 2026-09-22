@@ -41,40 +41,8 @@ context, which is useful for:
 
 | Category | Supported |
 | --- | --- |
-| rustc versions (CI) | `1.86` through `1.98`, plus `nightly` (non-blocking) |
+| rustc versions (CI) | `1.86` through `1.98`, plus `nightly` |
 | Platforms (CI) | `ubuntu-latest`, `ubuntu-24.04-arm`, `windows-latest`, `windows-11-arm`, `macos-latest` (Apple Silicon), `macos-15-intel` (Intel) |
-
-### Proc-macro capture and the compiler
-
-Expanding `macro_rules!` macros only needs `-Z trace-macros`, so it works on any
-supported compiler. Capturing *procedural* macros additionally reads rustc's
-internal proc-macro table, which carries no stability guarantee and has already
-changed shape: through 1.97 it is an enum holding each macro's name and kind
-inline, and from 1.98 it is a bare array of function pointers with the names moved
-into crate metadata.
-
-Proc-macro capture therefore covers **1.86 through 1.97**. On 1.98 and later the
-names would have to be recovered from crate metadata, which is not reliable enough
-to ship — an ordinary crate attribute such as `#![cfg_attr(docsrs, ..)]` is
-indistinguishable from a derive name there — so those compilers get no hook and
-`macro_rules!` expansion only.
-
-Two things change independently, and both were established by probing each
-compiler rather than inferred:
-
-| rustc | decls table | bridge RPC tags | proc-macro capture |
-| --- | --- | --- | --- |
-| 1.86 – 1.94 | `&[ProcMacro]` enum | nested, two bytes | yes |
-| 1.95 – 1.97 | `&[ProcMacro]` enum | flat, `ts_to_string` = 10 | yes |
-| 1.98 – 1.99 | `&[Client]` slice | flat, `ts_to_string` = 10 | no |
-| 1.100 | `&[Client]` slice | flat, `ts_to_string` = 9 | no |
-
-`cargo-macra` detects the compiler it will drive and selects the matching pair. On
-a version it has not been verified against it skips the hook entirely rather than
-guessing — `macro_rules!` expansions still work, proc macros are simply not
-captured. Guessing is not a safe default: the wrong table stride hands rustc
-garbage pointers and the wrong tag invokes the wrong bridge method, and both abort
-the compiler.
 
 ## Install
 
@@ -163,42 +131,6 @@ terminal; `NO_COLOR` and `TERM=dumb` disable them as well.
 
 `Esc` deliberately does not quit: it is the cancel key for a pending expansion, and an
 `Esc` arriving just after the trace landed would otherwise exit the application.
-
-### Choosing which macro to expand
-
-The derives of a single `#[derive(A, B, C)]` are order-independent — each one
-receives the same item — so all of them are listed and any can be expanded first.
-Because they share a line, use `Left` / `Right` to move between them; the macro
-the cursor is on is highlighted in the source view.
-
-Attribute macros are different: `rustc` expands them outside-in and each one's
-output contains the remaining attributes, so only the outermost is offered. The
-rest appear as children once it has been expanded.
-
-### Ambiguous expansions
-
-Occasionally more than one recorded expansion matches the macro under the cursor and
-they expand to *different* code — most often two attribute macros of the same name whose
-inputs `rustc` and `syn` serialize differently, or a crate that generates several
-similarly named helper macros. Nothing in the trace says which one belongs to this call
-site, so `cargo-macra` asks rather than guessing:
-
-```text
-┌ Which 'my_attr'? ─────────────────────────────────┐
-│ > 1. #[my_attr] fn first() {}                     │
-│   2. #[my_attr] fn second() {}                    │
-│                                                   │
-│ expands to:                                       │
-│ fn first() {                                      │
-│     ...                                           │
-│ }                                                 │
-└───────────────────────────────────────────────────┘
-```
-
-`j` / `k` (or `Up` / `Down`) move between candidates, showing each one's expansion
-below; `Enter` expands the highlighted one and `Esc` backs out. Matches that expand to
-identical code are not a real choice and never open the popup — they are collapsed to a
-single candidate and expanded directly.
 
 ### Split view
 
