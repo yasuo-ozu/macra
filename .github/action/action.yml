@@ -47,8 +47,14 @@ runs:
         $src = Join-Path $env:RUNNER_TEMP "cargo-macra-src"
         Copy-Item $crate.FullName $archive -Force
 
+        # Emptying the checkout is what proves the installed binary needs no source
+        # tree. `.github` has to survive it: these steps now live in a local composite
+        # action, and the runner resolves `./.github/action` from the workspace — wipe
+        # it and the rest of the job cannot be loaded ("Can't find 'action.yml' ...
+        # Did you forget to run actions/checkout"). Nothing under `.github` is on any
+        # path the smoke test exercises, so keeping it does not weaken the check.
         Get-ChildItem -Force $work |
-          Where-Object { $_.Name -notin @(".", "..") } |
+          Where-Object { $_.Name -notin @(".", "..", ".github") } |
           Remove-Item -Recurse -Force
 
         New-Item -ItemType Directory -Path $src -Force | Out-Null
