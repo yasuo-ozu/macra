@@ -91,21 +91,22 @@ struct MacroNode {
     children: Vec<usize>,
     /// Whether children are visible (collapsed/expanded in tree view)
     children_visible: bool,
-    /// For derive macros: snapshot of sibling derive nodes' state before this expansion,
-    /// used to restore their state on undo.
-    /// Vec of (node_id, original_lines, line, line_end, item_line_end, derive_line)
-    derive_sibling_snapshot: Vec<(usize, Vec<String>, usize, usize, usize, usize)>,
     /// Identifies the derives of one `#[derive(A, B)]` on one item. Set to the id of
     /// the group's first derive, so it is unique and — unlike a line number — never
     /// moves. Matching siblings by line broke as soon as one of them was expanded and
     /// left its line, which made an already-expanded derive look unexpanded and get
     /// re-emitted in the remaining `#[derive(...)]`.
     derive_group: usize,
-    /// True when this node's source text was swallowed by an enclosing expansion, so
-    /// its coordinates describe lines that no longer exist. Such nodes are hidden
-    /// rather than shifted: the enclosing expansion re-discovers them as children, and
-    /// applying a negative shift to them wrapped their line numbers past `usize::MAX`.
-    consumed: bool,
+    /// Set when this node's source text was swallowed by an enclosing expansion (the
+    /// id of that expansion's node), so its coordinates describe lines that no longer
+    /// exist. Such nodes are hidden, and are un-hidden with their state intact when
+    /// the consumer is undone — an already-expanded node included, so the buffer the
+    /// undo puts back and the node agree. Which expansion swallowed a node decides
+    /// whether it moves when the buffer changes elsewhere (see `shift_nodes`): it moves
+    /// exactly when its consumer does. Applying a shift on the node's own stale line
+    /// number instead wrapped it past `usize::MAX` for the consuming expansion and left
+    /// it stranded inside another expansion's output for every later one.
+    consumed_by: Option<usize>,
     /// Nodes this expansion swallowed, un-hidden on undo.
     consumed_ids: Vec<usize>,
     /// Nodes this expansion relocated onto its lifted tail, as they were beforehand.
@@ -210,6 +211,10 @@ struct PendingChoice {
 #[derive(Debug, Clone)]
 struct RelocatedNode {
     id: usize,
+    /// `call.line` of the expanded node at the time. The snapshot below is absolute,
+    /// so undo restores it shifted by however far the expansion has moved since —
+    /// restoring it verbatim lost every expansion made above it in between.
+    anchor_line: usize,
     line: usize,
     line_end: usize,
     derive_line: usize,
@@ -941,6 +946,107 @@ fn expand_tabs(source: &str) -> String {
     out
 }
 
+/// What `$crate` is rewritten to before expansion output is handed to `find_macros`:
+/// `syn::parse_file` rejects the `$` token, but the placeholder is a plain identifier.
+const DOLLAR_CRATE_PLACEHOLDER: &str = "__macra_dollar_crate__";
+
+/// Map character column `col` of `safe_line` — a line of the placeholder-substituted
+/// parse text — back onto the real text, where every placeholder ending at or before
+/// `col` was a `$crate`. A span boundary never falls inside an identifier, so a
+/// placeholder is either wholly before the column or not counted.
+fn unsubstituted_col(safe_line: &str, col: usize) -> usize {
+    let prefix: String = safe_line.chars().take(col).collect();
+    let stretch = DOLLAR_CRATE_PLACEHOLDER.len() - "$crate".len();
+    col - prefix.matches(DOLLAR_CRATE_PLACEHOLDER).count() * stretch
+}
+
+/// The node whose position stands for `id`'s: `id` itself while it is visible, else
+/// the expansion that swallowed it — following the chain when that one was swallowed
+/// in turn. A consumed node's own coordinates are frozen at the moment it was hidden,
+/// so they say nothing about where its text will reappear; its consumer's do.
+fn anchor_of(nodes: &[MacroNode], id: usize) -> usize {
+    let mut cur = id;
+    // A hidden node cannot be expanded, so it cannot consume, and the chain is
+    // acyclic; the bound only keeps a corrupt one from spinning forever.
+    for _ in 0..nodes.len() {
+        match nodes
+            .iter()
+            .find(|n| n.id == cur)
+            .and_then(|n| n.consumed_by)
+        {
+            Some(next) => cur = next,
+            None => break,
+        }
+    }
+    cur
+}
+
+/// Account for node `edited` replacing buffer lines `first..=last` (1-indexed) with
+/// `delta` more (or, negative, fewer) lines.
+///
+/// `expand_node` and `undo_selected` both go through here, with opposite `delta`s,
+/// so they cannot disagree about which nodes move. They used to: expansion skipped
+/// every consumed node while undo skipped only its own, so a node swallowed by an
+/// earlier expansion was never moved forward but was moved back, ending up on a
+/// line inside another expansion's output once it was un-hidden.
+///
+/// A node moves when its anchor (`anchor_of`) starts after `first`. For a visible
+/// node that is its own line. A consumed node moves exactly when its consumer does,
+/// because that is where its text comes back on undo — and it stays put when the
+/// edit happens *inside* its consumer's output, which the consumer's undo removes
+/// wholesale. Nodes anchored on `edited` itself are the ones this edit swallowed;
+/// `pinned` are those relocated onto the lifted tail, already at their final place.
+///
+/// An unexpanded attribute or derive whose item encloses the edited range does not
+/// move, but its item grew or shrank with it, so `item_line_end` follows. Left stale,
+/// expanding the attribute later removed too few lines and stranded the rest of its
+/// item — `    baz();` ... `}` — after its end marker.
+fn shift_nodes(
+    nodes: &mut [MacroNode],
+    edited: usize,
+    first: usize,
+    last: usize,
+    delta: isize,
+    pinned: &[usize],
+) {
+    if delta == 0 {
+        return;
+    }
+    // Decide before moving anything: an anchor's line is itself about to change.
+    let moves: Vec<bool> = nodes
+        .iter()
+        .map(|node| {
+            let anchor = anchor_of(nodes, node.id);
+            anchor != edited
+                && !pinned.contains(&node.id)
+                && nodes
+                    .iter()
+                    .find(|n| n.id == anchor)
+                    .is_some_and(|a| a.call.line > first)
+        })
+        .collect();
+    let shifted = |v: usize| (v as isize + delta) as usize;
+    for (node, moves) in nodes.iter_mut().zip(moves) {
+        if moves {
+            node.call.line = shifted(node.call.line);
+            node.call.line_end = shifted(node.call.line_end);
+            node.call.item_line_end = shifted(node.call.item_line_end);
+            // `derive_line` keys the column span of derive nodes and can differ from
+            // `line` for a multi-line `#[derive(...)]`; leaving it behind silently
+            // breaks h/l stepping and the selection highlight.
+            node.call.derive_line = shifted(node.call.derive_line);
+        } else if node.id != edited
+            && node.consumed_by.is_none()
+            && !node.expanded
+            && node.call.kind != MacroKind::Functional
+            && node.call.line <= first
+            && node.call.item_line_end >= last
+        {
+            node.call.item_line_end = shifted(node.call.item_line_end);
+        }
+    }
+}
+
 /// Build the top-level macro nodes for one file.
 ///
 /// Shared by the initial file and by `enter_submodule` so a module behaves exactly
@@ -964,9 +1070,13 @@ fn build_root_nodes(source: &str, source_lines: &[String]) -> (Vec<MacroNode>, u
         .map(|m| m.item_line_end)
         .collect();
 
-    // Derives of one `#[derive(...)]` share an item, so group them by it — the group
-    // id is the first member's node id, which is unique and never shifts.
-    let mut derive_groups: std::collections::HashMap<usize, usize> =
+    // Derives of one `#[derive(...)]` share both their attribute's line and their
+    // item, so key the group on the pair — the group id is the first member's node
+    // id, which is unique and never shifts. The item alone is not enough:
+    // `#[derive(Debug)]` and `#[derive(Clone)]` stacked on one struct are two
+    // attributes, and treating them as siblings made expanding one re-shift the
+    // other's item end and restore it to stale coordinates on undo.
+    let mut derive_groups: std::collections::HashMap<(usize, usize), usize> =
         std::collections::HashMap::new();
 
     // Create root-level nodes for each macro found
@@ -1007,7 +1117,9 @@ fn build_root_nodes(source: &str, source_lines: &[String]) -> (Vec<MacroNode>, u
             .to_vec();
 
         let derive_group = if mac.kind == MacroKind::Derive {
-            *derive_groups.entry(mac.item_line_end).or_insert(next_id)
+            *derive_groups
+                .entry((mac.line, mac.item_line_end))
+                .or_insert(next_id)
         } else {
             next_id
         };
@@ -1024,10 +1136,9 @@ fn build_root_nodes(source: &str, source_lines: &[String]) -> (Vec<MacroNode>, u
             expanded_content: None,
             children: Vec::new(),
             children_visible: true,
-            derive_sibling_snapshot: Vec::new(),
             original_line_origins: Vec::new(),
             tail_relocation_snapshot: Vec::new(),
-            consumed: false,
+            consumed_by: None,
             consumed_ids: Vec::new(),
         });
         next_id += 1;
@@ -1403,10 +1514,13 @@ impl App {
         if !self.split_view {
             return Vec::new();
         }
+        // A node swallowed by an enclosing expansion keeps `expanded` (so undoing the
+        // consumer brings it back as it was), but its coordinates point into text
+        // that is not on screen; a region built from them would overlap the consumer's.
         let regions: Vec<SplitRegion> = self
             .nodes
             .iter()
-            .filter(|n| n.expanded)
+            .filter(|n| n.expanded && n.consumed_by.is_none())
             .filter_map(|n| {
                 n.expanded_content.as_ref()?;
                 let start = n.call.line.saturating_sub(1);
@@ -1470,7 +1584,7 @@ impl App {
         let root_ids: Vec<usize> = self
             .nodes
             .iter()
-            .filter(|n| n.parent_id.is_none() && !n.consumed)
+            .filter(|n| n.parent_id.is_none() && n.consumed_by.is_none())
             .map(|n| n.id)
             .collect();
 
@@ -1491,16 +1605,19 @@ impl App {
     }
 
     fn collect_visible_nodes(&mut self, node_id: usize) {
-        self.visible_nodes.push(node_id);
-
         // Get children and visibility
         let (children, children_visible) = {
             let node = self.nodes.iter().find(|n| n.id == node_id);
             match node {
+                // A consumed child is as gone as a consumed root: its text is inside
+                // another expansion's output. Listing it let Tab and `n` select it
+                // and expand it at coordinates that slice that output.
+                Some(n) if n.consumed_by.is_some() => return,
                 Some(n) => (n.children.clone(), n.children_visible),
                 None => return,
             }
         };
+        self.visible_nodes.push(node_id);
 
         if children_visible {
             for child_id in children {
@@ -1534,6 +1651,11 @@ impl App {
         // these nodes are excluded from.
         let delta = tail_line as isize - tail_src_line as isize;
         let shift = |v: usize| (v as isize + delta).max(1) as usize;
+        let anchor_line = nodes
+            .iter()
+            .find(|n| n.id == expanded_id)
+            .map(|n| n.call.line)
+            .unwrap_or(tail_src_line);
 
         let mut relocated = Vec::new();
         for node in nodes.iter_mut() {
@@ -1548,6 +1670,7 @@ impl App {
             {
                 let before = RelocatedNode {
                     id: node.id,
+                    anchor_line,
                     line: node.call.line,
                     line_end: node.call.line_end,
                     derive_line: node.call.derive_line,
@@ -1956,7 +2079,14 @@ impl App {
                 .get(line_end.saturating_sub(1))
                 .cloned()
                 .unwrap_or_default();
-            let tail = attribute_tail(&last_removed, col_start);
+            // A list spanning several lines — `#[derive(\n    A,\n)] struct S;` — closes
+            // on a line that has no `#[` of its own, so the attribute's own start is no
+            // help there; the item is whatever follows the bracket that closes it.
+            let tail = if line == line_end {
+                attribute_tail(&last_removed, col_start)
+            } else {
+                attribute_close_tail(&last_removed)
+            };
             if !tail.is_empty() {
                 lines.push(format!("{}{}", base_indent_str, tail));
                 derive_tail = tail;
@@ -2025,6 +2155,16 @@ impl App {
             .get(line_idx..(line_idx + lines_removed).min(self.line_origins.len()))
             .unwrap_or(&[])
             .to_vec();
+        // Likewise the text. The `original_lines` taken when the node was discovered
+        // predate any expansion made *inside* its range since — a `println!` expanded
+        // inside a `#[tokio::main] fn` — so undoing the attribute would put back the
+        // pre-`println!` text while the `println!` node still claims to be expanded.
+        // What undo has to restore is exactly what this expansion removes.
+        let replaced_lines: Vec<String> = self
+            .source_lines
+            .get(line_idx..(line_idx + lines_removed).min(self.source_lines.len()))
+            .unwrap_or(&[])
+            .to_vec();
 
         // Update source and line_origins: replace the lines with expanded lines
         if line_idx < self.source_lines.len() {
@@ -2065,101 +2205,50 @@ impl App {
             );
         }
 
-        // Nodes whose own line sat inside the range this expansion replaced describe
-        // text that no longer exists. Shifting them is meaningless and, when the
+        // Nodes whose own text sat inside the range this expansion replaced describe
+        // lines that no longer exist. Shifting them is meaningless and, when the
         // expansion is shorter than what it replaced (an attribute macro that strips
         // its item), the negative shift wrapped their line numbers past `usize::MAX` —
         // after which `n` threw the cursor outside the buffer. Hide them instead; the
-        // expansion re-discovers whatever survived as children.
+        // expansion re-discovers whatever survived as children, and undo brings them
+        // back as they were — an expanded one included (see `consumed_by`).
+        //
+        // The first line is the one exception: a functional call keeps the text before
+        // it on the marker line, so a macro there is untouched, and one after it is
+        // relocated with the tail. An attribute or derive expansion replaces that line
+        // whole, so `#[my_attr] fn f() { q!(1) }` loses `q` too — left visible, it
+        // pointed into `// -- expanded: my_attr --` and expanding it corrupted that
+        // line. The same rule swallows the other derives of a `#[derive(A, B)]`: the
+        // remaining `#[derive(B)]` line is part of this expansion's output, and the
+        // child discovery below finds `B` there with the right columns. Moving the
+        // root `B` onto that line as well produced two `B` nodes, one of them with
+        // its old columns.
         let mut consumed_ids: Vec<usize> = Vec::new();
         let removed_end = line + lines_removed;
         for node in &mut self.nodes {
+            let inside = node.call.line > line && node.call.line < removed_end
+                || node.call.line == line && kind != MacroKind::Functional;
             if node.id != node_id
-                && !node.consumed
-                && node.call.line > line
-                && node.call.line < removed_end
+                && node.consumed_by.is_none()
+                && inside
                 && !tail_relocation.iter().any(|r| r.id == node.id)
             {
-                node.consumed = true;
+                node.consumed_by = Some(node_id);
                 consumed_ids.push(node.id);
             }
         }
 
-        // Update line numbers for all nodes that come after this line
-        if lines_added != 0 {
-            for node in &mut self.nodes {
-                if node.id != node_id
-                    && node.call.line > line
-                    && !node.consumed
-                    && !tail_relocation.iter().any(|r| r.id == node.id)
-                {
-                    node.call.line = (node.call.line as isize + lines_added) as usize;
-                    node.call.line_end = (node.call.line_end as isize + lines_added) as usize;
-                    node.call.item_line_end =
-                        (node.call.item_line_end as isize + lines_added) as usize;
-                    // `derive_line` keys the column span of derive nodes and can differ
-                    // from `line` for a multi-line `#[derive(...)]`; leaving it behind
-                    // silently breaks h/l stepping and the selection highlight.
-                    node.call.derive_line = (node.call.derive_line as isize + lines_added) as usize;
-                }
-            }
-        }
-
-        // For derive macros: snapshot and update existing sibling derive nodes
-        // (only relevant for child-level derives where siblings already exist as nodes)
-        let mut derive_sibling_snapshot = Vec::new();
-        if kind == MacroKind::Derive {
-            let has_remaining_line = !remaining_derives.is_empty();
-
-            // Snapshot sibling state before modification (for undo)
-            for node in &self.nodes {
-                if node.id != node_id
-                    && node.call.kind == MacroKind::Derive
-                    && node.derive_group == derive_group
-                    && !node.expanded
-                {
-                    derive_sibling_snapshot.push((
-                        node.id,
-                        node.original_lines.clone(),
-                        node.call.line,
-                        node.call.line_end,
-                        node.call.item_line_end,
-                        node.call.derive_line,
-                    ));
-                }
-            }
-
-            // Update sibling derives
-            for node in &mut self.nodes {
-                if node.id != node_id
-                    && node.call.kind == MacroKind::Derive
-                    && node.derive_group == derive_group
-                    && !node.expanded
-                {
-                    if has_remaining_line {
-                        // The remaining #[derive(...)] line is the last line in formatted_lines
-                        // Last formatted line, unless a rescued item was appended
-                        // after it — attributes have to precede their item, so the
-                        // remaining `#[derive(...)]` sits one line further up then.
-                        let remaining_line_pos = line_idx + num_expanded_lines
-                            - 1
-                            - usize::from(!derive_tail.is_empty()); // 0-indexed
-                        node.call.line = remaining_line_pos + 1; // 1-indexed
-                        node.call.line_end = remaining_line_pos + 1;
-                        // The surviving derives are rewritten onto this one line, so the
-                        // node's column span now lives there as well.
-                        node.call.derive_line = remaining_line_pos + 1;
-                        // Update original_lines to the new remaining derive line
-                        if let Some(new_line) = self.source_lines.get(remaining_line_pos) {
-                            node.original_lines = vec![new_line.clone()];
-                        }
-                    }
-                    // Adjust item_line_end by the net line change
-                    node.call.item_line_end =
-                        (node.call.item_line_end as isize + lines_added) as usize;
-                }
-            }
-        }
+        // Move everything after the replaced range, and grow the item of an attribute
+        // that encloses it. The relocated nodes are already at their final position.
+        let relocated_ids: Vec<usize> = tail_relocation.iter().map(|r| r.id).collect();
+        shift_nodes(
+            &mut self.nodes,
+            node_id,
+            line,
+            removed_end - 1,
+            lines_added,
+            &relocated_ids,
+        );
 
         // Mark node as expanded and store expanded content
         if let Some(node) = self.get_node_mut(node_id) {
@@ -2169,35 +2258,53 @@ impl App {
             // expanded, and permanently excluded it from the derive-sibling retry.
             node.expansion_failed = false;
             node.expanded_content = Some(expanded_content.clone());
+            node.original_lines = replaced_lines;
             node.original_line_origins = replaced_origins;
             node.tail_relocation_snapshot = tail_relocation;
             node.consumed_ids = consumed_ids;
             node.children_visible = true;
-            node.derive_sibling_snapshot = derive_sibling_snapshot;
         }
 
         // Parse expanded content to find child macros (use content without markers).
         // Replace $crate with a valid identifier so syn::parse_file() can parse
         // expanded macro output that contains $crate tokens.
-        const DOLLAR_CRATE_PLACEHOLDER: &str = "__macra_dollar_crate__";
         let content_for_parsing_safe =
             content_for_parsing.replace("$crate", DOLLAR_CRATE_PLACEHOLDER);
         let child_macros = find_macros(&content_for_parsing_safe);
+        // The columns `find_macros` reports index the substituted text, but the
+        // buffer holds the real `$crate`, which is shorter than the placeholder; a
+        // child after a `$crate` on its line has to be mapped back or its span is
+        // skewed by the difference — the highlight sat on the wrong text and
+        // expanding it left the invocation in place. `input`, `arguments` and `krate`
+        // are mapped back below for the same reason.
+        let safe_lines: Vec<&str> = content_for_parsing_safe.lines().collect();
+        let real_col = |line_no: usize, col: usize| {
+            safe_lines
+                .get(line_no.saturating_sub(1))
+                .map_or(col, |text| unsubstituted_col(text, col))
+        };
 
         // Create child nodes
         let mut child_ids = Vec::new();
         // Same grouping as `build_root_nodes`, over the children of this expansion.
-        let mut child_derive_groups: std::collections::HashMap<usize, usize> =
+        let mut child_derive_groups: std::collections::HashMap<(usize, usize), usize> =
             std::collections::HashMap::new();
         for child_mac in child_macros {
             let child_id = self.next_id;
             self.next_id += 1;
             let child_derive_group = if child_mac.kind == MacroKind::Derive {
                 *child_derive_groups
-                    .entry(child_mac.item_line_end)
+                    .entry((child_mac.line, child_mac.item_line_end))
                     .or_insert(child_id)
             } else {
                 child_id
+            };
+            // A derive's columns sit on `derive_line`; anything else spans from its
+            // first line to its last.
+            let (col_line, col_end_line) = if child_mac.kind == MacroKind::Derive {
+                (child_mac.derive_line, child_mac.derive_line)
+            } else {
+                (child_mac.line, child_mac.line_end)
             };
 
             // Adjust child line number: account for the marker comment line at the start
@@ -2232,8 +2339,8 @@ impl App {
                     },
                     kind: child_mac.kind,
                     line: adjusted_line,
-                    col_start: child_mac.col_start,
-                    col_end: child_mac.col_end,
+                    col_start: real_col(col_line, child_mac.col_start),
+                    col_end: real_col(col_end_line, child_mac.col_end),
                     derive_line: adjusted_line + (child_mac.derive_line - child_mac.line),
                     line_end: adjusted_line + (child_mac.line_end - child_mac.line),
                     item_line_end: adjusted_line + (child_mac.item_line_end - child_mac.line),
@@ -2252,10 +2359,9 @@ impl App {
                 expanded_content: None,
                 children: Vec::new(),
                 children_visible: true,
-                derive_sibling_snapshot: Vec::new(),
                 original_line_origins: Vec::new(),
                 tail_relocation_snapshot: Vec::new(),
-                consumed: false,
+                consumed_by: None,
                 consumed_ids: Vec::new(),
             });
 
@@ -2317,10 +2423,8 @@ impl App {
         let (
             name,
             line,
-            kind,
             expanded,
             original_lines,
-            derive_sibling_snapshot,
             original_line_origins,
             tail_relocation,
             consumed_ids,
@@ -2332,10 +2436,8 @@ impl App {
             (
                 node.call.name.clone(),
                 node.call.line,
-                node.call.kind,
                 node.expanded,
                 node.original_lines.clone(),
-                node.derive_sibling_snapshot.clone(),
                 node.original_line_origins.clone(),
                 node.tail_relocation_snapshot.clone(),
                 node.consumed_ids.clone(),
@@ -2351,10 +2453,12 @@ impl App {
         let num_expanded_lines = self.actual_expanded_line_count(node_id);
 
         // `actual_expanded_line_count` only walks descendants, so an expanded node that
-        // is *not* a descendant but sits inside this range — a sibling derive, or a
-        // macro relocated onto the lifted tail — is not counted, and undoing would
-        // remove the wrong number of lines and strand its output. Ask the user to
-        // collapse it first rather than corrupting the buffer.
+        // is *not* a descendant but sits inside this range — a macro relocated onto
+        // the lifted tail — is not counted, and undoing would remove the wrong number
+        // of lines and strand its output. Ask the user to collapse it first rather
+        // than corrupting the buffer. A node this expansion swallowed is different:
+        // its output is part of the text `original_lines` puts back, and it is
+        // hidden, so asking to collapse it first would leave the undo impossible.
         let descendants = self.descendant_ids(node_id);
         let blocker = self
             .nodes
@@ -2363,6 +2467,7 @@ impl App {
                 n.expanded
                     && n.id != node_id
                     && !descendants.contains(&n.id)
+                    && !consumed_ids.contains(&n.id)
                     && n.call.line >= line
                     && n.call.line < line + num_expanded_lines
             })
@@ -2399,62 +2504,43 @@ impl App {
             }
         }
 
-        // Update line numbers for all nodes that come after this line
-        if lines_delta != 0 {
-            for node in &mut self.nodes {
-                if node.id != node_id
-                    && node.call.line > line
-                    && !consumed_ids.contains(&node.id)
-                    && !tail_relocation.iter().any(|r| r.id == node.id)
-                {
-                    node.call.line = (node.call.line as isize - lines_delta) as usize;
-                    node.call.line_end = (node.call.line_end as isize - lines_delta) as usize;
-                    node.call.item_line_end =
-                        (node.call.item_line_end as isize - lines_delta) as usize;
-                    node.call.derive_line = (node.call.derive_line as isize - lines_delta) as usize;
-                }
-            }
-        }
+        // Move everything after this block back, and shrink the item of an attribute
+        // that encloses it — the exact reverse of the expansion's `shift_nodes` call.
+        let relocated_ids: Vec<usize> = tail_relocation.iter().map(|r| r.id).collect();
+        shift_nodes(
+            &mut self.nodes,
+            node_id,
+            line,
+            line + num_expanded_lines - 1,
+            -lines_delta,
+            &relocated_ids,
+        );
 
-        // For derive macros: restore sibling derive nodes from snapshot
-        if kind == MacroKind::Derive {
-            for (
-                sib_id,
-                sib_original_lines,
-                sib_line,
-                sib_line_end,
-                sib_item_line_end,
-                sib_derive_line,
-            ) in &derive_sibling_snapshot
-            {
-                if let Some(sib_node) = self.get_node_mut(*sib_id) {
-                    sib_node.original_lines = sib_original_lines.clone();
-                    sib_node.call.line = *sib_line;
-                    sib_node.call.line_end = *sib_line_end;
-                    sib_node.call.item_line_end = *sib_item_line_end;
-                    sib_node.call.derive_line = *sib_derive_line;
-                }
-            }
-        }
-
-        // The nodes this expansion swallowed are visible again, with the coordinates
-        // they never lost (they were excluded from both shift loops).
+        // The nodes this expansion swallowed are visible again. Their coordinates
+        // moved with this node in the meantime (`shift_nodes` anchors them on it), so
+        // they describe the text just put back.
         for id in &consumed_ids {
             if let Some(node) = self.get_node_mut(*id) {
-                node.consumed = false;
+                node.consumed_by = None;
             }
         }
 
         // Put back the nodes this expansion had relocated onto its lifted tail. Undoing
         // only the line shift left their columns rebased onto the tail and their
         // `original_lines` holding the tail's text, so they overlapped the macro they
-        // had shared a line with — and expanding one then sliced the wrong text.
+        // had shared a line with — and expanding one then sliced the wrong text. The
+        // snapshot is absolute, taken when this node sat on `r.anchor_line`; whatever
+        // has moved this node since moved the relocated node by as much, so the
+        // restored coordinates have to follow — restoring the snapshot verbatim put
+        // `b` of `a!(); b!();` back onto a line inside an expansion made above them.
         for r in &tail_relocation {
+            let since = line as isize - r.anchor_line as isize;
+            let back = |v: usize| (v as isize + since).max(1) as usize;
             if let Some(node) = self.get_node_mut(r.id) {
-                node.call.line = r.line;
-                node.call.line_end = r.line_end;
-                node.call.derive_line = r.derive_line;
-                node.call.item_line_end = r.item_line_end;
+                node.call.line = back(r.line);
+                node.call.line_end = back(r.line_end);
+                node.call.derive_line = back(r.derive_line);
+                node.call.item_line_end = back(r.item_line_end);
                 node.call.col_start = r.col_start;
                 node.call.col_end = r.col_end;
                 node.original_lines = r.original_lines.clone();
@@ -2470,7 +2556,6 @@ impl App {
             node.expanded_content = None;
             node.children.clear();
             node.children_visible = true;
-            node.derive_sibling_snapshot.clear();
             node.original_line_origins.clear();
             node.tail_relocation_snapshot.clear();
             node.consumed_ids.clear();
@@ -3441,17 +3526,31 @@ fn attribute_tail(line: &str, col: usize) -> String {
     let Some(open) = line[..anchor].rfind("#[") else {
         return String::new();
     };
+    text_after_closing_bracket(line, open + 2)
+}
+
+/// `attribute_tail` for the last line of an attribute that spans several lines: the
+/// `#[` was opened on an earlier line, so the item is whatever follows the first `]`
+/// on this one that is not closing a `[` of its own. With `rfind("#[")` on this line
+/// the `struct S;` of `#[derive(\n    A,\n)] struct S;` vanished until undo.
+fn attribute_close_tail(line: &str) -> String {
+    text_after_closing_bracket(line, 0)
+}
+
+/// The trimmed text after the `]` that closes a `[` opened before byte `from`, or an
+/// empty string when the bracket does not close on this line.
+fn text_after_closing_bracket(line: &str, from: usize) -> String {
     // `[` and `]` are ASCII, so scanning bytes cannot land inside a multibyte char.
     let bytes = line.as_bytes();
     let mut depth = 0usize;
-    for idx in (open + 1)..bytes.len() {
+    for idx in from..bytes.len() {
         match bytes[idx] {
             b'[' => depth += 1,
             b']' => {
-                depth -= 1;
                 if depth == 0 {
                     return line[idx + 1..].trim().to_string();
                 }
+                depth -= 1;
             }
             _ => {}
         }
@@ -3939,10 +4038,9 @@ mod tests {
             expanded_content: None,
             children: Vec::new(),
             children_visible: true,
-            derive_sibling_snapshot: Vec::new(),
             original_line_origins: Vec::new(),
             tail_relocation_snapshot: Vec::new(),
-            consumed: false,
+            consumed_by: None,
             consumed_ids: Vec::new(),
         }
     }
@@ -4893,5 +4991,273 @@ struct B;
             true,
             true
         ));
+    }
+
+    // ---- Line-bookkeeping regressions -------------------------------------------
+    //
+    // These drive `expand_node`/`undo_selected` on a real `App` whose trace lookup is
+    // bypassed (`expand_node(id, Some(text))` takes the popup path, which never
+    // touches the cache), so the buffer and the node coordinates can be compared
+    // after each step.
+
+    /// An `App` over `source` with an idle, empty expansion cache.
+    fn test_app(source: &str) -> App {
+        let child = std::process::Command::new("true").spawn().unwrap();
+        let cache = ExpansionCache {
+            inner: Arc::new((
+                Mutex::new(CacheInner {
+                    expansions: Vec::new(),
+                    normalized: Vec::new(),
+                    done: true,
+                    error: None,
+                    build_error: None,
+                }),
+                Condvar::new(),
+            )),
+            child: Arc::new(Mutex::new(child)),
+        };
+        let tm = TraceMacros::new(
+            Path::new("cargo"),
+            &cargo_macra::trace_macros::Args::default(),
+        );
+        App::new(
+            source.to_string(),
+            PathBuf::from("/dev/null"),
+            vec!["crate".into()],
+            cache,
+            tm,
+        )
+    }
+
+    /// Select `id` the way Tab would, so `undo_selected` acts on it.
+    fn select(app: &mut App, id: usize) {
+        let idx = app
+            .visible_nodes
+            .iter()
+            .position(|&n| n == id)
+            .unwrap_or_else(|| panic!("node {} is not visible", id));
+        app.selected_idx = idx;
+        app.list_state.select(Some(idx));
+    }
+
+    fn node_named(app: &App, name: &str) -> usize {
+        app.nodes
+            .iter()
+            .find(|n| n.call.name == name)
+            .unwrap_or_else(|| panic!("no node named {}", name))
+            .id
+    }
+
+    /// 1-indexed line of the first buffer line containing `needle`.
+    fn line_of(app: &App, needle: &str) -> usize {
+        app.source_lines
+            .iter()
+            .position(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("{:?} is not in the buffer", needle))
+            + 1
+    }
+
+    /// The `#[tokio::main]` workflow: expand a `println!` inside the function, then
+    /// the attribute. The attribute's `item_line_end` has to follow the expansion
+    /// inside its item, or the attribute expansion removes too few lines and strands
+    /// the tail of the function after its end marker; and the swallowed-but-expanded
+    /// inner node must come back intact on undo instead of blocking it while hidden.
+    #[test]
+    fn enclosing_attribute_follows_an_expansion_inside_its_item() {
+        let mut app = test_app("#[my_attr]\nfn f() {\n    foo!();\n}\n");
+        let attr = node_named(&app, "my_attr");
+        let foo = node_named(&app, "foo");
+
+        app.expand_node(foo, Some("bar();\nbaz();".into()));
+        let item_end = line_of(&app, "}");
+        assert_eq!(app.get_node(attr).unwrap().call.item_line_end, item_end);
+
+        app.expand_node(attr, Some("fn f() {}\nfn g() {}\nfn h() {}".into()));
+        assert_eq!(
+            app.source_lines.last().map(String::as_str),
+            Some("// -- end my_attr --"),
+            "nothing may survive past the attribute's end marker: {:#?}",
+            app.source_lines
+        );
+        let inner = app.get_node(foo).unwrap();
+        assert!(inner.expanded && inner.consumed_by == Some(attr));
+        assert!(!app.visible_nodes.contains(&foo));
+
+        // Undo the attribute: the buffer is back to the state with `foo` expanded.
+        select(&mut app, attr);
+        app.undo_selected();
+        assert!(!app.get_node(attr).unwrap().expanded, "{}", app.status);
+        assert_eq!(app.source_lines.len(), item_end);
+        assert_eq!(app.source_lines[2], "    // -- expanded: foo --");
+        assert_eq!(app.source_lines[0], "#[my_attr]");
+        let inner = app.get_node(foo).unwrap();
+        assert!(inner.expanded && inner.consumed_by.is_none());
+        assert!(app.visible_nodes.contains(&foo));
+
+        // And undoing `foo` restores the original file.
+        select(&mut app, foo);
+        app.undo_selected();
+        assert_eq!(
+            app.source_lines,
+            vec!["#[my_attr]", "fn f() {", "    foo!();", "}"]
+        );
+        assert_eq!(app.get_node(attr).unwrap().call.item_line_end, 4);
+    }
+
+    /// A node swallowed by one expansion must move with that expansion when something
+    /// above them both is expanded, or it is un-hidden on undo pointing at a line
+    /// inside the other expansion's output.
+    #[test]
+    fn a_consumed_node_moves_with_its_consumer() {
+        let mut app = test_app("top!();\n#[my_attr]\nfn f() {\n    foo!();\n}\n");
+        let top = node_named(&app, "top");
+        let attr = node_named(&app, "my_attr");
+        let foo = node_named(&app, "foo");
+
+        app.expand_node(attr, Some("fn f() {}".into()));
+        app.expand_node(top, Some("x();\ny();".into()));
+        select(&mut app, attr);
+        app.undo_selected();
+
+        assert_eq!(app.get_node(foo).unwrap().call.line, line_of(&app, "foo!"));
+    }
+
+    /// A node relocated onto an expansion's lifted tail is put back *relative to where
+    /// the expansion now is*: restoring the absolute coordinates recorded at expansion
+    /// time loses every shift applied above it in between.
+    #[test]
+    fn a_relocated_node_is_restored_relative_to_the_current_position() {
+        let mut app = test_app("top!();\nfn f() {\n    a!(); b!();\n}\n");
+        let top = node_named(&app, "top");
+        let a = node_named(&app, "a");
+        let b = node_named(&app, "b");
+
+        app.expand_node(a, Some("x();".into()));
+        app.expand_node(top, Some("y();\nz();".into()));
+        select(&mut app, a);
+        app.undo_selected();
+
+        let b = app.get_node(b).unwrap();
+        assert_eq!(b.call.line, line_of(&app, "b!"));
+        assert_eq!((b.call.col_start, b.call.col_end), (10, 14));
+        assert_eq!(app.source_lines[b.call.line - 1], "    a!(); b!();");
+    }
+
+    /// Two separate `#[derive]` attributes on one item are two groups, not one: the
+    /// sibling-derive bookkeeping is for the names inside a single `#[derive(A, B)]`.
+    /// Treating `#[derive(Clone)]` as a sibling of `#[derive(Debug)]` shifted it twice
+    /// and, on undo, left it pointing past the end of a three-line buffer.
+    #[test]
+    fn separate_derive_attributes_on_one_item_are_separate_groups() {
+        let mut app = test_app("#[derive(Debug)]\n#[derive(Clone)]\nstruct S;\n");
+        let debug = node_named(&app, "Debug");
+        let clone = node_named(&app, "Clone");
+        assert_ne!(
+            app.get_node(debug).unwrap().derive_group,
+            app.get_node(clone).unwrap().derive_group
+        );
+
+        app.expand_node(debug, Some("impl Debug for S {}\nimpl X for S {}".into()));
+        let c = app.get_node(clone).unwrap();
+        assert_eq!(c.call.line, line_of(&app, "#[derive(Clone)]"));
+        assert_eq!(c.call.item_line_end, line_of(&app, "struct S;"));
+
+        select(&mut app, debug);
+        app.undo_selected();
+        let c = app.get_node(clone).unwrap();
+        assert_eq!((c.call.line, c.call.item_line_end), (2, 3));
+    }
+
+    /// Child macros are located by parsing text in which `$crate` was replaced by a
+    /// longer placeholder; their columns have to be mapped back onto the real text or
+    /// every child after a `$crate` on its line is skewed by the length difference.
+    #[test]
+    fn child_columns_are_mapped_back_from_the_dollar_crate_placeholder() {
+        let mut app = test_app("fn main() {\n    foo!(1);\n}\n");
+        app.expand_node(
+            0,
+            Some("const X: u32 = $crate::compute!(1) + baz!(3);".into()),
+        );
+        let baz = node_named(&app, "baz");
+        let (line, col_start, col_end) = {
+            let n = app.get_node(baz).unwrap();
+            (n.call.line, n.call.col_start, n.call.col_end)
+        };
+        let text = &app.source_lines[line - 1];
+        assert_eq!(
+            split_at_cols(text, col_start, col_end).1,
+            "baz!(3)",
+            "in {:?}",
+            text
+        );
+
+        app.expand_node(baz, Some("9".into()));
+        let marker = &app.source_lines[line - 1];
+        assert!(marker.ends_with("// -- expanded: baz --"), "{:?}", marker);
+        assert!(!marker.contains("baz!(3)"), "{:?}", marker);
+    }
+
+    /// A consumed *child* must leave `visible_nodes` like a consumed root does, or Tab
+    /// and `n` still reach it with coordinates that point into another node's output.
+    #[test]
+    fn consumed_children_are_not_visible() {
+        let mut app = test_app("#[outer]\nfn f() {}\n");
+        app.expand_node(0, Some("#[inner_attr]\nfn g() {\n    q!(1);\n}".into()));
+        let inner = node_named(&app, "inner_attr");
+        let q = node_named(&app, "q");
+
+        app.expand_node(inner, Some("fn g() {}".into()));
+
+        assert_eq!(app.get_node(q).unwrap().consumed_by, Some(inner));
+        assert!(!app.visible_nodes.contains(&q));
+    }
+
+    /// An attribute expansion replaces its whole first line, so a macro sharing that
+    /// line with the attribute is gone too — unlike the text before a functional call,
+    /// which stays on the marker line.
+    #[test]
+    fn a_macro_on_the_attributes_own_line_is_consumed() {
+        let mut app = test_app("#[my_attr] fn f() { q!(1) }\n");
+        let attr = node_named(&app, "my_attr");
+        let q = node_named(&app, "q");
+
+        app.expand_node(attr, Some("fn f() {}".into()));
+
+        assert_eq!(app.get_node(q).unwrap().consumed_by, Some(attr));
+        assert!(!app.visible_nodes.contains(&q));
+    }
+
+    /// Expanding `A` of `#[derive(A, B)]` leaves exactly one `B` to pick, sitting on the
+    /// remaining `#[derive(B)]` line with columns that cover its name there.
+    #[test]
+    fn a_remaining_sibling_derive_is_offered_exactly_once() {
+        let mut app = test_app("#[derive(A, B)]\nstruct S;\n");
+        app.expand_node(0, Some("impl A for S {}".into()));
+
+        let bs: Vec<&MacroNode> = app
+            .visible_nodes
+            .iter()
+            .filter_map(|&id| app.get_node(id))
+            .filter(|n| n.call.name == "B")
+            .collect();
+        assert_eq!(bs.len(), 1, "{:?}", bs);
+        let b = bs[0];
+        let text = &app.source_lines[b.call.derive_line - 1];
+        assert_eq!(text.trim(), "#[derive(B)]");
+        assert_eq!(split_at_cols(text, b.call.col_start, b.call.col_end).1, "B");
+    }
+
+    /// A multi-line `#[derive(\n ...\n)] struct S;` closes on the item's line, which
+    /// has no `#[` of its own; the item still has to be carried over.
+    #[test]
+    fn an_item_after_a_multiline_derive_list_is_kept() {
+        let mut app = test_app("#[derive(\n    A,\n    B,\n)] struct S;\n");
+        app.expand_node(0, Some("impl A for S {}".into()));
+
+        assert!(
+            app.source_lines.iter().any(|l| l == "struct S;"),
+            "{:#?}",
+            app.source_lines
+        );
     }
 }
