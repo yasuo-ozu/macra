@@ -108,6 +108,16 @@ pub struct MultiDeriveTwoAttr;
 #[helper_one]
 pub struct HelperUser;
 
+// --- A compiler built-in derive beside a proc-macro derive ---
+
+// `Debug` is expanded inside rustc and never crosses the proc-macro bridge, so the
+// hook records `Greet` for this item and nothing at all for `Debug`. The TUI leans
+// on that absence: a built-in name with no derive record is reported as built-in
+// instead of failing over to a sibling, which used to expand `Greet` when the user
+// asked for `Debug`.
+#[derive(Debug, Greet)]
+pub struct BuiltinBeside;
+
 #[allow(dead_code)]
 pub fn call_generated_path_macros() {
     pathstruct_hello!();

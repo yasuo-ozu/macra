@@ -748,6 +748,29 @@ __TAG_ARGS_FOR_MultiAttrStruct : & str = "role = \"primary\"";"#,
             .collect::<Vec<_>>()
     );
 
+    // 20. #[derive(Debug, Greet)] on BuiltinBeside: the proc-macro derive is recorded
+    // with the item as its input, and the built-in beside it leaves no derive record
+    // at all — rustc expands `Debug` itself, off the bridge. The TUI tells a built-in
+    // from a derive whose trace is merely missing by exactly this absence.
+    assert_exact(
+        &expansions,
+        "#[derive(Greet)]",
+        "pub struct BuiltinBeside;",
+        r#"impl BuiltinBeside
+{
+    pub fn greet() -> String
+    { format! ("Hello from {}", stringify! (BuiltinBeside)) }
+}"#,
+    );
+    let builtin_records: Vec<&MacroExpansion> = expansions
+        .iter()
+        .filter(|e| e.kind == MacroExpansionKind::Derive && e.name == "Debug")
+        .collect();
+    assert!(
+        builtin_records.is_empty(),
+        "a compiler built-in derive must leave no derive record: {builtin_records:?}"
+    );
+
     assert_trace_macro_blocks(&expansions);
 }
 

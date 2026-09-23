@@ -284,6 +284,11 @@ struct CacheInner {
     aliases: std::collections::HashMap<String, Vec<String>>,
     /// See [`HelperAttrs`]; filled from every derive record as it is pushed.
     helper_attrs: HelperAttrs,
+    /// Every name a derive record has been pushed under. What tells
+    /// `#[derive(Debug)]` from `std` — expanded inside rustc, never through the
+    /// proc-macro bridge, so the hook cannot record it — from `derive_more::Debug`,
+    /// which is a proc macro and does leave a record under that same name.
+    traced_derives: std::collections::HashSet<String>,
     done: bool,
     error: Option<String>,
     /// Stored build failure message (non-zero exit from cargo check).
@@ -300,6 +305,7 @@ impl CacheInner {
         aliases: Vec<(String, String)>,
     ) {
         if exp.kind == MacroExpansionKind::Derive {
+            self.traced_derives.insert(exp.name.clone());
             for helper in &exp.helpers {
                 let owners = self.helper_attrs.entry(helper.clone()).or_default();
                 if !owners.contains(&exp.name) {
@@ -588,6 +594,7 @@ impl ExpansionCache {
                 normalized: Vec::new(),
                 aliases: std::collections::HashMap::new(),
                 helper_attrs: HelperAttrs::new(),
+                traced_derives: std::collections::HashSet::new(),
                 done: false,
                 error: None,
                 build_error: None,
@@ -1205,6 +1212,13 @@ impl ExpansionCache {
         mutex.lock().unwrap().helper_attrs.clone()
     }
 
+    /// The names derive records have arrived under so far (see
+    /// `CacheInner::traced_derives`). Non-blocking, like `helper_attributes`.
+    fn traced_derives(&self) -> std::collections::HashSet<String> {
+        let (ref mutex, _) = *self.inner;
+        mutex.lock().unwrap().traced_derives.clone()
+    }
+
     /// Whether the trace holds an attribute-macro expansion invoked as `name`.
     fn attribute_macro_seen(&self, name: &str) -> bool {
         let (ref mutex, _) = *self.inner;
@@ -1299,6 +1313,11 @@ struct App {
     /// `inert_attrs.len()` when the current root nodes were built. The roots are
     /// rebuilt when it falls behind — see `rebuild_roots_if_untouched`.
     roots_helper_count: usize,
+    /// Every derive name the trace has recorded an expansion under, merged across
+    /// reloads like `inert_attrs`. Read by the node list and by `expand_node` to
+    /// tell a compiler built-in derive from a proc macro sharing its name — see
+    /// `is_builtin_derive`.
+    traced_derives: std::collections::HashSet<String>,
     /// When set, each expanded range is rendered as a two-column block comparing the
     /// original source (left) with the expansion (right). Code outside those ranges
     /// stays full width. Toggled with `v`.
@@ -1550,6 +1569,57 @@ fn helper_attribute_status(name: &str, owners: &[String]) -> String {
     )
 }
 
+/// Whether `name` is one of the derives rustc implements itself.
+///
+/// These are `rustc_builtin_macros::deriving`'s `LegacyDerive` extensions: they run
+/// inside the compiler and never cross the proc-macro bridge, so the hook has no
+/// call to record and no lookup for them can ever succeed. Offering them as ordinary
+/// derive nodes was what the sibling retry in `expand_node` used to paper over, and
+/// that retry expanded a *different* derive than the one selected.
+///
+/// A name here is only a hint, never a verdict on its own: `derive_more::Debug` is a
+/// proc macro that answers to the same name and does leave a record, so callers pair
+/// this with `CacheInner::traced_derives` (see `App::is_builtin_derive`). The nightly
+/// ones are listed too — they are built in just the same, and a wrong inclusion costs
+/// nothing more than a more specific message for a derive that had no trace anyway.
+fn is_builtin_derive(name: &str) -> bool {
+    matches!(
+        name,
+        "Clone"
+            | "Copy"
+            | "Debug"
+            | "Default"
+            | "Eq"
+            | "Hash"
+            | "Ord"
+            | "PartialEq"
+            | "PartialOrd"
+            | "CoercePointee"
+            | "ConstParamTy"
+            | "UnsizedConstParamTy"
+    )
+}
+
+/// The last segment of a macro path as the source spells it: `syan :: visit :: Ast`
+/// (a `MacroCall::name` is the path's token text) is the derive `Ast`.
+fn macro_leaf(name: &str) -> &str {
+    name.rsplit("::").next().unwrap_or(name).trim()
+}
+
+/// Status line for an attempt to expand a compiler built-in derive. `others` are the
+/// derives of the same `#[derive(..)]` that are proc macros, so the user knows where
+/// the expansion they were after lives instead of getting one picked for them.
+fn builtin_derive_status(name: &str, others: &[String]) -> String {
+    let mut status = format!(
+        "'{}' is a compiler built-in derive: rustc expands it itself and leaves no trace.",
+        name
+    );
+    if !others.is_empty() {
+        status.push_str(&format!(" Proc-macro derives here: {}.", others.join(", ")));
+    }
+    status
+}
+
 /// Build the top-level macro nodes for one file.
 ///
 /// Shared by the initial file and by `enter_submodule` so a module behaves exactly
@@ -1679,6 +1749,7 @@ impl App {
         // Usually empty here — the build has only just been spawned — but a cache
         // that already holds records (a test's, or a fast rebuild) is honoured.
         let inert_attrs = expansion_cache.helper_attributes();
+        let traced_derives = expansion_cache.traced_derives();
         let roots_helper_count = inert_attrs.len();
         let (nodes, next_id) = build_root_nodes(&source, &source_lines, &inert_attrs);
 
@@ -1711,6 +1782,7 @@ impl App {
             module_stack: Vec::new(),
             inert_attrs,
             roots_helper_count,
+            traced_derives,
             split_view: false,
         };
         app.seed_source_aliases();
@@ -1738,9 +1810,9 @@ impl App {
             .add_aliases(source_aliases_in_tree(starts));
     }
 
-    /// Merge the helper attributes the trace has reported so far into
-    /// `inert_attrs`.
-    fn absorb_helper_knowledge(&mut self) {
+    /// Merge what the trace has reported so far into `inert_attrs` and
+    /// `traced_derives`.
+    fn absorb_trace_knowledge(&mut self) {
         for (helper, owners) in self.expansion_cache.helper_attributes() {
             let known = self.inert_attrs.entry(helper).or_default();
             for owner in owners {
@@ -1749,6 +1821,23 @@ impl App {
                 }
             }
         }
+        self.traced_derives
+            .extend(self.expansion_cache.traced_derives());
+    }
+
+    /// Whether the macro `name` of `kind`, reached through `krate`, is a derive rustc
+    /// expands itself, given everything the trace has said so far: a `std` built-in
+    /// name — bare, or reached through `std`/`core` — under which no derive record
+    /// has arrived. A record under that name means a proc macro answers to it in
+    /// this build (`derive_more::Debug`), and the node is then an ordinary derive
+    /// whose lookup decides. Only conclusive once the stream has ended; before that
+    /// it is the best available reading, and the list is redrawn as it changes.
+    fn is_builtin_derive(&self, kind: MacroKind, krate: &str, name: &str) -> bool {
+        let leaf = macro_leaf(name);
+        kind == MacroKind::Derive
+            && matches!(krate, "" | "std" | "core")
+            && is_builtin_derive(leaf)
+            && !self.traced_derives.contains(leaf)
     }
 
     /// Once per event-loop tick: learn any newly reported helpers and, if that
@@ -1760,7 +1849,7 @@ impl App {
     /// `build_root_nodes`), but a helper that happens to precede an attribute macro
     /// on its item still holds that item's only attribute slot until this runs.
     fn refresh_helper_knowledge(&mut self) {
-        self.absorb_helper_knowledge();
+        self.absorb_trace_knowledge();
         self.rebuild_roots_if_untouched();
     }
 
@@ -2531,14 +2620,38 @@ impl App {
             }
             TraceLookup::Exhausted => {
                 // The lookup waited for the stream to end, so every derive's helpers
-                // are known now — including any that arrived after the last tick,
-                // when this attribute may still have passed for a macro.
-                self.absorb_helper_knowledge();
+                // and every traced derive name are known now — including any that
+                // arrived after the last tick, when this attribute may still have
+                // passed for a macro, or this derive for a proc macro.
+                self.absorb_trace_knowledge();
                 if kind == MacroKind::Attribute {
                     if let Some(owners) = self.inert_attrs.get(&name) {
                         self.status = helper_attribute_status(&name, owners);
                         return;
                     }
+                }
+
+                // A compiler built-in derive has no trace by nature, so an empty
+                // lookup is the expected outcome, not a failure — and not a reason to
+                // go and expand something else. This is the case the sibling retry
+                // below used to stand in for: Enter on `Debug` in `#[derive(Clone,
+                // Debug, PartialEq, Ast)]` failed over to `Clone`, then `PartialEq`,
+                // then expanded `Ast` — reported as "always the last trait is
+                // expanded regardless of selected trait". Name the proc-macro
+                // derives of the group instead and let the user pick one.
+                if self.is_builtin_derive(kind, &krate, &name) {
+                    let leaf = macro_leaf(&name);
+                    let others: Vec<String> = sibling_derives
+                        .iter()
+                        .map(|d| macro_leaf(d))
+                        .filter(|d| {
+                            *d != leaf
+                                && !(is_builtin_derive(d) && !self.traced_derives.contains(*d))
+                        })
+                        .map(str::to_string)
+                        .collect();
+                    self.status = builtin_derive_status(leaf, &others);
+                    return;
                 }
 
                 // Mark as failed and show error
@@ -2572,31 +2685,11 @@ impl App {
                     }
                 }
 
-                // For derive macros with siblings, try the next sibling
-                if kind == MacroKind::Derive && sibling_derives.len() > 1 {
-                    let next_sibling_id = self
-                        .nodes
-                        .iter()
-                        .find(|n| {
-                            n.call.kind == MacroKind::Derive
-                                && n.call.line == line
-                                && n.id != node_id
-                                && !n.expanded
-                                && !n.expansion_failed
-                        })
-                        .map(|n| n.id);
-                    if let Some(next_id) = next_sibling_id {
-                        // Select the next sibling derive in the visible nodes list
-                        if let Some(vis_idx) =
-                            self.visible_nodes.iter().position(|&id| id == next_id)
-                        {
-                            self.list_state.select(Some(vis_idx));
-                            self.status = format!("'{}' failed, trying next derive...", name);
-                            self.expand_selected();
-                            return;
-                        }
-                    }
-                }
+                // No falling over to a sibling derive from here on. Enter on a macro
+                // either expands that macro or explains why it cannot; the retry that
+                // used to live here expanded a different one and reported the last
+                // sibling's error under the selected one's name (see the built-in
+                // check above for the case it was compensating for).
 
                 // Check for stream error
                 if let Some(err) = self.expansion_cache.take_error() {
@@ -3985,7 +4078,14 @@ fn ui(frame: &mut Frame, app: &mut App) {
             // the user wondering why an attribute in the source has no node.
             let inert = node.call.kind == MacroKind::Attribute
                 && app.inert_attrs.contains_key(&node.call.name);
-            let kind_label = if inert {
+            // A compiler built-in derive is the same kind of thing — in the source,
+            // never expandable — and gets the same treatment, unless the trace has
+            // shown a proc macro answering to its name (`derive_more::Debug`).
+            let builtin = app.is_builtin_derive(node.call.kind, &node.call.krate, &node.call.name);
+            let inert = inert || builtin;
+            let kind_label = if builtin {
+                "Builtin"
+            } else if inert {
                 "Helper"
             } else {
                 node.call.kind.as_str()
@@ -5645,6 +5745,7 @@ pub struct Page;
             normalized: Vec::new(),
             aliases: std::collections::HashMap::new(),
             helper_attrs: HelperAttrs::new(),
+            traced_derives: std::collections::HashSet::new(),
             done: false,
             error: None,
             build_error: None,
@@ -6924,32 +7025,34 @@ pub struct Page {
     /// The guard the old gate provided, kept at expansion time: a derive behind a
     /// real attribute macro is offered, and when the lookup fails the report says
     /// why and what to do — instead of a generic "no trace" plus a retry of every
-    /// sibling, which would fail identically.
+    /// sibling, which would fail identically. The derives are proc-macro-shaped
+    /// names: a built-in such as `Debug` would get the built-in verdict, which is
+    /// the more specific truth about it, before the gate is even considered.
     #[test]
     fn a_derive_behind_an_attribute_macro_is_explained_not_hidden() {
-        let source = "#[my_attr]\n#[derive(Debug, Clone)]\nstruct S;\n";
+        let source = "#[my_attr]\n#[derive(Ast, Parse)]\nstruct S;\n";
         let mut app = test_app_with(
             source,
             vec![attribute_expansion(
                 "my_attr",
-                "#[derive(Debug, Clone)] struct S;",
+                "#[derive(Ast, Parse)] struct S;",
                 "struct S; struct Extra;",
             )],
         );
-        assert_eq!(node_names(&app), ["my_attr", "Debug", "Clone"]);
+        assert_eq!(node_names(&app), ["my_attr", "Ast", "Parse"]);
 
-        let debug = node_named(&app, "Debug");
-        app.expand_node(debug, None);
+        let ast = node_named(&app, "Ast");
+        app.expand_node(ast, None);
         let msg = app.error_message.clone().unwrap_or_default();
         assert!(
             msg.contains("#[my_attr] is an attribute macro")
                 && msg.contains("Expand #[my_attr] first"),
             "{msg}"
         );
-        assert!(app.get_node(debug).unwrap().expansion_failed);
-        // No sibling retry: `Clone` sits behind the same attribute.
+        assert!(app.get_node(ast).unwrap().expansion_failed);
+        // No sibling retry: `Parse` sits behind the same attribute.
         assert!(
-            !app.get_node(node_named(&app, "Clone"))
+            !app.get_node(node_named(&app, "Parse"))
                 .unwrap()
                 .expansion_failed
         );
@@ -7045,5 +7148,121 @@ pub struct Page {
         assert!(!app.get_node(ast).unwrap().expanded, "{}", app.status);
         assert_eq!(node_names(&app), ["Debug", "Ast", "subast"]);
         assert_eq!(app.get_node(subast).unwrap().call.line, 2);
+    }
+
+    /// The user's report: "when expanding #[derive] with multiple traits from TUI,
+    /// always the last trait is expanded regardless of selected trait". `Debug` is a
+    /// compiler built-in, so the hook never records it; the lookup came up empty and
+    /// the old sibling retry went on to expand `Ast` in its place. Enter on `Debug`
+    /// must leave `Ast` alone and say why nothing happened.
+    #[test]
+    fn a_built_in_derive_does_not_expand_its_proc_macro_sibling() {
+        let input =
+            "#[subast(crate::ast::Line)] pub struct Page { pub placed: Vec<(Length, Line)>, }";
+        let mut app = test_app_with(
+            PAGE,
+            vec![derive_expansion(
+                "Ast",
+                input,
+                "impl Ast for Page {}",
+                &["subast"],
+            )],
+        );
+        let debug = node_named(&app, "Debug");
+        let ast = node_named(&app, "Ast");
+        select(&mut app, debug);
+        app.expand_selected();
+
+        assert!(
+            !app.get_node(ast).unwrap().expanded,
+            "Enter on Debug expanded Ast: {:?}",
+            app.source_lines
+        );
+        assert!(
+            !app.source_lines
+                .iter()
+                .any(|l| l.contains("impl Ast for Page")),
+            "{:?}",
+            app.source_lines
+        );
+        assert_eq!(app.selected_node().unwrap().id, debug);
+        // Nothing went wrong: `Debug` was never going to have a trace.
+        assert!(app.error_message.is_none(), "{:?}", app.error_message);
+        assert!(!app.get_node(debug).unwrap().expansion_failed);
+        assert!(
+            app.status.contains("built-in") && app.status.contains("Ast"),
+            "{}",
+            app.status
+        );
+    }
+
+    /// A proc-macro derive whose lookup fails for its own reasons fails alone: the
+    /// sibling is neither tried nor marked, however many siblings there are and
+    /// whatever state they are in. This is also the guard against the retry chain
+    /// ever revisiting a node — there is no chain.
+    #[test]
+    fn a_failed_derive_never_touches_its_siblings() {
+        let source = "#[derive(Ast, Parse, Spanned)]\nstruct S;\n";
+        let mut app = test_app_with(
+            source,
+            vec![derive_expansion(
+                "Parse",
+                "struct Other;",
+                "impl Parse for Other {}",
+                &[],
+            )],
+        );
+        let ast = node_named(&app, "Ast");
+        let parse = node_named(&app, "Parse");
+        let spanned = node_named(&app, "Spanned");
+        select(&mut app, ast);
+        app.expand_selected();
+
+        assert!(app.get_node(ast).unwrap().expansion_failed);
+        assert!(app.error_message.is_some(), "{}", app.status);
+        for (name, id) in [("Parse", parse), ("Spanned", spanned)] {
+            let n = app.get_node(id).unwrap();
+            assert!(!n.expanded && !n.expansion_failed, "{name} was touched");
+        }
+        assert_eq!(app.selected_node().unwrap().id, ast);
+    }
+
+    /// A crate that re-implements a built-in's name (`derive_more::Debug`) leaves a
+    /// derive record called `Debug`, so `Debug` is then an ordinary derive: it
+    /// expands when its input matches and fails — as itself, not as "built-in" —
+    /// when it does not.
+    #[test]
+    fn a_re_implemented_built_in_name_is_an_ordinary_derive() {
+        let source = "#[derive(Debug, Clone)]\nstruct S;\n";
+        let mut app = test_app_with(
+            source,
+            vec![derive_expansion(
+                "Debug",
+                "struct S;",
+                "impl Debug for S {}",
+                &[],
+            )],
+        );
+        let debug = node_named(&app, "Debug");
+        app.expand_node(debug, None);
+        assert!(app.get_node(debug).unwrap().expanded, "{}", app.status);
+
+        let mut app = test_app_with(
+            source,
+            vec![derive_expansion(
+                "Debug",
+                "struct Other;",
+                "impl Debug for Other {}",
+                &[],
+            )],
+        );
+        let debug = node_named(&app, "Debug");
+        let clone = node_named(&app, "Clone");
+        app.expand_node(debug, None);
+        assert!(app.get_node(debug).unwrap().expansion_failed);
+        let msg = app.error_message.clone().unwrap_or_default();
+        assert!(msg.contains("No trace found for 'Debug'"), "{msg}");
+        assert!(!app.status.contains("built-in"), "{}", app.status);
+        assert!(!app.get_node(clone).unwrap().expanded);
     }
 }
