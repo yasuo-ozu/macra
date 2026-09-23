@@ -1212,6 +1212,17 @@ impl ExpansionCache {
         mutex.lock().unwrap().helper_attrs.clone()
     }
 
+    /// Whether the expansion stream has finished.
+    ///
+    /// Until it has, an absent record proves nothing: a proc macro answering to a
+    /// built-in derive.'.s name may still be on its way, so calling that derive a
+    /// built-in — striking it through, refusing to look it up — would be a claim the
+    /// trace has not yet earned.
+    fn stream_done(&self) -> bool {
+        let (ref mutex, _) = *self.inner;
+        mutex.lock().unwrap().done
+    }
+
     /// The names derive records have arrived under so far (see
     /// `CacheInner::traced_derives`). Non-blocking, like `helper_attributes`.
     fn traced_derives(&self) -> std::collections::HashSet<String> {
@@ -1318,6 +1329,9 @@ struct App {
     /// tell a compiler built-in derive from a proc macro sharing its name — see
     /// `is_builtin_derive`.
     traced_derives: std::collections::HashSet<String>,
+    /// Whether the expansion stream has ended. Until it has, a derive name with no
+    /// record is merely unclassified, not proved to be a compiler built-in.
+    trace_finished: bool,
     /// When set, each expanded range is rendered as a two-column block comparing the
     /// original source (left) with the expansion (right). Code outside those ranges
     /// stays full width. Toggled with `v`.
@@ -1783,6 +1797,7 @@ impl App {
             inert_attrs,
             roots_helper_count,
             traced_derives,
+            trace_finished: false,
             split_view: false,
         };
         app.seed_source_aliases();
@@ -1823,6 +1838,7 @@ impl App {
         }
         self.traced_derives
             .extend(self.expansion_cache.traced_derives());
+        self.trace_finished = self.expansion_cache.stream_done();
     }
 
     /// Whether the macro `name` of `kind`, reached through `krate`, is a derive rustc
@@ -1838,6 +1854,12 @@ impl App {
             && matches!(krate, "" | "std" | "core")
             && is_builtin_derive(leaf)
             && !self.traced_derives.contains(leaf)
+            // An absent record only means "built-in" once nothing more can arrive.
+            // While the build runs, a proc macro answering to this name may still be
+            // streaming in, and calling it a built-in then strikes it through in the
+            // list and refuses the lookup with "rustc expands it itself" — about a
+            // macro that does expand. Unknown reads as an ordinary derive.
+            && self.trace_finished
     }
 
     /// Once per event-loop tick: learn any newly reported helpers and, if that
@@ -7380,6 +7402,9 @@ pub struct Page {
     #[test]
     fn a_proved_unexpandable_macro_is_struck_through() {
         let mut app = test_app("#[derive(Debug, Greet)]\npub struct S;\n");
+        // The event loop does this each tick; the dummy cache is already finished, so
+        // this is the state after a build, which is when a built-in verdict is earned.
+        app.absorb_trace_knowledge();
         let buf = render(&mut app, 100, 20);
 
         // Collect, per tree row, the names drawn with CROSSED_OUT.
@@ -7414,6 +7439,33 @@ pub struct Page {
         assert!(
             plain.iter().any(|w| w == "Greet") && !struck.iter().any(|w| w == "Greet"),
             "a proc-macro derive must not be struck; struck={struck:?} plain={plain:?}"
+        );
+    }
+
+    /// A built-in *name* is only called a built-in once the stream has ended. While
+    /// the build is still running, a proc macro answering to that name may yet arrive,
+    /// so claiming it — striking it out, refusing the lookup with "rustc expands it
+    /// itself" — would be a verdict about a macro that does expand.
+    #[test]
+    fn a_built_in_name_is_not_judged_until_the_stream_ends() {
+        let mut app = test_app("#[derive(Debug)]\npub struct S;\n");
+
+        // Mid-build: nothing has arrived yet, so no verdict.
+        app.trace_finished = false;
+        assert!(
+            !app.is_builtin_derive(MacroKind::Derive, "", "Debug"),
+            "a pending stream must not yield a built-in verdict"
+        );
+
+        // Stream ended with no record under that name: now it is proved.
+        app.trace_finished = true;
+        assert!(app.is_builtin_derive(MacroKind::Derive, "", "Debug"));
+
+        // ... unless a proc macro answered to it.
+        app.traced_derives.insert("Debug".to_string());
+        assert!(
+            !app.is_builtin_derive(MacroKind::Derive, "", "Debug"),
+            "a traced Debug is an ordinary derive"
         );
     }
 }
