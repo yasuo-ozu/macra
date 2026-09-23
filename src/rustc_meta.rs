@@ -8,10 +8,13 @@
 //! `fn some_other_name`) exists only here, as does the bang/derive distinction.
 //!
 //! Metadata is a compiler-internal format with no stability guarantee. This module
-//! therefore decodes exactly the layout rustc 1.98, 1.99 and 1.100 write, checked
-//! against `rustc_metadata/src/rmeta/{mod,encoder}.rs` at each of those releases,
-//! and returns `None` for any other version or for any byte that does not match.
-//! The caller then reports no names rather than wrong ones.
+//! therefore decodes the layout rustc 1.98, 1.99 and 1.100 write, checked against
+//! `rustc_metadata/src/rmeta/{mod,encoder}.rs` at each of those releases, and
+//! returns `None` for anything older or for any byte that does not match. The one
+//! way those releases differ from each other — how many `LazyArray` fields precede
+//! `proc_macro_data` — is not looked up by version but discovered, see
+//! [`LAZY_ARRAY_COUNTS`], so a later release that only adds or drops such a field
+//! keeps decoding. The caller then reports no names rather than wrong ones.
 //!
 //! # Layout
 //!
@@ -36,7 +39,8 @@
 //! name: Symbol, is_proc_macro_crate, is_stub }`, then `extra_filename: String`,
 //! `stable_crate_id` (8 raw bytes), `required_panic_strategy: Option<_>`,
 //! `panic_in_drop_strategy`, `edition`, four `bool`s, a run of `LazyArray`s (15 on
-//! 1.98, 16 from 1.99 — `canonical_symbols` was added), then
+//! 1.98, 16 from 1.99 — `canonical_symbols` was added; a proc-macro crate leaves
+//! every one of them empty, so each is a single `0` byte), then
 //! `proc_macro_data: Option<ProcMacroData { proc_macro_decls_static: DefIndex,
 //! stability: Option<_>, macros: LazyArray<(DefIndex, LazyValue<ProcMacroKind>)> }>`.
 //!
@@ -108,31 +112,45 @@ pub fn version_string(meta: &[u8]) -> Option<String> {
         .then(|| s.to_string())
 }
 
-/// How many `LazyArray` fields sit between the scalar prefix of `CrateRoot` and
-/// `proc_macro_data`, per rustc version.
+/// The first rustc minor whose decls table is a bare `&[Client]`, and so the first
+/// whose macro names have to come from here at all.
+const FIRST_SUPPORTED_MINOR: u32 = 98;
+
+/// The `1.<minor>` of a `rustc <version>` string, if this module supports it.
 ///
-/// This is the one place the verified releases differ: 1.99 inserted
-/// `canonical_symbols`. A release newer than any we have checked is decoded with that
-/// same shape rather than refused outright, so macra keeps working across a minor bump
-/// instead of going dark the day one lands. That is safe only because the decode is
-/// checked, not trusted: a root that grew another field fails one of the structural
-/// invariants and returns `None`, which costs capture rather than mislabelling a macro.
-/// Anything older than 1.98 is a different table layout entirely and decodes to nothing.
-fn lazy_arrays_before_proc_macro_data(version: &str) -> Option<usize> {
+/// The version gates support; it does not choose a layout. Anything before 1.98
+/// still names its macros in the decls table itself, and the caller reads them from
+/// there, so a metadata decode has nothing to line up against and is refused. From
+/// 1.98 on every release is attempted, because the only layout drift seen so far is
+/// discovered rather than looked up — see [`LAZY_ARRAY_COUNTS`].
+fn supported_minor(version: &str) -> Option<u32> {
     let rest = version.strip_prefix("rustc 1.")?;
     let digits = rest.find(|c: char| !c.is_ascii_digit())?;
-    match rest[..digits].parse::<u32>().ok()? {
-        98 => Some(15),
-        // 1.99 inserted `canonical_symbols`. Later releases are assumed to keep that
-        // shape: trying the newest verified layout is what lets macra keep working
-        // across a minor bump instead of going dark the day one lands. The decode
-        // validates roughly twenty invariants before it believes anything, so a root
-        // that has grown another field fails closed rather than renaming a macro —
-        // which is the only outcome that would be worse than capturing nothing.
-        99.. => Some(16),
-        _ => None,
-    }
+    let minor = rest[..digits].parse::<u32>().ok()?;
+    (minor >= FIRST_SUPPORTED_MINOR).then_some(minor)
 }
+
+/// How many `LazyArray` fields may sit between the scalar prefix of `CrateRoot` and
+/// `proc_macro_data`: every count in this window is tried, see [`discover`].
+///
+/// The count is the one place the verified releases differ — 15 on 1.98, 16 from
+/// 1.99, which inserted `canonical_symbols` — and it used to be looked up from the
+/// version string, with every later release assumed to keep 1.99's shape. That
+/// guess turns the next such insertion into a hard failure on rustc's schedule
+/// rather than macra's, so instead the count is discovered: a wrong count reads the
+/// bytes of some other field as `proc_macro_data` and fails one of the structural
+/// checks in [`macros_array`] within a few bytes, so trying each plausible count
+/// and keeping the one that decodes is a lookup by evidence rather than by label.
+///
+/// The window is centred on the verified 15 and 16 and reaches further up than
+/// down because a struct like `CrateRoot` gains fields more readily than it loses
+/// them: the one change across the three verified releases was an insertion. Width
+/// is a trade: every candidate is one more chance for a coincidental decode, which
+/// the agreement rule in [`discover`] turns into a refusal rather than a wrong
+/// answer, so the cost of width is capture, not correctness, and three removals or
+/// four additions of drift is well past the observed one insertion in three
+/// releases.
+const LAZY_ARRAY_COUNTS: std::ops::RangeInclusive<usize> = 12..=20;
 
 /// Bounds-checked cursor over the opaque encoding.
 struct Reader<'a> {
@@ -311,8 +329,17 @@ fn record_positions(blob: &[u8], array: &MacrosArray) -> Option<Vec<usize>> {
     let mut r = Reader::at(blob, array.pos)?;
     let mut node = Node::new(array.pos);
     let mut out = Vec::with_capacity(array.len);
+    let mut def_indices = Vec::with_capacity(array.len);
     for _ in 0..array.len {
-        r.leb()?; // DefIndex
+        // Each element names a distinct macro function, so a repeated DefIndex can
+        // only mean these bytes are not the `macros` array. Cheap to check, and it
+        // is exactly the kind of coincidence a wrong `LazyArray` count (see
+        // `discover`) would otherwise need to survive.
+        let def_index = r.leb()?;
+        if def_index > u32::MAX as usize || def_indices.contains(&def_index) {
+            return None;
+        }
+        def_indices.push(def_index);
         out.push(node.resolve(r.leb()?)?);
     }
     Some(out)
@@ -365,8 +392,19 @@ pub fn proc_macro_entries(meta: &[u8], fn_names: &[String]) -> Option<Vec<ProcMa
         return None;
     }
     let blob = blob(meta)?;
-    let n_arrays = lazy_arrays_before_proc_macro_data(blob_version(blob)?)?;
+    supported_minor(blob_version(blob)?)?;
     let root = root_pos(blob)?;
+    discover(blob, root, fn_names).map(|(_n_arrays, entries)| entries)
+}
+
+/// One full decode of `CrateRoot` on the assumption that `n_arrays` `LazyArray`
+/// fields precede `proc_macro_data`, checked against `fn_names` like any other.
+fn decode(
+    blob: &[u8],
+    root: usize,
+    n_arrays: usize,
+    fn_names: &[String],
+) -> Option<Vec<ProcMacroEntry>> {
     let array = macros_array(blob, root, n_arrays)?;
     if array.len != fn_names.len() {
         return None;
@@ -376,6 +414,46 @@ pub fn proc_macro_entries(meta: &[u8], fn_names: &[String]) -> Option<Vec<ProcMa
         .map(|pos| record_at(blob, pos))
         .collect::<Option<Vec<_>>>()?;
     validate(entries, fn_names)
+}
+
+/// Find the `LazyArray` count by trying every one in [`LAZY_ARRAY_COUNTS`], and
+/// return it with the entries it decoded.
+///
+/// All candidates are tried, always — not just until one works. A first-hit scheme
+/// keyed on the version-suggested count would only repeat the gap this replaces: on
+/// a release whose count has moved, the old count is the one that must not be
+/// trusted, yet it would be the one asked first and believed if its bytes happened
+/// to pass. Trying the rest costs a handful of walks over a few dozen bytes each,
+/// once per dylib load, which is nothing next to the `dlopen` that got us here.
+///
+/// Every successful decode has already passed the structural checks and
+/// [`validate`], which pins each bang and attribute macro to its function's name
+/// from the symbol table. What remains is the derive names and the kinds, and those
+/// are what a decode of the wrong bytes could get wrong while still looking valid.
+/// So when two counts both decode, their results must be identical, or nothing is
+/// returned. Identical results cannot mislabel: whichever count is the real layout,
+/// the answer is the one it gave. Differing results mean at most one is right and
+/// nothing here can say which, and a wrong pick would rename a derive — the one
+/// outcome worse than capturing nothing — so that case fails closed.
+///
+/// What this cannot defend against is a section whose real layout is outside the
+/// window, or is no longer "some number of empty arrays, then `proc_macro_data`" at
+/// all: then every success is a coincidence, and if there is exactly one it is
+/// believed. That is the same residual risk the fixed-count scheme carried, minus
+/// the cases where the real count is in the window and outvotes the coincidence.
+fn discover(blob: &[u8], root: usize, fn_names: &[String]) -> Option<(usize, Vec<ProcMacroEntry>)> {
+    let mut found: Option<(usize, Vec<ProcMacroEntry>)> = None;
+    for n_arrays in LAZY_ARRAY_COUNTS {
+        let Some(entries) = decode(blob, root, n_arrays, fn_names) else {
+            continue;
+        };
+        match &found {
+            Some((_, prev)) if *prev != entries => return None,
+            Some(_) => {}
+            None => found = Some((n_arrays, entries)),
+        }
+    }
+    found
 }
 
 /// Reject anything that does not agree with the symbol-derived function names.
@@ -551,6 +629,13 @@ mod tests {
         predefined_crate_name: bool,
         is_proc_macro: bool,
         stability: bool,
+        /// A byte to insert between the last `LazyArray` and `proc_macro_data`,
+        /// standing in for a scalar field a future `CrateRoot` might grow there.
+        extra_scalar: Option<u8>,
+        /// Plant a second, single-element `macros` array naming a derive of this
+        /// name where a walk two arrays too long lands, so that two candidate
+        /// counts both decode. Needs exactly one macro, a derive.
+        decoy: Option<&'static str>,
         macros: Vec<Macro>,
     }
 
@@ -564,6 +649,8 @@ mod tests {
                 predefined_crate_name: false,
                 is_proc_macro: true,
                 stability: false,
+                extra_scalar: None,
+                decoy: None,
                 macros,
             }
         }
@@ -634,6 +721,15 @@ mod tests {
                 b.extend_from_slice(&[0x2a, 0x2b, k as u8]);
             }
 
+            // The decoy's record: a derive with no helpers, right before the array.
+            let decoy_record = self.decoy.map(|name| {
+                let pos = b.len();
+                b.push(KIND_DERIVE);
+                string(&mut b, name);
+                leb(&mut b, 0);
+                pos
+            });
+
             // macros: LazyArray<(DefIndex, LazyValue<ProcMacroKind>)>.
             let array = b.len();
             for (i, &rec) in records.iter().enumerate() {
@@ -644,6 +740,18 @@ mod tests {
                     rec - records[i - 1]
                 };
                 leb(&mut b, dist);
+            }
+
+            // The decoy array: one element, as the last two bytes before the root.
+            // A walk that treats `proc_macro_data`'s `Some` and `proc_macro_decls_static`
+            // as one more array (count 1, distance 13) and `stability: None` as an
+            // empty one arrives at the trailer below with its lazy cursor at
+            // `root - 13`, and the trailer sends it forward 11 bytes to land here.
+            if let Some(rec) = decoy_record {
+                let decoy_array = b.len();
+                leb(&mut b, 9); // DefIndex
+                leb(&mut b, decoy_array - rec);
+                assert_eq!(b.len() - decoy_array, 2, "decoy array must be two bytes");
             }
 
             // CrateRoot.
@@ -686,6 +794,9 @@ mod tests {
             for _ in filled.len()..self.n_arrays {
                 leb(&mut b, 0);
             }
+            if let Some(scalar) = self.extra_scalar {
+                b.push(scalar);
+            }
             b.push(1); // proc_macro_data: Some
             leb(&mut b, 13); // proc_macro_decls_static
             if self.stability {
@@ -699,6 +810,12 @@ mod tests {
                 Some(p) => array - p,
             };
             leb(&mut b, dist);
+            if self.decoy.is_some() {
+                // Read by the walk two arrays too long as `stability: None`,
+                // `macros.len() == 1` and the forward distance to the decoy array.
+                assert_eq!(records.len(), 1, "a decoy needs a one-macro crate");
+                b.extend_from_slice(&[0, 1, 11]);
+            }
             b.extend_from_slice(b"\x01\x00rust-end-file");
 
             b[8..16].copy_from_slice(&(root as u64).to_le_bytes());
@@ -721,6 +838,15 @@ mod tests {
                 kind: *k,
                 name: n.to_string(),
             })
+            .collect()
+    }
+
+    /// Every candidate `LazyArray` count under which a section fully decodes.
+    fn counts_that_decode(sec: &[u8], fns: &[String]) -> Vec<usize> {
+        let blob = blob(sec).expect("framing");
+        let root = root_pos(blob).expect("root");
+        LAZY_ARRAY_COUNTS
+            .filter(|&n| decode(blob, root, n, fns).is_some())
             .collect()
     }
 
@@ -791,55 +917,157 @@ mod tests {
         assert_eq!(version_string(b"nothing here"), None);
     }
 
+    /// The version string decides whether a release is supported at all; the
+    /// layout within a supported release is discovered from the bytes.
     #[test]
-    fn layout_is_selected_by_version() {
-        assert_eq!(
-            lazy_arrays_before_proc_macro_data("rustc 1.98.0 (88d9e12ae 2026-08-18)"),
-            Some(15)
-        );
-        assert_eq!(
-            lazy_arrays_before_proc_macro_data("rustc 1.98.1 (48a229cea 2026-09-01)"),
-            Some(15)
-        );
-        assert_eq!(
-            lazy_arrays_before_proc_macro_data("rustc 1.99.0-beta.7 (aa0593682 2026-09-19)"),
-            Some(16)
-        );
-        assert_eq!(
-            lazy_arrays_before_proc_macro_data("rustc 1.100.0-nightly (cea272fa3 2026-09-07)"),
-            Some(16)
-        );
+    fn version_gates_support_and_discovery_selects_the_layout() {
+        for (version, minor) in [
+            ("rustc 1.98.0 (88d9e12ae 2026-08-18)", 98),
+            ("rustc 1.98.1 (48a229cea 2026-09-01)", 98),
+            ("rustc 1.99.0-beta.7 (aa0593682 2026-09-19)", 99),
+            ("rustc 1.100.0-nightly (cea272fa3 2026-09-07)", 100),
+            // A newer release is attempted rather than refused, so a minor bump does
+            // not end proc-macro capture on its own. Whether its bytes decode is then
+            // the decoder's business, with roughly twenty invariants to say no with.
+            ("rustc 1.101.0-nightly (0 2026-10-01)", 101),
+            ("rustc 1.120.0 (0 2028-01-01)", 120),
+        ] {
+            assert_eq!(supported_minor(version), Some(minor), "{version}");
+        }
         // Older releases put the names in the table itself, so there is no metadata
         // layout to guess at: fail closed.
+        assert_eq!(supported_minor("rustc 1.97.0 (2d8144b78 2026-07-07)"), None);
+        assert_eq!(supported_minor("rustc 2.0.0"), None);
+        assert_eq!(supported_minor("clang 1.98.0"), None);
+
+        // The verified layouts: 15 arrays on 1.98, 16 from 1.99. Discovery finds
+        // each from the bytes alone, and reports which count it was.
+        let fns = names(&PROBE_FNS);
+        for (version, n_arrays) in [
+            ("rustc 1.98.0 (88d9e12ae 2026-08-18)", 15),
+            ("rustc 1.98.1 (48a229cea 2026-09-01)", 15),
+            ("rustc 1.99.0-beta.7 (aa0593682 2026-09-19)", 16),
+            ("rustc 1.100.0-nightly (cea272fa3 2026-09-07)", 16),
+            // What 1.101 would look like if it inserted another array: the case the
+            // version lookup could only guess at.
+            ("rustc 1.101.0-nightly (0 2026-10-01)", 17),
+            // The version string plays no part in the choice: 1.98's string over
+            // the 16-array root decodes as the 16-array root.
+            ("rustc 1.98.0 (88d9e12ae 2026-08-18)", 16),
+        ] {
+            let (sec, _) = Synth::new(version, n_arrays, probe_macros()).build();
+            let blob = blob(&sec).unwrap();
+            let (found, got) = discover(blob, root_pos(blob).unwrap(), &fns)
+                .unwrap_or_else(|| panic!("{version} with {n_arrays} arrays"));
+            assert_eq!(found, n_arrays, "{version}");
+            assert_eq!(got, entries(&PROBE_ENTRIES), "{version}");
+            assert_eq!(counts_that_decode(&sec, &fns), vec![n_arrays], "{version}");
+        }
+
+        // Outside the window nothing is tried, so nothing is found. The bounds are
+        // asserted so that moving them is a deliberate act.
+        assert_eq!(LAZY_ARRAY_COUNTS, 12..=20);
+        for n_arrays in [11, 21] {
+            let (sec, _) = Synth::new(
+                "rustc 1.101.0-nightly (0 2026-10-01)",
+                n_arrays,
+                probe_macros(),
+            )
+            .build();
+            assert_eq!(proc_macro_entries(&sec, &fns), None, "{n_arrays} arrays");
+        }
+    }
+
+    /// A new scalar field between the arrays and `proc_macro_data` is what a count
+    /// cannot express. One that encodes as a non-zero byte derails every candidate;
+    /// one that encodes as `0` — a `false`, a `None`, a first variant — is
+    /// indistinguishable from an empty array and is absorbed as one, which is
+    /// correct: the bytes that follow it really are `proc_macro_data`.
+    #[test]
+    fn a_new_scalar_field_fails_closed_unless_it_reads_as_an_empty_array() {
+        let fns = names(&PROBE_FNS);
+        for scalar in [1u8, 2, 5, 0x7f, 0x80, 0xff] {
+            let mut synth = Synth::new("rustc 1.101.0-nightly (0 2026-10-01)", 16, probe_macros());
+            synth.extra_scalar = Some(scalar);
+            let (sec, _) = synth.build();
+            assert_eq!(
+                counts_that_decode(&sec, &fns),
+                Vec::<usize>::new(),
+                "{scalar:#x}"
+            );
+            assert_eq!(proc_macro_entries(&sec, &fns), None, "{scalar:#x}");
+        }
+        let mut synth = Synth::new("rustc 1.101.0-nightly (0 2026-10-01)", 16, probe_macros());
+        synth.extra_scalar = Some(0);
+        let (sec, _) = synth.build();
+        assert_eq!(counts_that_decode(&sec, &fns), vec![17]);
         assert_eq!(
-            lazy_arrays_before_proc_macro_data("rustc 1.97.0 (2d8144b78 2026-07-07)"),
-            None
+            proc_macro_entries(&sec, &fns),
+            Some(entries(&PROBE_ENTRIES))
         );
-        // A newer release is attempted on the newest shape we have verified rather
-        // than refused, so a minor bump does not end proc-macro capture on its own.
-        // Whether those bytes really decode is then the decoder's business, and it
-        // has roughly twenty invariants to say no with.
+    }
+
+    /// Two counts that both decode must agree, or nothing is returned. The decoy
+    /// here is a derive record that a one-derive crate's function name cannot rule
+    /// out — exactly the mislabel a wrong layout could produce — so the only defence
+    /// is noticing that another count disagrees.
+    #[test]
+    fn disagreeing_counts_fail_closed_and_agreeing_ones_do_not() {
+        let fns = names(&["derive_real"]);
+        let real = entries(&[(KIND_DERIVE, "Real")]);
+
+        let mut synth = Synth::new(
+            "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+            15,
+            vec![derive("Real", &[])],
+        );
+        synth.decoy = Some("Decoy");
+        let (sec, _) = synth.build();
+        let blob = blob(&sec).unwrap();
+        let root = root_pos(blob).unwrap();
+        // Each count on its own passes every structural check and `validate`.
+        assert_eq!(decode(blob, root, 15, &fns), Some(real.clone()));
         assert_eq!(
-            lazy_arrays_before_proc_macro_data("rustc 1.101.0-nightly (0 2026-10-01)"),
-            Some(16)
+            decode(blob, root, 17, &fns),
+            Some(entries(&[(KIND_DERIVE, "Decoy")]))
         );
-        assert_eq!(
-            lazy_arrays_before_proc_macro_data("rustc 1.120.0 (0 2028-01-01)"),
-            Some(16)
+        assert_eq!(counts_that_decode(&sec, &fns), vec![15, 17]);
+        // Together they are a tie, and a tie is refused.
+        assert_eq!(proc_macro_entries(&sec, &fns), None);
+
+        // The same construction with a decoy that happens to say the same thing:
+        // whichever count is the real layout, the answer is this one.
+        let mut synth = Synth::new(
+            "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+            15,
+            vec![derive("Real", &[])],
         );
-        assert_eq!(lazy_arrays_before_proc_macro_data("rustc 2.0.0"), None);
-        assert_eq!(lazy_arrays_before_proc_macro_data("clang 1.98.0"), None);
+        synth.decoy = Some("Real");
+        let (sec, _) = synth.build();
+        assert_eq!(counts_that_decode(&sec, &fns), vec![15, 17]);
+        assert_eq!(proc_macro_entries(&sec, &fns), Some(real));
+
+        // Without the decoy, only the real count decodes.
+        let (sec, _) = Synth::new(
+            "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+            15,
+            vec![derive("Real", &[])],
+        )
+        .build();
+        assert_eq!(counts_that_decode(&sec, &fns), vec![15]);
     }
 
     /// The case the whole exercise exists for: derives whose trait names differ
     /// from their function names, next to the attributes that used to produce
-    /// phantom records — on both root layouts.
+    /// phantom records — on both verified root layouts and a hypothetical next one.
     #[test]
     fn recovers_derive_trait_names_and_kinds() {
         for (version, n_arrays) in [
             ("rustc 1.98.0 (88d9e12ae 2026-08-18)", 15),
+            ("rustc 1.98.1 (48a229cea 2026-09-01)", 15),
             ("rustc 1.99.0-beta.7 (aa0593682 2026-09-19)", 16),
             ("rustc 1.100.0-nightly (cea272fa3 2026-09-07)", 16),
+            ("rustc 1.101.0-nightly (0 2026-10-01)", 17),
         ] {
             let (sec, _) = Synth::new(version, n_arrays, probe_macros()).build();
             assert_eq!(
@@ -888,14 +1116,16 @@ mod tests {
         assert_eq!(proc_macro_entries(b"\0\0\0\0garbage", &fns), None);
         assert_eq!(proc_macro_entries(&sec, &[]), None);
 
-        // A version this module has no layout for.
+        // A version this module does not support, over bytes it could otherwise
+        // decode: the gate comes first.
         let (sec97, _) =
             Synth::new("rustc 1.97.0 (2d8144b78 2026-07-07)", 15, probe_macros()).build();
+        assert_eq!(counts_that_decode(&sec97, &fns), vec![15]);
         assert_eq!(proc_macro_entries(&sec97, &fns), None);
-        // The right version string over the other layout: the walk lands on the
+        // A root with an array count no candidate reaches: every walk lands on the
         // wrong bytes and must notice.
         let (wrong, _) =
-            Synth::new("rustc 1.98.0 (88d9e12ae 2026-08-18)", 16, probe_macros()).build();
+            Synth::new("rustc 1.98.0 (88d9e12ae 2026-08-18)", 22, probe_macros()).build();
         assert_eq!(proc_macro_entries(&wrong, &fns), None);
 
         // Count mismatch in either direction.
@@ -1083,20 +1313,33 @@ mod tests {
     /// Bytes captured from real dylibs, one per root layout.
     #[test]
     fn decodes_sections_captured_from_real_dylibs() {
-        for (name, hex, version) in [
+        for (name, hex, version, n_arrays) in [
             (
                 "1.98.0",
                 PROBE_SECTION_1_98,
                 "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+                15,
             ),
             (
                 "1.100.0-nightly",
                 PROBE_SECTION_1_100,
                 "rustc 1.100.0-nightly (cea272fa3 2026-09-07)",
+                16,
             ),
         ] {
             let sec = from_hex(hex);
             assert_eq!(version_string(&sec).as_deref(), Some(version), "{name}");
+            // On real bytes exactly one candidate count decodes, and it is the one
+            // read off `CrateRoot` in rustc's source for that release: discovery is
+            // not being rescued by the agreement rule here, it simply finds the
+            // layout. (Wrong counts die within a few bytes: one short reads an empty
+            // array's `0` as `proc_macro_data: None`; one long reads the `Some` as a
+            // count of one and `stability: None` as `proc_macro_data: None`.)
+            assert_eq!(
+                counts_that_decode(&sec, &names(&PROBE_FNS)),
+                vec![n_arrays],
+                "{name}"
+            );
 
             // The blob really does contain the strings that used to read as
             // derive records — a doc comment, a `#[deprecated(note)]`, a
@@ -1153,6 +1396,7 @@ mod tests {
             .collect();
         let bytes = std::fs::read(path).expect("section file");
         println!("version: {:?}", version_string(&bytes));
+        println!("counts that decode: {:?}", counts_that_decode(&bytes, &fns));
         let got = proc_macro_entries(&bytes, &fns);
         println!("entries: {:#?}", got);
         assert!(got.is_some(), "scan failed on a real section");
