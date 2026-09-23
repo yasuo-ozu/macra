@@ -86,6 +86,13 @@ fn proc_macro_capture_supported() -> bool {
     *SUPPORTED.get_or_init(|| {
         let supported = cargo_macra::proc_macro_capture_supported()
             .expect("could not probe `rustc -vV`; refusing to skip the suite silently");
+        // See `show_expansion.rs`: on a supported toolchain a skip must fail loudly,
+        // because every one of these tests asserts output only the hook produces and
+        // would otherwise pass vacuously.
+        assert!(
+            supported || std::env::var_os("MACRA_REQUIRE_CAPTURE").is_none(),
+            "MACRA_REQUIRE_CAPTURE is set, but this rustc has no mapped bridge ABI",
+        );
         if !supported {
             eprintln!(
                 "skipping external_crate proc-macro tests: rustc 1.{} has no mapped bridge ABI",

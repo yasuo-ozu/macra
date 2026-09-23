@@ -101,3 +101,45 @@ pub fn tag_item(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
     output.into()
 }
+
+// ---------------------------------------------------------------------------
+// Shapes that break a `.rustc` metadata scan. None of these are invoked by
+// `tests/test-usage`: they only have to be *declared*, because the hook reads the
+// whole decls table, so a scan that miscounts here corrupts the names of the macros
+// that are used. Each one is a bug that reached a user.
+// ---------------------------------------------------------------------------
+
+/// A derive whose helper attributes follow the trait name — serde's own shape
+/// (`#[proc_macro_derive(Serialize, attributes(serde))]`). A scan that resumed after
+/// the trait name landed on the helper *count* and read it as the next macro's kind,
+/// which made the whole scan fail and cost every proc-macro expansion in the crate.
+#[proc_macro_derive(WithHelpers, attributes(helper_one, helper_two))]
+pub fn derive_with_helpers(_input: TokenStream) -> TokenStream {
+    TokenStream::new()
+}
+
+/// `Display` is a name rustc predefines, so it is encoded as an index rather than a
+/// string in the def-path echo. Anything that recovers names by matching strings has
+/// to cope with this one carrying no string at all.
+#[proc_macro_derive(Display)]
+pub fn derive_display_impl(_input: TokenStream) -> TokenStream {
+    TokenStream::new()
+}
+
+/// Doc text, `#[doc(alias)]` and a deprecation note all encode as interned strings
+/// that look exactly like a derive record (`KIND_DERIVE` and the string tag are both
+/// `0x00`). A scan that trusted that shape reported `PhantomName` as a derive.
+#[doc(alias = "PhantomAlias")]
+#[deprecated(note = "PhantomNote")]
+#[proc_macro_derive(PhantomName)]
+pub fn derive_phantom_name(_input: TokenStream) -> TokenStream {
+    TokenStream::new()
+}
+
+/// Declared LAST on purpose: a scan that stops after `fn_names.len()` entries drops
+/// whatever is at the end once a phantom has taken a slot, so this is the macro that
+/// disappears first.
+#[proc_macro]
+pub fn declared_last(_input: TokenStream) -> TokenStream {
+    TokenStream::new()
+}

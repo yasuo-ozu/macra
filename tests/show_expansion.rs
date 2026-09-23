@@ -81,8 +81,18 @@ fn assert_exact(
 /// Without one the compiler still emits `macro_rules!` traces, but no proc-macro
 /// expansion is captured, so tests assert only what the toolchain can deliver.
 fn proc_macros_captured() -> bool {
-    cargo_macra::proc_macro_capture_supported()
-        .expect("could not probe `rustc -vV`; refusing to skip the assertions silently")
+    let supported = cargo_macra::proc_macro_capture_supported()
+        .expect("could not probe `rustc -vV`; refusing to skip the assertions silently");
+    // On a toolchain we claim to support, a skip is a failure, not a pass. Silence is
+    // exactly what an unmapped compiler looks like from the outside — no derives, no
+    // attributes, no message — so without this every proc-macro test goes green the
+    // moment capture stops working. CI sets it for the release channels.
+    assert!(
+        supported || std::env::var_os("MACRA_REQUIRE_CAPTURE").is_none(),
+        "MACRA_REQUIRE_CAPTURE is set, but this rustc has no mapped bridge ABI, \
+         so no proc macro would be captured",
+    );
+    supported
 }
 
 /// Run trace-macros directly on the test-usage crate and return raw expansions.

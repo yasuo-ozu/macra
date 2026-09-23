@@ -13,6 +13,12 @@ jobs:
   test:
     name: Test ( ${{ matrix.os }} ${{ matrix.rust }})
     runs-on: ${{ matrix.os }}
+    # Every version in this matrix has a mapped bridge ABI, so a skipped proc-macro
+    # test means capture broke, not that the toolchain is out of scope. Deliberately
+    # NOT set for nightly, which legitimately goes unmapped each time rustc's minor
+    # bumps and is an early-warning channel rather than a guarantee.
+    env:
+      MACRA_REQUIRE_CAPTURE: "1"
     strategy:
       fail-fast: false
       matrix:
