@@ -4141,12 +4141,27 @@ fn ui(frame: &mut Frame, app: &mut App) {
                 Style::default().fg(Color::White).bold()
             };
 
+            // Struck through when the macro is *proved* to have no expansion, so the
+            // list says so at a glance instead of only through colour. Both cases are
+            // conclusive: `inert` is a built-in derive or a declared helper attribute,
+            // and `expansion_failed` is set only after the trace stream ran to
+            // completion without a match, so no later record can arrive to contradict
+            // it. A pending lookup is never struck — it may still succeed.
+            let unexpandable = inert || node.expansion_failed;
+            let strike = |s: Style| {
+                if unexpandable {
+                    s.add_modifier(Modifier::CROSSED_OUT)
+                } else {
+                    s
+                }
+            };
+
             let line = Line::from(vec![
                 Span::raw(indent),
                 Span::raw(branch),
                 Span::raw(collapse_indicator),
-                Span::styled(format!("[{}] ", kind_label), kind_style),
-                Span::styled(node.call.name.clone(), name_style),
+                Span::styled(format!("[{}] ", kind_label), strike(kind_style)),
+                Span::styled(node.call.name.clone(), strike(name_style)),
                 Span::styled(
                     format!(" L{}", node.call.line),
                     Style::default().fg(Color::DarkGray),
@@ -7358,5 +7373,47 @@ pub struct Page {
         assert!(msg.contains("No trace found for 'Debug'"), "{msg}");
         assert!(!app.status.contains("built-in"), "{}", app.status);
         assert!(!app.get_node(clone).unwrap().expanded);
+    }
+
+    /// A macro macra has *proved* cannot expand is struck through in the tree, so the
+    /// verdict survives a terminal or a reader that loses the grey.
+    #[test]
+    fn a_proved_unexpandable_macro_is_struck_through() {
+        let mut app = test_app("#[derive(Debug, Greet)]\npub struct S;\n");
+        let buf = render(&mut app, 100, 20);
+
+        // Collect, per tree row, the names drawn with CROSSED_OUT.
+        let mut struck = Vec::new();
+        let mut plain = Vec::new();
+        for y in 0..buf.area.height {
+            let mut word = String::new();
+            let mut crossed = false;
+            for x in 0..buf.area.width {
+                let cell = &buf[(x, y)];
+                let c = cell.symbol();
+                if c.chars().all(|ch| ch.is_alphanumeric() || ch == '_') && !c.trim().is_empty() {
+                    word.push_str(c);
+                    crossed |= cell.modifier.contains(Modifier::CROSSED_OUT);
+                } else {
+                    if !word.is_empty() {
+                        if crossed {
+                            struck.push(word.clone())
+                        } else {
+                            plain.push(word.clone())
+                        }
+                    }
+                    word.clear();
+                    crossed = false;
+                }
+            }
+        }
+        assert!(
+            struck.iter().any(|w| w == "Debug"),
+            "built-in Debug should be struck through; struck={struck:?}"
+        );
+        assert!(
+            plain.iter().any(|w| w == "Greet") && !struck.iter().any(|w| w == "Greet"),
+            "a proc-macro derive must not be struck; struck={struck:?} plain={plain:?}"
+        );
     }
 }
