@@ -183,6 +183,17 @@ fn wait_cancelled() -> bool {
 /// collision while still bounded — it never waits for the whole build.
 const AMBIGUITY_SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// Most cached expansions one failure log may contain.
+///
+/// The entries that explain a miss — same name, its aliases, its mangled forms — are
+/// a handful to a few dozen even in a project that traces 69,000 expansions (the one
+/// that motivated the cap had 42 aliases in total), so the cap is far above what a
+/// human would compare against the query and still leaves room for a sample of the
+/// same-kind entries that *were* traced. At the sizes seen there (~430 bytes per
+/// entry on average, a few KB for a derive's output) it keeps a log around a hundred
+/// KB to a low single-digit MB, where the previous unbounded dump was 30 MB.
+const ERROR_LOG_MAX_ENTRIES: usize = 300;
+
 /// Outcome of a trace lookup.
 enum TraceLookup {
     /// Exactly one distinct expansion matched.
@@ -246,10 +257,89 @@ struct CacheInner {
     /// `normalize_tokens` of each expansion's `input` and `arguments`, computed once
     /// when the entry is pushed; index-aligned with `expansions`.
     normalized: Vec<(String, String)>,
+    /// Alias name -> definition names, from every `use <def> as <Alias>;` seen in an
+    /// expansion's output.
+    ///
+    /// A derive that generates a `macro_rules!` typically mangles the name and
+    /// re-exports it (`macro_rules! __line_ast_<hash> {..} pub use __line_ast_<hash>
+    /// as Line;`). `-Z trace-macros` then names the *definition* while the source call
+    /// — and so the query — names the *alias*, so nothing in `expansions` is called
+    /// `Line` and the lookup fails. One alias can point at several definitions (two
+    /// crates each re-exporting their helper as `Debug`), hence the `Vec`; the
+    /// resulting collision is for the ambiguity popup to resolve.
+    aliases: std::collections::HashMap<String, Vec<String>>,
     done: bool,
     error: Option<String>,
     /// Stored build failure message (non-zero exit from cargo check).
     build_error: Option<String>,
+}
+
+impl CacheInner {
+    /// Append one entry. `normalized` and `aliases` are computed by the caller, outside
+    /// the lock, so that the lock only covers the pushes themselves.
+    fn push(
+        &mut self,
+        exp: MacroExpansion,
+        normalized: (String, String),
+        aliases: Vec<(String, String)>,
+    ) {
+        self.expansions.push(exp);
+        self.normalized.push(normalized);
+        for (alias, def) in aliases {
+            let defs = self.aliases.entry(alias).or_default();
+            if !defs.contains(&def) {
+                defs.push(def);
+            }
+        }
+    }
+
+    /// The definition names `name` (a source-side macro name) is an alias of, if any.
+    fn alias_definitions(&self, name: &str) -> &[String] {
+        let alias = name.rsplit("::").next().unwrap_or(name).trim();
+        self.aliases.get(alias).map_or(&[], Vec::as_slice)
+    }
+}
+
+/// Every `use <path> as <Alias>;` in an expansion's output, as `(alias, definition)`
+/// where the definition is the path's last segment.
+///
+/// This is a token-level scan, not a parse: the output is a single line of
+/// `TokenStream`-style text. Splitting on `;` isolates items, `rfind` picks the `use`
+/// nearest the `as`, and the checks on the preceding character and on quote parity
+/// reject `reuse as`, `_use as` and a `use` inside a string literal. Braced imports
+/// (`use m::{a as b}`) are not recognised; a miss there only costs the alias match,
+/// never expands the wrong macro.
+fn alias_targets(output: &str) -> Vec<(String, String)> {
+    fn ident(s: &str) -> bool {
+        s.starts_with(|c: char| c.is_alphabetic() || c == '_')
+            && s.chars().all(|c| c.is_alphanumeric() || c == '_')
+    }
+    let mut out = Vec::new();
+    for stmt in output.split(';') {
+        let Some(pos) = stmt.rfind("use ") else {
+            continue;
+        };
+        let before = &stmt[..pos];
+        if before
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+            || before.matches('"').count() % 2 == 1
+        {
+            continue;
+        }
+        let rest = &stmt[pos + 4..];
+        let Some((path, alias)) = rest.split_once(" as ") else {
+            continue;
+        };
+        let alias = alias.trim();
+        let def = path.trim().rsplit("::").next().unwrap_or("").trim();
+        // `use x as _;` names nothing a source call could refer to.
+        if ident(alias) && ident(def) && alias != def && alias != "_" {
+            out.push((alias.to_string(), def.to_string()));
+        }
+    }
+    out
 }
 
 struct ExpansionCache {
@@ -269,6 +359,7 @@ impl ExpansionCache {
             Mutex::new(CacheInner {
                 expansions: Vec::new(),
                 normalized: Vec::new(),
+                aliases: std::collections::HashMap::new(),
                 done: false,
                 error: None,
                 build_error: None,
@@ -289,9 +380,9 @@ impl ExpansionCache {
                             cargo_macra::normalize_tokens(&exp.input),
                             cargo_macra::normalize_tokens(&exp.arguments),
                         );
+                        let aliases = alias_targets(&exp.to);
                         let mut cache = mutex.lock().unwrap();
-                        cache.expansions.push(exp);
-                        cache.normalized.push(normalized);
+                        cache.push(exp, normalized, aliases);
                         condvar.notify_all();
                     }
                     Err(e) => {
@@ -397,6 +488,7 @@ impl ExpansionCache {
             &cargo_macra::normalize_tokens(input),
             &cargo_macra::normalize_tokens(arguments),
             name,
+            &[],
             kind,
             relaxed_name,
             strict_input,
@@ -408,7 +500,9 @@ impl ExpansionCache {
     /// `exp_norm_input` / `exp_norm_arguments` must be `normalize_tokens` of
     /// `exp.input` / `exp.arguments` (stored in `CacheInner::normalized`), and
     /// `norm_input` / `norm_arguments` those of the query. The raw `input` is still
-    /// needed for the truncated-invocation fallback below.
+    /// needed for the truncated-invocation fallback below. `alias_defs` are the
+    /// definition names `name` is a re-export of (`CacheInner::alias_definitions`);
+    /// an entry named after any of them matches as if it carried `name` itself.
     #[allow(clippy::too_many_arguments)]
     fn expansion_matches_pre(
         exp: &MacroExpansion,
@@ -418,17 +512,27 @@ impl ExpansionCache {
         norm_input: &str,
         norm_arguments: &str,
         name: &str,
+        alias_defs: &[String],
         kind: MacroKind,
         relaxed_name: bool,
         strict_input: bool,
     ) -> bool {
         let macro_name = name.rsplit("::").next().unwrap_or(name).trim();
         let exp_name = exp.name.rsplit("::").next().unwrap_or(&exp.name).trim();
+        // A re-exported macro (`pub use __line_ast_<hash> as Line;`) is traced under
+        // its definition name, so `Line` in the source never equals any entry's name.
+        // The alias is resolved exactly rather than by loosening the relaxed pass
+        // below: `__line_ast_<hash>` differs from `Line` in case and carries an extra
+        // `_ast` infix, and a heuristic loose enough to bridge that would also let
+        // `Line` expand some unrelated `__line_<other>_<hash>`. Resolving through the
+        // `use` is as exact as a name comparison, so it belongs in the exact pass.
+        //
         // Mangled helper macros are generated as `__<Name>_<hash>`, so the relaxed
         // pass has to stop at a `_` boundary. A bare prefix test also accepted
         // `__Parser_<hash>` for source name `Parse`, silently expanding a different
         // macro — and with only one such match there is no collision to prompt about.
         let name_matches = exp_name == macro_name
+            || alias_defs.iter().any(|def| def == exp_name)
             || (relaxed_name
                 && !macro_name.is_empty()
                 && exp_name
@@ -538,9 +642,11 @@ impl ExpansionCache {
     /// `min_idx`: `find_trace_for_tokens` passes 0 for a lookup's first scan and, after
     /// each *unsuccessful* scan, the length it saw, so later wakes only test entries
     /// appended since. That is safe because entries are immutable and only ever
-    /// appended, and matching is a pure function of entry and query — an entry rejected
-    /// by every pass cannot start matching later. (A scan that does match returns
-    /// immediately, so the watermark never hides a candidate from a later scan.)
+    /// appended, and matching is a pure function of entry, query and the alias set for
+    /// `name` — an entry rejected by every pass cannot start matching later unless a
+    /// new alias for `name` arrives, which is the one case where the caller has to
+    /// reset the watermark. (A scan that does match returns immediately, so the
+    /// watermark never hides a candidate from a later scan.)
     ///
     /// Note the `strict_input` dimension only affects attribute macros; for bang and
     /// derive macros both values behave identically, so those passes are skipped.
@@ -554,6 +660,7 @@ impl ExpansionCache {
         kind: MacroKind,
         min_idx: usize,
     ) -> Vec<usize> {
+        let alias_defs = inner.alias_definitions(name);
         let strict_passes: &[bool] = if kind == MacroKind::Attribute {
             &[true, false]
         } else {
@@ -572,6 +679,7 @@ impl ExpansionCache {
                             norm_input,
                             norm_arguments,
                             name,
+                            alias_defs,
                             kind,
                             relaxed,
                             strict_input,
@@ -615,8 +723,19 @@ impl ExpansionCache {
         // The watermark is read under the lock, and pushes also happen under the lock,
         // so an entry arriving during a wait always has an index >= the watermark.
         let mut scanned_len = 0;
+        // How many definitions `name` was known to alias at the last scan. The
+        // watermark assumes a rejected entry stays rejected, but a `pub use
+        // __line_ast_<hash> as Line;` arriving *after* the `__line_ast_<hash>!`
+        // invocation retroactively makes that earlier entry match `Line`. Whenever the
+        // alias set grows, the whole cache has to be rescanned.
+        let mut alias_count = 0;
 
         loop {
+            let aliases_now = inner.alias_definitions(name).len();
+            if aliases_now != alias_count {
+                alias_count = aliases_now;
+                scanned_len = 0;
+            }
             let hits = Self::search_expansions(
                 &inner,
                 input,
@@ -686,8 +805,13 @@ impl ExpansionCache {
     }
 
     /// Write a diagnostic log file for a failed expansion.
-    /// Contains the macro info dump followed by all cached expansion traces.
-    /// Returns the path to the log file.
+    /// Contains the macro info dump followed by the cached expansion traces most
+    /// relevant to the query (see `write_error_log_to`). Returns the path.
+    ///
+    /// The file is named after this process rather than the wall clock: each
+    /// failure used to write a fresh timestamped file, and one afternoon of retrying
+    /// a broken lookup left 35 files totalling 783 MB in `/tmp/macra`. A failure
+    /// now overwrites this run's file; concurrent macra instances still get their own.
     fn write_error_log(
         &self,
         name: &str,
@@ -695,71 +819,126 @@ impl ExpansionCache {
         input: &str,
         arguments: &str,
     ) -> Option<PathBuf> {
-        use std::io::Write;
-
         let tmp_dir = std::env::temp_dir().join("macra");
         if std::fs::create_dir_all(&tmp_dir).is_err() {
             return None;
         }
+        let log_path = tmp_dir.join(format!("expansion-error-{}.log", std::process::id()));
 
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let log_path = tmp_dir.join(format!("expansion-error-{}.log", timestamp));
-
-        let mut file = match std::fs::File::create(&log_path) {
-            Ok(f) => f,
-            Err(_) => return None,
-        };
-
-        // Dump macro info
-        let _ = writeln!(file, "name: {}", name);
-        let _ = writeln!(file, "kind: {}", kind.as_str());
-        let _ = writeln!(file, "input: {}", input);
-        let _ = writeln!(file, "arguments: {}", arguments);
-        let _ = writeln!(file);
-
-        // Dump all cached expansions (--show-expansion format)
         let (ref mutex, _) = *self.inner;
         let inner = mutex.lock().unwrap();
+        Self::write_error_log_to(&inner, &log_path, name, kind, input, arguments)
+            .ok()
+            .map(|()| log_path)
+    }
+
+    /// Body of `write_error_log`, writing to an explicit path so it can be exercised
+    /// against a hand-built cache.
+    ///
+    /// At most `ERROR_LOG_MAX_ENTRIES` entries are written. Dumping the whole cache
+    /// wrote 69,000 entries (30 MB) per failure in a project with a few dependencies,
+    /// which no one reads. The entries kept are the ones that explain a miss, in this
+    /// order: same kind and same name (the input or arguments differed), same kind
+    /// and a mangled or aliased form of the name, a name hit under a different kind
+    /// (the source was classified wrongly), then the rest of the same kind as a sample
+    /// of what *was* traced, then everything else. Stream order is preserved within a
+    /// rank. The tail states how many were omitted so the reader knows it is a sample.
+    fn write_error_log_to(
+        inner: &CacheInner,
+        log_path: &Path,
+        name: &str,
+        kind: MacroKind,
+        input: &str,
+        arguments: &str,
+    ) -> io::Result<()> {
+        use std::io::Write;
+
+        let mut file = io::BufWriter::new(std::fs::File::create(log_path)?);
+
+        // Dump macro info
+        writeln!(file, "name: {}", name)?;
+        writeln!(file, "kind: {}", kind.as_str())?;
+        writeln!(file, "input: {}", input)?;
+        writeln!(file, "arguments: {}", arguments)?;
+        writeln!(file)?;
 
         if inner.expansions.is_empty() {
-            let _ = writeln!(file, "No macro expansions found.");
-        } else {
-            let mut first = true;
-            for expansion in &inner.expansions {
-                if !first {
-                    let _ = writeln!(file);
-                }
-                first = false;
-
-                let caller = match expansion.kind {
-                    MacroExpansionKind::Bang => format!("{}!", expansion.name),
-                    MacroExpansionKind::Attribute => {
-                        if expansion.arguments.is_empty() {
-                            format!("#[{}]", expansion.name)
-                        } else {
-                            format!(
-                                "#[{}({})]",
-                                expansion.name,
-                                expansion.arguments.replace('\n', " ")
-                            )
-                        }
-                    }
-                    MacroExpansionKind::Derive => format!("#[derive({})]", expansion.name),
-                };
-
-                let _ = writeln!(file, "== {} ==", caller);
-                if !expansion.input.is_empty() {
-                    let _ = writeln!(file, "{}", expansion.input);
-                }
-                let _ = writeln!(file, "---");
-                let _ = writeln!(file, "{}", expansion.to);
-            }
+            writeln!(file, "No macro expansions found.")?;
+            return file.flush();
         }
 
-        Some(log_path)
+        let macro_name = name.rsplit("::").next().unwrap_or(name).trim();
+        let alias_defs = inner.alias_definitions(name);
+        let exp_kind = Self::to_expansion_kind(kind);
+        let rank = |exp: &MacroExpansion| -> u8 {
+            let exp_name = exp.name.rsplit("::").next().unwrap_or(&exp.name).trim();
+            let same_kind = exp.kind == exp_kind;
+            let exact = exp_name == macro_name;
+            // The same shapes `expansion_matches_pre` accepts, so every entry a
+            // lookup pass could have considered is ranked ahead of the noise.
+            let related = alias_defs.iter().any(|def| def == exp_name)
+                || (!macro_name.is_empty()
+                    && exp_name
+                        .strip_prefix("__")
+                        .and_then(|rest| rest.strip_prefix(macro_name))
+                        .is_some_and(|tail| tail.is_empty() || tail.starts_with('_')));
+            match (same_kind, exact, related) {
+                (true, true, _) => 0,
+                (true, false, true) => 1,
+                (false, true, _) | (false, false, true) => 2,
+                (true, false, false) => 3,
+                (false, false, false) => 4,
+            }
+        };
+        let mut order: Vec<usize> = (0..inner.expansions.len()).collect();
+        // Stable, so entries of equal rank stay in stream order.
+        order.sort_by_key(|&idx| rank(&inner.expansions[idx]));
+
+        let total = order.len();
+        let kept = total.min(ERROR_LOG_MAX_ENTRIES);
+        writeln!(
+            file,
+            "{} of {} cached expansions follow, most relevant to '{}' first.",
+            kept, total, macro_name
+        )?;
+
+        // Dump the kept expansions (--show-expansion format)
+        for &idx in &order[..kept] {
+            let expansion = &inner.expansions[idx];
+            writeln!(file)?;
+            let caller = match expansion.kind {
+                MacroExpansionKind::Bang => format!("{}!", expansion.name),
+                MacroExpansionKind::Attribute => {
+                    if expansion.arguments.is_empty() {
+                        format!("#[{}]", expansion.name)
+                    } else {
+                        format!(
+                            "#[{}({})]",
+                            expansion.name,
+                            expansion.arguments.replace('\n', " ")
+                        )
+                    }
+                }
+                MacroExpansionKind::Derive => format!("#[derive({})]", expansion.name),
+            };
+
+            writeln!(file, "== {} ==", caller)?;
+            if !expansion.input.is_empty() {
+                writeln!(file, "{}", expansion.input)?;
+            }
+            writeln!(file, "---")?;
+            writeln!(file, "{}", expansion.to)?;
+        }
+
+        writeln!(file)?;
+        writeln!(
+            file,
+            "{} of {} cached expansions omitted (cap: {}).",
+            total - kept,
+            total,
+            ERROR_LOG_MAX_ENTRIES
+        )?;
+        file.flush()
     }
 
     /// Take the stored error (if any), clearing it.
@@ -4799,23 +4978,25 @@ struct B;
         }
     }
 
+    /// A cache filled the way the reader thread fills it, entry by entry.
     fn cache_inner_of(expansions: Vec<MacroExpansion>) -> CacheInner {
-        let normalized = expansions
-            .iter()
-            .map(|e| {
-                (
-                    cargo_macra::normalize_tokens(&e.input),
-                    cargo_macra::normalize_tokens(&e.arguments),
-                )
-            })
-            .collect();
-        CacheInner {
-            expansions,
-            normalized,
+        let mut inner = CacheInner {
+            expansions: Vec::new(),
+            normalized: Vec::new(),
+            aliases: std::collections::HashMap::new(),
             done: false,
             error: None,
             build_error: None,
+        };
+        for exp in expansions {
+            let normalized = (
+                cargo_macra::normalize_tokens(&exp.input),
+                cargo_macra::normalize_tokens(&exp.arguments),
+            );
+            let aliases = alias_targets(&exp.to);
+            inner.push(exp, normalized, aliases);
         }
+        inner
     }
 
     fn search(inner: &CacheInner, min_idx: usize) -> Vec<usize> {
@@ -5067,6 +5248,7 @@ struct B;
                 Mutex::new(CacheInner {
                     expansions: Vec::new(),
                     normalized: Vec::new(),
+                    aliases: std::collections::HashMap::new(),
                     done: true,
                     error: None,
                     build_error: None,
@@ -5317,6 +5499,201 @@ struct B;
             app.source_lines.iter().any(|l| l == "struct S;"),
             "{:#?}",
             app.source_lines
+        );
+    }
+
+    /// The shapes captured from the project that hit the bug: a derive's output that
+    /// defines a mangled `macro_rules!` and re-exports it under the source name, in
+    /// the one-line `TokenStream` form the trace delivers.
+    #[test]
+    fn alias_targets_reads_re_exports_from_real_derive_output() {
+        let out = "macro_rules! __line_ast_1293612360414456081 { ($($t:tt)*) => {} } \
+                   #[doc(hidden)] pub use __line_ast_1293612360414456081 as Line; \
+                   macro_rules! __newer_type_macro__1126978984725632989 { () => {} } \
+                   pub use __newer_type_macro__1126978984725632989 as Debug; \
+                   pub use a::b::C as D;";
+        let found = alias_targets(out);
+        let found: Vec<(&str, &str)> = found
+            .iter()
+            .map(|(a, d)| (a.as_str(), d.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("Line", "__line_ast_1293612360414456081"),
+                ("Debug", "__newer_type_macro__1126978984725632989"),
+                ("D", "C"),
+            ]
+        );
+    }
+
+    #[test]
+    fn alias_targets_ignores_things_that_only_look_like_re_exports() {
+        // `use` inside a string literal: the `;` split leaves an odd number of quotes
+        // before it, whether the string itself contains a `;` or not.
+        assert!(alias_targets(r#"const S: &str = "use x as y"; "#).is_empty());
+        assert!(alias_targets(r#"const S: &str = "please use x as y; and more";"#).is_empty());
+        assert!(alias_targets(r#"#[doc = "use it as Foo"] fn f() {}"#).is_empty());
+        // Identifiers that merely end in `use`.
+        assert!(alias_targets("let z = reuse as u32;").is_empty());
+        assert!(alias_targets("let z = _use as u32;").is_empty());
+        // A `use` with no `as` renames nothing.
+        assert!(alias_targets("use crate::ast::Line;").is_empty());
+        // An alias equal to its definition carries no information.
+        assert!(alias_targets("pub use Line as Line;").is_empty());
+        // Neither does a wildcard binding.
+        assert!(alias_targets("use Line as _;").is_empty());
+        // A non-identifier on either side is not a plain re-export.
+        assert!(alias_targets("use m::{a as b, c as d};").is_empty());
+        // A trailing `use x as y` with no `;` is a truncated but unambiguous item; the
+        // cost of accepting it is nil because a matched entry must also agree on kind
+        // and input.
+        assert_eq!(
+            alias_targets("use x as y"),
+            vec![("y".to_string(), "x".to_string())]
+        );
+    }
+
+    /// `crate::ast::Line! { .. }` in the source, traced by rustc as
+    /// `__line_ast_<hash>! { .. }` because `Line` is `pub use __line_ast_<hash> as
+    /// Line;`. The alias differs from the definition in case and carries an `_ast`
+    /// infix, so neither the exact nor the relaxed pass can match it; only the
+    /// re-export can. Before alias resolution existed this test failed on the
+    /// `with_alias` assertion.
+    #[test]
+    fn aliased_call_matches_its_mangled_definition_only_when_the_alias_is_seen() {
+        let invocation = bang_expansion(
+            "__line_ast_1293612360414456081",
+            "@ ast $crate :: _imp :: syan_macro :: __visitor_build { @ base { } }",
+            "pub enum Line { Text(i64) }",
+        );
+        let derive = MacroExpansion {
+            expanding: "syan".to_string(),
+            arguments: String::new(),
+            to: "macro_rules! __line_ast_1293612360414456081 { ($($t:tt)*) => {} } \
+                 #[doc(hidden)] pub use __line_ast_1293612360414456081 as Line;"
+                .to_string(),
+            name: "syan".to_string(),
+            kind: MacroExpansionKind::Attribute,
+            input: "mod ast { }".to_string(),
+            krate: String::new(),
+        };
+        let input = "@ ast $crate::_imp::syan_macro::__visitor_build { @ base {} }";
+        let norm_input = cargo_macra::normalize_tokens(input);
+        let norm_arguments = cargo_macra::normalize_tokens("");
+        let search = |inner: &CacheInner, min_idx: usize| {
+            ExpansionCache::search_expansions(
+                inner,
+                input,
+                &norm_input,
+                &norm_arguments,
+                "crate::ast::Line",
+                MacroKind::Functional,
+                min_idx,
+            )
+        };
+
+        let without_alias = cache_inner_of(vec![invocation.clone()]);
+        assert!(search(&without_alias, 0).is_empty());
+
+        // Either arrival order resolves, and the hit is the invocation, not the
+        // derive whose output introduced the alias.
+        let with_alias = cache_inner_of(vec![derive.clone(), invocation.clone()]);
+        assert_eq!(search(&with_alias, 0), vec![1]);
+        let alias_late = cache_inner_of(vec![invocation.clone(), derive.clone()]);
+        assert_eq!(search(&alias_late, 0), vec![0]);
+        // ...which is why `find_trace_for_tokens` resets its watermark when the alias
+        // set grows: resumed from past the invocation, the late alias finds nothing.
+        assert!(search(&alias_late, 1).is_empty());
+
+        // The alias never bridges a different kind: `#[derive(Line)]` is not `Line!`.
+        let derive_query = ExpansionCache::search_expansions(
+            &with_alias,
+            input,
+            &norm_input,
+            &norm_arguments,
+            "Line",
+            MacroKind::Derive,
+            0,
+        );
+        assert!(derive_query.is_empty());
+    }
+
+    /// Two crates each re-exporting their own helper as `Debug` both stay reachable;
+    /// collapsing them would silently pick one, which is the popup's decision.
+    #[test]
+    fn one_alias_can_name_several_definitions() {
+        let inner = cache_inner_of(vec![
+            bang_expansion(
+                "sumtype",
+                "",
+                "pub use __sumtype_macro_10937832296169661908 as Debug;",
+            ),
+            bang_expansion(
+                "newer_type",
+                "",
+                "pub use __newer_type_macro__1126978984725632989 as Debug; \
+                 pub use __newer_type_macro__1126978984725632989 as Debug;",
+            ),
+        ]);
+        assert_eq!(
+            inner.alias_definitions("Debug"),
+            [
+                "__sumtype_macro_10937832296169661908".to_string(),
+                "__newer_type_macro__1126978984725632989".to_string(),
+            ]
+        );
+        assert!(inner.alias_definitions("Clone").is_empty());
+    }
+
+    #[test]
+    fn error_log_is_bounded_and_keeps_the_relevant_entries_first() {
+        let mut expansions: Vec<MacroExpansion> = (0..ERROR_LOG_MAX_ENTRIES * 10)
+            .map(|i| bang_expansion("quote_token", &format!("{}", i), "noise"))
+            .collect();
+        // A derive that happens to share the name: kept, but behind same-kind hits.
+        expansions.push(MacroExpansion {
+            kind: MacroExpansionKind::Derive,
+            ..bang_expansion("foo", "", "derive of the same name")
+        });
+        // The relaxed and aliased forms, and the exact name, all buried at the end.
+        expansions.push(bang_expansion("__foo_123", "x", "mangled"));
+        expansions.push(bang_expansion("aliasing", "", "pub use __hidden_9 as foo;"));
+        expansions.push(bang_expansion("__hidden_9", "x", "aliased"));
+        expansions.push(bang_expansion("foo", "not a", "exact"));
+        let inner = cache_inner_of(expansions);
+        let total = inner.expansions.len();
+
+        let dir = std::env::temp_dir().join(format!("macra-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("expansion-error.log");
+        ExpansionCache::write_error_log_to(&inner, &path, "foo", MacroKind::Functional, "a", "")
+            .unwrap();
+        let log = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(log.starts_with("name: foo\nkind: fn\ninput: a\narguments: \n"));
+        assert_eq!(log.matches("\n== ").count(), ERROR_LOG_MAX_ENTRIES);
+        assert!(log.contains(&format!(
+            "{} of {} cached expansions omitted (cap: {}).",
+            total - ERROR_LOG_MAX_ENTRIES,
+            total,
+            ERROR_LOG_MAX_ENTRIES
+        )));
+        let headers: Vec<&str> = log
+            .lines()
+            .filter(|l| l.starts_with("== "))
+            .take(5)
+            .collect();
+        assert_eq!(
+            headers,
+            [
+                "== foo! ==",
+                "== __foo_123! ==",
+                "== __hidden_9! ==",
+                "== #[derive(foo)] ==",
+                "== quote_token! ==",
+            ]
         );
     }
 }
