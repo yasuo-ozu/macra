@@ -257,8 +257,9 @@ struct CacheInner {
     /// `normalize_tokens` of each expansion's `input` and `arguments`, computed once
     /// when the entry is pushed; index-aligned with `expansions`.
     normalized: Vec<(String, String)>,
-    /// Alias name -> definition names, from every `use <def> as <Alias>;` seen in an
-    /// expansion's output.
+    /// Alias name -> the names it directly renames, from every `use <def> as
+    /// <Alias>;` seen in an expansion's output or in the crate's own source
+    /// (`source_aliases`).
     ///
     /// A derive that generates a `macro_rules!` typically mangles the name and
     /// re-exports it (`macro_rules! __line_ast_<hash> {..} pub use __line_ast_<hash>
@@ -267,6 +268,9 @@ struct CacheInner {
     /// `Line` and the lookup fails. One alias can point at several definitions (two
     /// crates each re-exporting their helper as `Debug`), hence the `Vec`; the
     /// resulting collision is for the ambiguity popup to resolve.
+    ///
+    /// Only one hop is stored per entry; `alias_definitions` follows chains, so a
+    /// hand-written `use Line as L;` on top of the generated re-export resolves too.
     aliases: std::collections::HashMap<String, Vec<String>>,
     done: bool,
     error: Option<String>,
@@ -285,6 +289,12 @@ impl CacheInner {
     ) {
         self.expansions.push(exp);
         self.normalized.push(normalized);
+        self.add_aliases(aliases);
+    }
+
+    /// Record `(alias, definition)` pairs, keeping the one-to-many shape and first-seen
+    /// order; a pair seen twice (two expansions of the same derive) is stored once.
+    fn add_aliases(&mut self, aliases: Vec<(String, String)>) {
         for (alias, def) in aliases {
             let defs = self.aliases.entry(alias).or_default();
             if !defs.contains(&def) {
@@ -293,11 +303,208 @@ impl CacheInner {
         }
     }
 
-    /// The definition names `name` (a source-side macro name) is an alias of, if any.
-    fn alias_definitions(&self, name: &str) -> &[String] {
-        let alias = name.rsplit("::").next().unwrap_or(name).trim();
-        self.aliases.get(alias).map_or(&[], Vec::as_slice)
+    /// Every name `name` (a source-side macro name) resolves to through the recorded
+    /// re-exports, transitively, in breadth-first order and without `name` itself.
+    ///
+    /// `use A as B; use B as C;` stores `B -> A` and `C -> B`, and a call to `C!` is
+    /// traced as `A!`, so a one-hop lookup found nothing for `C`. Following the chain
+    /// has to keep the one-to-many shape at every hop — a chain through a name with
+    /// two definitions reaches both, and dropping either would silently pick one
+    /// where the ambiguity popup should decide — and it has to survive `use A as B;
+    /// use B as A;`, which a naive walk would loop on. The visited set is what stops
+    /// that cycle; `MAX_ALIAS_HOPS` only bounds the work on a degenerate alias map.
+    fn alias_definitions(&self, name: &str) -> Vec<String> {
+        let start = name.rsplit("::").next().unwrap_or(name).trim();
+        let mut found: Vec<String> = Vec::new();
+        let mut frontier: Vec<&str> = vec![start];
+        for _ in 0..MAX_ALIAS_HOPS {
+            let mut next: Vec<&str> = Vec::new();
+            for alias in frontier {
+                let Some(defs) = self.aliases.get(alias) else {
+                    continue;
+                };
+                for def in defs {
+                    if def != start && !found.contains(def) {
+                        found.push(def.clone());
+                        next.push(def);
+                    }
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            frontier = next;
+        }
+        found
     }
+}
+
+/// How many `use X as Y;` hops `CacheInner::alias_definitions` follows.
+///
+/// Generated code contributes one hop (`pub use __mangled_<hash> as Name;`) and a
+/// hand-written re-export of that one more; every hop beyond is another `use` someone
+/// typed. Eight is far past any layering seen in practice, and since a visited set
+/// already stops cycles the cap only keeps a pathological alias map from being walked
+/// in full on every lookup.
+const MAX_ALIAS_HOPS: usize = 8;
+
+/// Most source files `source_aliases_in_tree` reads for one crate.
+///
+/// The walk follows `mod foo;` from the crate root and a visited set already stops a
+/// `#[path]` loop, so this only bounds the work on a `#[path]` that points into some
+/// huge vendored tree. A crate's own module tree is a few hundred files at most.
+const MAX_SOURCE_FILES: usize = 2000;
+
+/// Every `use <path> as <Alias>;` in real source text, as `(alias, definition)`, via
+/// `syn` — so `use a::b::{c as d, e as f};`, a `pub(crate) use`, and a `use` inside
+/// an inline module or a function body are all read exactly, with none of the
+/// quote-parity guesswork `alias_targets` needs on token-stream text.
+///
+/// Text that does not parse as a file (the user is mid-edit) falls back to that
+/// scraper: its plain `use x as y;` lines are still real re-exports, and an alias only
+/// ever adds a candidate that still has to agree on kind and input.
+fn source_aliases(source: &str) -> Vec<(String, String)> {
+    match syn::parse_file(source) {
+        Ok(file) => file_renames(&file),
+        Err(_) => alias_targets(source),
+    }
+}
+
+/// The `(alias, definition)` pairs of every `use` item in a parsed file, wherever it
+/// sits — see `source_aliases`.
+fn file_renames(file: &syn::File) -> Vec<(String, String)> {
+    struct Renames(Vec<(String, String)>);
+    impl Renames {
+        fn collect(&mut self, tree: &syn::UseTree) {
+            match tree {
+                syn::UseTree::Path(path) => self.collect(&path.tree),
+                syn::UseTree::Group(group) => group.items.iter().for_each(|t| self.collect(t)),
+                syn::UseTree::Rename(rename) => {
+                    let alias = rename.rename.to_string();
+                    let def = rename.ident.to_string();
+                    // `use x as _;` binds nothing a call could name; `use x::{self as
+                    // y}` renames a module, not a macro; an alias equal to its
+                    // definition carries no information.
+                    if alias != "_"
+                        && alias != def
+                        && !matches!(def.as_str(), "self" | "super" | "crate" | "Self")
+                    {
+                        self.0.push((alias, def));
+                    }
+                }
+                syn::UseTree::Name(_) | syn::UseTree::Glob(_) => {}
+            }
+        }
+    }
+    impl<'ast> syn::visit::Visit<'ast> for Renames {
+        fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+            self.collect(&item.tree);
+        }
+    }
+    let mut renames = Renames(Vec::new());
+    syn::visit::Visit::visit_file(&mut renames, file);
+    renames.0
+}
+
+/// The file a `mod <name>;` in `file` refers to, by the rules `rustc` applies to a
+/// declaration at the top of a file: next to a `mod.rs`/`lib.rs`/`main.rs`, else in
+/// the directory named after the file. Shared by the submodule navigation and by
+/// `source_aliases_in_tree`, so the alias walk reaches exactly the files the user can
+/// navigate into.
+fn submodule_file(file: &Path, mod_name: &str) -> Option<PathBuf> {
+    let file_name = file.file_stem()?.to_str()?;
+    let parent_dir = file.parent()?;
+    let base_dir = if file_name == "mod" || file_name == "lib" || file_name == "main" {
+        parent_dir.to_path_buf()
+    } else {
+        parent_dir.join(file_name)
+    };
+    // Try `base_dir/mod_name.rs` first, then `base_dir/mod_name/mod.rs`
+    let candidate1 = base_dir.join(format!("{}.rs", mod_name));
+    if candidate1.exists() {
+        return Some(candidate1);
+    }
+    let candidate2 = base_dir.join(mod_name).join("mod.rs");
+    if candidate2.exists() {
+        return Some(candidate2);
+    }
+    None
+}
+
+/// `source_aliases` of every file reachable from `starts` through top-level `mod
+/// foo;` declarations (honouring a `#[path = ".."]` on them), deduplicated by path.
+///
+/// The scope is one crate's own module tree, no more: a hand-written re-export of a
+/// macro (`pub(crate) use paste::paste as p;`) normally sits in `lib.rs` or a
+/// `macros` module while the calls are spread over sibling files, so scanning only
+/// the file on screen would honour the alias just when call and `use` happen to
+/// share a file — the less common arrangement. Dependencies are deliberately not
+/// read: their generated re-exports arrive through the trace already, and their
+/// hand-written ones would mean parsing the whole graph for a case nobody has hit.
+/// Unreadable or unparsable files are skipped; a `mod` inside an inline module is
+/// not followed (its directory rules differ), though `use` items inside one are read.
+fn source_aliases_in_tree(starts: impl IntoIterator<Item = PathBuf>) -> Vec<(String, String)> {
+    let mut queue: std::collections::VecDeque<PathBuf> = starts.into_iter().collect();
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    while let Some(file) = queue.pop_front() {
+        if seen.len() >= MAX_SOURCE_FILES {
+            break;
+        }
+        let key = std::fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
+        if !seen.insert(key) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        // Parse once for both the renames and the `mod` declarations. A file that
+        // does not parse still gives up its plain `use x as y;` lines, but its
+        // submodules cannot be located without the item list.
+        let parsed = match syn::parse_file(&text) {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                out.extend(alias_targets(&text));
+                continue;
+            }
+        };
+        out.extend(file_renames(&parsed));
+        for item in &parsed.items {
+            let syn::Item::Mod(module) = item else {
+                continue;
+            };
+            if module.content.is_some() {
+                continue;
+            }
+            let explicit = module.attrs.iter().find_map(|attr| {
+                if !attr.path().is_ident("path") {
+                    return None;
+                }
+                let syn::Meta::NameValue(nv) = &attr.meta else {
+                    return None;
+                };
+                let syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Str(lit),
+                    ..
+                }) = &nv.value
+                else {
+                    return None;
+                };
+                // A `#[path]` on a top-level `mod` is relative to the directory that
+                // holds the declaring file, whatever that file is called.
+                Some(file.parent()?.join(lit.value()))
+            });
+            let next = match explicit {
+                Some(path) => path,
+                None => match submodule_file(&file, &module.ident.to_string()) {
+                    Some(path) => path,
+                    None => continue,
+                },
+            };
+            queue.push_back(next);
+        }
+    }
+    out
 }
 
 /// Every `use <path> as <Alias>;` in an expansion's output, as `(alias, definition)`
@@ -439,6 +646,21 @@ impl ExpansionCache {
             Ok(Err(e)) => Some(format!("failed to wait for cargo check: {}", e)),
             Err(_) => None,
         }
+    }
+
+    /// Record re-exports found outside the trace (the crate's own source).
+    ///
+    /// Wakes a lookup that is waiting: `find_trace_for_tokens` rescans from the start
+    /// when the alias set for its name grows, so an alias learnt late still bridges
+    /// an entry that was already rejected.
+    fn add_aliases(&self, aliases: Vec<(String, String)>) {
+        if aliases.is_empty() {
+            return;
+        }
+        let (ref mutex, ref condvar) = *self.inner;
+        let mut inner = mutex.lock().unwrap();
+        inner.add_aliases(aliases);
+        condvar.notify_all();
     }
 
     /// Kill this run's `cargo check`.
@@ -679,7 +901,7 @@ impl ExpansionCache {
                             norm_input,
                             norm_arguments,
                             name,
-                            alias_defs,
+                            &alias_defs,
                             kind,
                             relaxed,
                             strict_input,
@@ -1022,6 +1244,10 @@ struct App {
     trace_macros: TraceMacros,
     /// Path of the currently loaded source file
     file_path: PathBuf,
+    /// The crate root (`lib.rs`, `main.rs`, a test file), where the alias walk of
+    /// `seed_source_aliases` starts. It is not derivable from `file_path`: with
+    /// `--module foo::bar` the first file shown is `src/foo/bar.rs`.
+    crate_root: PathBuf,
     /// Module path segments (e.g., ["crate", "foo", "bar"])
     module_path: Vec<String>,
     /// Stack of saved module states for returning to parent modules
@@ -1371,6 +1597,7 @@ impl App {
     fn new(
         source: String,
         file_path: PathBuf,
+        crate_root: PathBuf,
         module_path: Vec<String>,
         expansion_cache: ExpansionCache,
         trace_macros: TraceMacros,
@@ -1403,12 +1630,34 @@ impl App {
             needs_full_redraw: false,
             trace_macros,
             file_path,
+            crate_root,
             module_path,
             module_stack: Vec::new(),
             split_view: false,
         };
+        app.seed_source_aliases();
         app.sync_selection_to_cursor();
         app
+    }
+
+    /// Teach the expansion cache the re-exports written in the crate's own source.
+    ///
+    /// `alias_targets` only sees `use`s that some expansion *emitted*, so a re-export
+    /// the user typed — `pub use my_macro as Alias;`, `use other_crate::mac as
+    /// Alias;` — was never learnt, and `Alias!` could not be matched even though the
+    /// trace had the definition. The walk starts at the crate root and also at the
+    /// file on screen, so the current file is covered even when the root does not
+    /// reach it (an exotic `#[path]` layout).
+    fn seed_source_aliases(&self) {
+        let starts = std::iter::once(self.crate_root.clone())
+            .chain(
+                self.module_stack
+                    .iter()
+                    .map(|saved| saved.file_path.clone()),
+            )
+            .chain(std::iter::once(self.file_path.clone()));
+        self.expansion_cache
+            .add_aliases(source_aliases_in_tree(starts));
     }
 
     fn selected_node(&self) -> Option<&MacroNode> {
@@ -2913,6 +3162,9 @@ impl App {
         match self.trace_macros.run() {
             Ok(run) => {
                 self.expansion_cache = ExpansionCache::new(run.iter, run.check_result, run.child);
+                // The new cache starts empty; the source-side aliases live in the
+                // files, not in the trace, so they have to be read again.
+                self.seed_source_aliases();
 
                 // Rebuild every per-file state from the fresh source. Expanded nodes
                 // are dropped on purpose: their content, undo snapshots and line ranges
@@ -3007,26 +3259,7 @@ impl App {
     /// - If current file is `mod.rs`, `lib.rs`, or `main.rs`: look in the same directory
     /// - Otherwise: look in a subdirectory named after the current file (without extension)
     fn resolve_submodule_path(&self, mod_name: &str) -> Option<PathBuf> {
-        let file_name = self.file_path.file_stem()?.to_str()?;
-        let parent_dir = self.file_path.parent()?;
-
-        // Determine the base directory for submodule search
-        let base_dir = if file_name == "mod" || file_name == "lib" || file_name == "main" {
-            parent_dir.to_path_buf()
-        } else {
-            parent_dir.join(file_name)
-        };
-
-        // Try `base_dir/mod_name.rs` first, then `base_dir/mod_name/mod.rs`
-        let candidate1 = base_dir.join(format!("{}.rs", mod_name));
-        if candidate1.exists() {
-            return Some(candidate1);
-        }
-        let candidate2 = base_dir.join(mod_name).join("mod.rs");
-        if candidate2.exists() {
-            return Some(candidate2);
-        }
-        None
+        submodule_file(&self.file_path, mod_name)
     }
 
     /// Enter a submodule: save current state and load the submodule file.
@@ -3051,6 +3284,10 @@ impl App {
                 return;
             }
         };
+        // Normally already known from the crate walk; this keeps "the file on screen
+        // has been scanned" true even when the walk could not reach it. Duplicates
+        // are dropped by the cache.
+        self.expansion_cache.add_aliases(source_aliases(&source));
 
         // Save current state
         let saved = ModuleState {
@@ -3253,6 +3490,7 @@ fn build_trace_macros(args: &Args) -> TraceMacros {
 fn run_app(
     source: String,
     file_path: PathBuf,
+    crate_root: PathBuf,
     module_path: Vec<String>,
     expansion_cache: ExpansionCache,
     trace_macros: TraceMacros,
@@ -3274,6 +3512,7 @@ fn run_app(
     let mut app = App::new(
         source,
         file_path,
+        crate_root,
         module_path,
         expansion_cache,
         trace_macros,
@@ -4207,7 +4446,7 @@ fn run_main() -> io::Result<()> {
             }
         }
     } else {
-        (top_level_path, vec!["crate".to_string()])
+        (top_level_path.clone(), vec!["crate".to_string()])
     };
 
     eprintln!("Loading source from {}", src_path.display());
@@ -4231,7 +4470,7 @@ fn run_main() -> io::Result<()> {
     }
 
     let cache = ExpansionCache::new(run.iter, run.check_result, run.child);
-    run_app(source, src_path, module_path, cache, tm)
+    run_app(source, src_path, top_level_path, module_path, cache, tm)
 }
 
 /// Print all macro expansions to stdout in a human-readable format.
@@ -5343,6 +5582,7 @@ struct B;
         App::new(
             source.to_string(),
             PathBuf::from("/dev/null"),
+            PathBuf::from("/dev/null"),
             vec!["crate".into()],
             cache,
             tm,
@@ -5723,6 +5963,278 @@ struct B;
             ]
         );
         assert!(inner.alias_definitions("Clone").is_empty());
+    }
+
+    /// A fresh directory for one test, named after the test so parallel tests never
+    /// share one.
+    fn scratch_dir(test: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("macra-test-{}-{}", std::process::id(), test));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// An `App` over the file at `file_path` in a crate rooted at `crate_root`, with
+    /// `expansions` already cached and the stream finished.
+    fn app_over(file_path: &Path, crate_root: &Path, expansions: Vec<MacroExpansion>) -> App {
+        let source = std::fs::read_to_string(file_path).unwrap();
+        let child = std::process::Command::new("true").spawn().unwrap();
+        let mut inner = cache_inner_of(expansions);
+        inner.done = true;
+        let cache = ExpansionCache {
+            inner: Arc::new((Mutex::new(inner), Condvar::new())),
+            child: Arc::new(Mutex::new(child)),
+        };
+        let tm = TraceMacros::new(
+            Path::new("cargo"),
+            &cargo_macra::trace_macros::Args::default(),
+        );
+        App::new(
+            source,
+            file_path.to_path_buf(),
+            crate_root.to_path_buf(),
+            vec!["crate".into()],
+            cache,
+            tm,
+        )
+    }
+
+    fn search_named(inner: &CacheInner, name: &str) -> Vec<usize> {
+        let norm_input = cargo_macra::normalize_tokens("a");
+        let norm_arguments = cargo_macra::normalize_tokens("");
+        ExpansionCache::search_expansions(
+            inner,
+            "a",
+            &norm_input,
+            &norm_arguments,
+            name,
+            MacroKind::Functional,
+            0,
+        )
+    }
+
+    /// `pub use m as A;` typed by the user, not emitted by any expansion: nothing in
+    /// the trace mentions `A`, so only reading the source can bridge `A!` to the
+    /// traced `m!`. Before the source scan existed the search below found nothing.
+    #[test]
+    fn hand_written_re_export_in_the_loaded_source_is_honoured() {
+        let dir = scratch_dir("hand-written");
+        let lib = dir.join("lib.rs");
+        std::fs::write(
+            &lib,
+            "macro_rules! m { ($x:tt) => {} }\npub use m as A;\nfn f() {\n    A!(a);\n}\n",
+        )
+        .unwrap();
+        let app = app_over(&lib, &lib, vec![bang_expansion("m", "a", "expanded")]);
+        let (ref mutex, _) = *app.expansion_cache.inner;
+        let inner = mutex.lock().unwrap();
+        assert_eq!(inner.alias_definitions("A"), ["m".to_string()]);
+        assert_eq!(search_named(&inner, "A"), vec![0]);
+        assert_eq!(search_named(&inner, "crate::A"), vec![0]);
+        // The alias adds a candidate; it never loosens the input or kind check.
+        let derive_query = ExpansionCache::search_expansions(
+            &inner,
+            "a",
+            &cargo_macra::normalize_tokens("a"),
+            &cargo_macra::normalize_tokens(""),
+            "A",
+            MacroKind::Derive,
+            0,
+        );
+        assert!(derive_query.is_empty());
+        drop(inner);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every shape `syn` reads that the token scraper cannot: a braced multi-rename,
+    /// nesting, a restricted visibility, and `use`s inside an inline module and a
+    /// function body. `alias_targets` returns nothing for the braced form (see
+    /// `alias_targets_ignores_things_that_only_look_like_re_exports`), which is what
+    /// this test failed on before `source_aliases` existed.
+    #[test]
+    fn braced_multi_rename_is_read_from_source() {
+        let src = "use x::{a as b, c as d, e, f::{g as h}, self as _, i::{self as j}};\n\
+                   pub(crate) use crate::m::n as o;\n\
+                   mod q { pub use r as s; }\n\
+                   fn f() { use t as u; }\n\
+                   use v::*;\n\
+                   use w as w;\n\
+                   use y as _;\n";
+        let found: Vec<(String, String)> = source_aliases(src);
+        let found: Vec<(&str, &str)> = found
+            .iter()
+            .map(|(a, d)| (a.as_str(), d.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("b", "a"),
+                ("d", "c"),
+                ("h", "g"),
+                ("o", "n"),
+                ("s", "r"),
+                ("u", "t")
+            ]
+        );
+        // Text that is not a whole file still yields its plain re-exports.
+        assert_eq!(
+            source_aliases("pub use __hidden_9 as foo; let x = ;"),
+            vec![("foo".to_string(), "__hidden_9".to_string())]
+        );
+    }
+
+    /// The walk from the crate root follows `mod foo;` by the same rules the submodule
+    /// navigation uses, honours `#[path]`, survives a `#[path]` that points back at an
+    /// ancestor, and covers the file on screen even when it is not the root.
+    #[test]
+    fn source_aliases_are_collected_across_the_crate_module_tree() {
+        let dir = scratch_dir("tree");
+        std::fs::create_dir_all(dir.join("deep")).unwrap();
+        std::fs::write(
+            dir.join("lib.rs"),
+            "pub use root_m as Root;\nmod deep;\n#[path = \"odd_name.rs\"]\nmod renamed;\nmod missing;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("deep.rs"),
+            "pub use deep_m as Deep;\nmod inner;\nmod block { mod not_followed; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("deep").join("inner.rs"),
+            "pub use inner_m as Inner;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("odd_name.rs"),
+            "pub use odd_m as Odd;\n#[path = \"lib.rs\"]\nmod back_to_root;\n",
+        )
+        .unwrap();
+        let found = source_aliases_in_tree(vec![dir.join("lib.rs")]);
+        assert_eq!(
+            found,
+            [
+                ("Root".to_string(), "root_m".to_string()),
+                ("Deep".to_string(), "deep_m".to_string()),
+                ("Odd".to_string(), "odd_m".to_string()),
+                ("Inner".to_string(), "inner_m".to_string()),
+            ]
+        );
+
+        // Opened at `deep/inner.rs` (as `--module deep::inner` would), the root's
+        // alias is still learnt.
+        let app = app_over(
+            &dir.join("deep").join("inner.rs"),
+            &dir.join("lib.rs"),
+            vec![bang_expansion("root_m", "a", "expanded")],
+        );
+        let (ref mutex, _) = *app.expansion_cache.inner;
+        let inner = mutex.lock().unwrap();
+        assert_eq!(search_named(&inner, "Root"), vec![0]);
+        assert_eq!(inner.alias_definitions("Inner"), ["inner_m".to_string()]);
+        drop(inner);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `use __a_1 as B; use B as C;` and a call to `C!`, traced as `__a_1!`. One hop
+    /// resolved `C` to `B` only, and no entry is named `B`, so before chains were
+    /// followed the search found nothing.
+    #[test]
+    fn alias_chain_resolves_end_to_end() {
+        let inner = cache_inner_of(vec![
+            bang_expansion("gen", "", "pub use __a_1 as B;"),
+            bang_expansion("gen", "", "pub use B as C;"),
+            bang_expansion("__a_1", "a", "expanded"),
+        ]);
+        assert_eq!(
+            inner.alias_definitions("C"),
+            ["B".to_string(), "__a_1".to_string()]
+        );
+        assert_eq!(search_named(&inner, "C"), vec![2]);
+        assert_eq!(search_named(&inner, "B"), vec![2]);
+    }
+
+    /// `use A as B; use B as A;` is a cycle a naive walk loops on. It has to stop,
+    /// and it must still reach the definition behind it: `D`, aliased as `A`. Before
+    /// chains were followed `B` resolved to `A` alone and `D` was missed.
+    #[test]
+    fn alias_cycle_terminates_and_still_reaches_the_definition_behind_it() {
+        let inner = cache_inner_of(vec![bang_expansion(
+            "gen",
+            "",
+            "pub use D as A; pub use A as B; pub use B as A;",
+        )]);
+        assert_eq!(
+            inner.alias_definitions("B"),
+            ["A".to_string(), "D".to_string()]
+        );
+        assert_eq!(
+            inner.alias_definitions("A"),
+            ["D".to_string(), "B".to_string()]
+        );
+        // A longer ring, and a self-referential entry, also terminate. `x` is
+        // directly `z` (`use z as x`) and through it `y`; `x` itself is left out.
+        let ring = cache_inner_of(vec![bang_expansion(
+            "gen",
+            "",
+            "use x as y; use y as z; use z as x; use x as x;",
+        )]);
+        assert_eq!(
+            ring.alias_definitions("x"),
+            ["z".to_string(), "y".to_string()]
+        );
+    }
+
+    /// A chain through a name with several definitions keeps every branch: `Dbg` ->
+    /// `Debug` -> {two helpers}. Collapsing to one would silently expand the wrong
+    /// helper where the popup should ask. Before chains were followed `Dbg` resolved
+    /// to `Debug` alone.
+    #[test]
+    fn chain_through_a_one_to_many_name_yields_every_definition() {
+        let inner = cache_inner_of(vec![
+            bang_expansion("sumtype", "", "pub use __sumtype_macro_1 as Debug;"),
+            bang_expansion("newer_type", "", "pub use __newer_type_macro_2 as Debug;"),
+            bang_expansion("user", "", "pub use Debug as Dbg;"),
+            bang_expansion("__sumtype_macro_1", "a", "from sumtype"),
+            bang_expansion("__newer_type_macro_2", "a", "from newer_type"),
+        ]);
+        assert_eq!(
+            inner.alias_definitions("Dbg"),
+            [
+                "Debug".to_string(),
+                "__sumtype_macro_1".to_string(),
+                "__newer_type_macro_2".to_string(),
+            ]
+        );
+        // Both invocations are hits, so the lookup ends in the ambiguity popup rather
+        // than in one of them.
+        assert_eq!(search_named(&inner, "Dbg"), vec![3, 4]);
+    }
+
+    /// The hop cap is a work bound, not a correctness rule: a chain longer than
+    /// `MAX_ALIAS_HOPS` is cut, a chain exactly that long is not.
+    #[test]
+    fn alias_chain_depth_is_bounded() {
+        let mut uses = String::new();
+        for i in 0..MAX_ALIAS_HOPS + 1 {
+            uses.push_str(&format!("use n{} as n{}; ", i, i + 1));
+        }
+        let inner = cache_inner_of(vec![bang_expansion("gen", "", &uses)]);
+        let top = format!("n{}", MAX_ALIAS_HOPS + 1);
+        let defs = inner.alias_definitions(&top);
+        assert_eq!(defs.len(), MAX_ALIAS_HOPS);
+        assert_eq!(
+            defs.first().map(String::as_str),
+            Some(format!("n{}", MAX_ALIAS_HOPS).as_str())
+        );
+        assert_eq!(defs.last().map(String::as_str), Some("n1"));
+        assert!(!defs.iter().any(|d| d == "n0"));
+        assert!(
+            inner
+                .alias_definitions(&format!("n{}", MAX_ALIAS_HOPS))
+                .iter()
+                .any(|d| d == "n0")
+        );
     }
 
     #[test]
