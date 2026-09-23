@@ -76,37 +76,7 @@ fn min_rustc_for_crate(repo: &str) -> u32 {
     }
 }
 
-/// Report once whether this toolchain can capture proc-macros at all.
-///
-/// Every external crate here exercises proc-macros, so on a rustc macra has no
-/// bridge ABI for there is nothing to assert; the callers treat an empty result
-/// as a skip.
-fn proc_macro_capture_supported() -> bool {
-    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *SUPPORTED.get_or_init(|| {
-        let supported = cargo_macra::proc_macro_capture_supported()
-            .expect("could not probe `rustc -vV`; refusing to skip the suite silently");
-        // See `show_expansion.rs`: on a supported toolchain a skip must fail loudly,
-        // because every one of these tests asserts output only the hook produces and
-        // would otherwise pass vacuously.
-        assert!(
-            supported || std::env::var_os("MACRA_REQUIRE_CAPTURE").is_none(),
-            "MACRA_REQUIRE_CAPTURE is set, but this rustc has no mapped bridge ABI",
-        );
-        if !supported {
-            eprintln!(
-                "skipping external_crate proc-macro tests: rustc 1.{} has no mapped bridge ABI",
-                rustc_minor_version()
-            );
-        }
-        supported
-    })
-}
-
 fn run_trace_for_repo(repo: &str, test: Option<&str>) -> Vec<MacroExpansion> {
-    if !proc_macro_capture_supported() {
-        return Vec::new();
-    }
     // Serialize tests per repo so parallel `cargo check` processes don't race
     // over the same target directory (prevents flaky hook-output loss on Windows).
     let _lock = repo_lock(repo).lock().unwrap_or_else(|e| e.into_inner());

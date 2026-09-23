@@ -518,27 +518,6 @@ pub fn hook_build_id() -> u64 {
     })
 }
 
-/// Whether the rustc that will run the build is one macra has a bridge ABI for, or
-/// `None` when the compiler could not be probed at all.
-///
-/// Proc-macro capture goes through the injected hook, and the hook only arms itself
-/// when [`bridge_abi_for`] recognises the compiler. On every other toolchain macra
-/// still reports `macro_rules!` expansions, but no proc-macro ones, so callers that
-/// assert on proc-macro output (the test suite) use this to skip rather than fail.
-///
-/// The `None` case is kept distinct from `Some(false)` on purpose: a missing or broken
-/// `rustc` means "unknown", not "unsupported", and collapsing the two lets an
-/// environment fault turn the test suite green by skipping everything.
-pub fn proc_macro_capture_supported() -> Option<bool> {
-    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
-    let out = std::process::Command::new(rustc).arg("-vV").output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let version = parse_rustc_version(&String::from_utf8_lossy(&out.stdout))?;
-    Some(bridge_abi_for(version).is_some())
-}
-
 #[cfg(test)]
 mod cache_tests {
     use super::*;

@@ -76,25 +76,6 @@ fn assert_exact(
     );
 }
 
-/// Whether this rustc has a bridge ABI macra can hook.
-///
-/// Without one the compiler still emits `macro_rules!` traces, but no proc-macro
-/// expansion is captured, so tests assert only what the toolchain can deliver.
-fn proc_macros_captured() -> bool {
-    let supported = cargo_macra::proc_macro_capture_supported()
-        .expect("could not probe `rustc -vV`; refusing to skip the assertions silently");
-    // On a toolchain we claim to support, a skip is a failure, not a pass. Silence is
-    // exactly what an unmapped compiler looks like from the outside — no derives, no
-    // attributes, no message — so without this every proc-macro test goes green the
-    // moment capture stops working. CI sets it for the release channels.
-    assert!(
-        supported || std::env::var_os("MACRA_REQUIRE_CAPTURE").is_none(),
-        "MACRA_REQUIRE_CAPTURE is set, but this rustc has no mapped bridge ABI, \
-         so no proc macro would be captured",
-    );
-    supported
-}
-
 /// Run trace-macros directly on the test-usage crate and return raw expansions.
 fn run_show_expansion_test_usage() -> Vec<MacroExpansion> {
     filetime::set_file_mtime(test_usage_lib(), filetime::FileTime::now())
@@ -135,18 +116,7 @@ fn run_show_expansion_test_usage() -> Vec<MacroExpansion> {
 fn show_expansion() {
     let expansions = run_show_expansion_test_usage();
     assert!(!expansions.is_empty(), "Expected macro expansions.",);
-    if !proc_macros_captured() {
-        // The `macro_rules!` half still runs through `-Z trace-macros`, so check it
-        // and stop before the hook-only assertions below.
-        assert!(
-            expansions
-                .iter()
-                .any(|e| expansion_caller(e) == "repeat_twice!"),
-            "Missing macro_rules! expansion (repeat_twice!).",
-        );
-        eprintln!("skipping proc-macro assertions: this rustc has no mapped bridge ABI");
-        return;
-    }
+
     // ---------------------------------------------------------------
     // All macro types are trapped
     // ---------------------------------------------------------------
@@ -555,12 +525,6 @@ fn show_expansion() {
 #[test]
 fn test_usage_expansion() {
     let expansions = run_show_expansion_test_usage();
-    if !proc_macros_captured() {
-        // Assert what this toolchain *can* deliver before stopping.
-        assert_trace_macro_blocks(&expansions);
-        eprintln!("skipping proc-macro assertions: this rustc has no mapped bridge ABI");
-        return;
-    }
 
     // =================================================================
     // Hook-based proc-macro expansions (14 blocks)
@@ -745,11 +709,12 @@ __TAG_ARGS_FOR_MultiAttrStruct : & str = "role = \"primary\"";"#,
     assert_trace_macro_blocks(&expansions);
 }
 
-/// Blocks 15-18: `macro_rules!` expansions, which `-Z trace-macros` reports whether or
-/// not the hook is armed.
+/// Blocks 15-18: `macro_rules!` expansions, which come from `-Z trace-macros` rather
+/// than the hook.
 ///
-/// Split out of `test_usage_expansion` so the no-hook path still asserts them instead
-/// of returning early past the only coverage a toolchain without a mapped ABI can give.
+/// Kept separate because they are the half that does not depend on the bridge at all:
+/// when a proc-macro assertion above fails, whether these still pass says immediately
+/// whether the hook broke or the whole trace did.
 fn assert_trace_macro_blocks(expansions: &[MacroExpansion]) {
     // 15. repeat_twice!(get_answer())
     assert_exact(
