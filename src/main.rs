@@ -6199,6 +6199,69 @@ pub struct Page;
         assert!(!marker.contains("baz!(3)"), "{:?}", marker);
     }
 
+    /// What rustc traces for `assert_eq!(a(), vec![1, 2])`: a block, not items.
+    const ASSERT_EQ_OUTPUT: &str = "{ match (&a(), &vec![1, 2]) { (left_val, right_val) => { \
+        if !(*left_val == *right_val) { let kind = $crate::panicking::AssertKind::Eq; \
+        $crate::panicking::assert_failed(kind, &*left_val, &*right_val, \
+        $crate::option::Option::None); } } } }";
+
+    /// A `vec!` nested in `assert_eq!`'s arguments has no node of its own (syn does not
+    /// look inside a macro's tokens), so the only way to reach it is as a child of the
+    /// `assert_eq!` expansion. That expansion is a block, which `syn::parse_file`
+    /// rejects — and `find_macros` used to return nothing for anything it rejected, so
+    /// the `vec!` could never be expanded from the TUI.
+    #[test]
+    fn a_macro_inside_a_block_shaped_expansion_is_a_child() {
+        let mut app = test_app("fn t() {\n    assert_eq!(a(), vec![1, 2]);\n}\n");
+        app.expand_node(0, Some(ASSERT_EQ_OUTPUT.into()));
+
+        let vec_id = node_named(&app, "vec");
+        let (line, col_start, col_end, parent) = {
+            let n = app.get_node(vec_id).unwrap();
+            (n.call.line, n.call.col_start, n.call.col_end, n.parent_id)
+        };
+        assert_eq!(parent, Some(0));
+        assert!(app.visible_nodes.contains(&vec_id));
+        // The columns have to pick out exactly the call in the buffer, or the
+        // highlight sits on the wrong text and expanding it slices the wrong span.
+        let text = &app.source_lines[line - 1];
+        assert_eq!(
+            split_at_cols(text, col_start, col_end).1,
+            "vec![1, 2]",
+            "in {:?}",
+            text
+        );
+
+        // And expanding it in place replaces just that call.
+        app.expand_node(vec_id, Some("<[_]>::into_vec(Box::new([1, 2]))".into()));
+        let marker = &app.source_lines[line - 1];
+        assert!(marker.ends_with("// -- expanded: vec --"), "{:?}", marker);
+        assert!(!marker.contains("vec!"), "{:?}", marker);
+        assert!(marker.contains("match (&a(), &"), "{:?}", marker);
+    }
+
+    /// The `$crate` placeholder is applied before the fallback parse too: a child after
+    /// a `$crate` on a line inside a block-shaped expansion still maps back onto the
+    /// real text.
+    #[test]
+    fn block_shaped_expansion_children_are_mapped_back_from_the_placeholder() {
+        let mut app = test_app("fn t() {\n    foo!(1);\n}\n");
+        app.expand_node(0, Some("{ let x = $crate::a::b(1) + baz!(3); x }".into()));
+        let baz = node_named(&app, "baz");
+        let (line, col_start, col_end) = {
+            let n = app.get_node(baz).unwrap();
+            (n.call.line, n.call.col_start, n.call.col_end)
+        };
+        let text = &app.source_lines[line - 1];
+        assert!(text.contains("$crate::a::b(1)"), "{:?}", text);
+        assert_eq!(
+            split_at_cols(text, col_start, col_end).1,
+            "baz!(3)",
+            "in {:?}",
+            text
+        );
+    }
+
     /// A consumed *child* must leave `visible_nodes` like a consumed root does, or Tab
     /// and `n` still reach it with coordinates that point into another node's output.
     #[test]

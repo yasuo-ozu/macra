@@ -388,15 +388,52 @@ fn is_builtin_functional(name: &str) -> bool {
     )
 }
 
+/// Parse `source` in whichever shape it has and walk it with `visitor`. False when no
+/// shape fits.
+///
+/// Expansion output is not always a sequence of items: `assert_eq!` yields a block, a
+/// `macro_rules!` arm can yield bare statements or a lone expression. `syn::parse_file`
+/// rejects all of those, and giving up there left the `vec!` inside
+/// `assert_eq!(a, vec![1, 2])` without a node — syn does not look inside a macro's
+/// tokens, so the expansion is the only place that call can be discovered.
+///
+/// Items are tried first: every real source file and every item-producing macro is
+/// items, and only `parse_file` accepts a shebang and inner `#![..]` attributes. Then
+/// statements (`Block::parse_within`), which take a braced block, `let`s, nested items
+/// and a trailing expression in one go. Then a lone expression: the statement parser
+/// ends a block-like expression at its closing brace, so `match x {} + rest!()` is
+/// two statements to it, and `+ rest!()` is not one — the expression parser takes
+/// the whole thing.
+///
+/// No shape wraps the text, so every span indexes `source` exactly as given; the
+/// columns reported here are what the TUI slices the buffer with, and a wrapper
+/// would have skewed them by its own length.
+fn visit_source(source: &str, visitor: &mut MacroVisitor) -> bool {
+    use syn::parse::Parser;
+
+    if let Ok(file) = syn::parse_file(source) {
+        visitor.visit_file(&file);
+        return true;
+    }
+    if let Ok(stmts) = syn::Block::parse_within.parse_str(source) {
+        for stmt in &stmts {
+            visitor.visit_stmt(stmt);
+        }
+        return true;
+    }
+    if let Ok(expr) = syn::parse_str::<Expr>(source) {
+        visitor.visit_expr(&expr);
+        return true;
+    }
+    false
+}
+
 /// Find all macro calls in the given Rust source code.
 pub fn find_macros(source: &str) -> Vec<MacroCall> {
-    let file = match syn::parse_file(source) {
-        Ok(f) => f,
-        Err(_) => return Vec::new(),
-    };
-
     let mut visitor = MacroVisitor::new();
-    visitor.visit_file(&file);
+    if !visit_source(source, &mut visitor) {
+        return Vec::new();
+    }
 
     // Sort by line number
     visitor.macros.sort_by_key(|m| m.line);
@@ -781,5 +818,91 @@ struct Baz;
             "Clone input should not contain its own derive: {}",
             clone.input
         );
+    }
+
+    /// The columns `find_macros` reports for `name`, checked against the text they
+    /// are meant to slice: the caller says what the slice must be.
+    fn slice_of<'a>(source: &'a str, macros: &[MacroCall], name: &str) -> (usize, &'a str) {
+        let m = macros
+            .iter()
+            .find(|m| m.name == name)
+            .unwrap_or_else(|| panic!("no {name} in {macros:?}"));
+        assert_eq!(
+            m.line, m.line_end,
+            "{name} is single-line in these fixtures"
+        );
+        let line = source.lines().nth(m.line - 1).unwrap();
+        (m.line, &line[m.col_start..m.col_end])
+    }
+
+    /// `assert_eq!`'s output: a block. `parse_file` rejects it, and the `vec!` inside it
+    /// used to be lost with it.
+    #[test]
+    fn a_block_yields_the_macros_inside_it() {
+        let source = "{\n    match (&a(), &vec![1, 2]) {\n        (l, r) => {\n            \
+                      __macra_dollar_crate__::panicking::assert_failed(l, r, fmt!(\"x\"));\n        \
+                      }\n    }\n}";
+        assert!(
+            syn::parse_file(source).is_err(),
+            "the fixture must not be items"
+        );
+        let macros = find_macros(source);
+        assert_eq!(slice_of(source, &macros, "vec"), (2, "vec![1, 2]"));
+        assert_eq!(slice_of(source, &macros, "fmt"), (4, "fmt!(\"x\")"));
+    }
+
+    /// A `macro_rules!` arm that produces statements: `let`s, a nested item and a
+    /// trailing expression, none of which `parse_file` accepts.
+    #[test]
+    fn bare_statements_yield_their_macros() {
+        let source = "let x = foo!(1);\nstruct S;\nbar!(2);\nx + baz!(3)";
+        assert!(
+            syn::parse_file(source).is_err(),
+            "the fixture must not be items"
+        );
+        let macros = find_macros(source);
+        assert_eq!(slice_of(source, &macros, "foo"), (1, "foo!(1)"));
+        assert_eq!(slice_of(source, &macros, "bar"), (3, "bar!(2)"));
+        assert_eq!(slice_of(source, &macros, "baz"), (4, "baz!(3)"));
+    }
+
+    /// A lone expression that is not a statement sequence either: statement parsing
+    /// stops the `match` at its brace and cannot make a statement of `+ rest!()`.
+    #[test]
+    fn an_expression_yields_its_macros() {
+        use syn::parse::Parser;
+        let source = "match x {\n    _ => 1,\n} + rest!(2)";
+        assert!(
+            syn::parse_file(source).is_err(),
+            "the fixture must not be items"
+        );
+        assert!(
+            syn::Block::parse_within.parse_str(source).is_err(),
+            "the fixture must not be statements, or the expression fallback is untested"
+        );
+        let macros = find_macros(source);
+        assert_eq!(slice_of(source, &macros, "rest"), (3, "rest!(2)"));
+    }
+
+    /// Only `parse_file` takes inner attributes; the fallbacks must not pre-empt it.
+    #[test]
+    fn items_with_inner_attributes_still_parse_as_a_file() {
+        let source = "#![allow(unused)]\nfoo!(1);\n#[my_attr]\nfn f() {}";
+        let macros = find_macros(source);
+        assert_eq!(slice_of(source, &macros, "foo"), (2, "foo!(1)"));
+        assert!(macros.iter().any(|m| m.name == "my_attr"), "{macros:?}");
+    }
+
+    /// Nothing parses as anything: no shape fits, and nothing panics.
+    #[test]
+    fn unparseable_text_yields_nothing() {
+        for source in [
+            "fn { ) ] garbage !!",
+            "foo!(1) bar!(2)",
+            "let = ;",
+            "struct S { a: u32",
+        ] {
+            assert!(find_macros(source).is_empty(), "{source:?}");
+        }
     }
 }
