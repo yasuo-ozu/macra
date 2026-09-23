@@ -8,9 +8,7 @@ keywords = ["cargo", "macros", "tooling", "cli", "diagnostics"]
 categories = ["command-line-utilities", "development-tools"]
 license = "MIT"
 repository = "https://github.com/yasuo-ozu/macra"
-homepage = "https://github.com/yasuo-ozu/macra"
 documentation = "https://docs.rs/cargo-macra"
-readme = "README.md"
 authors = ["Yasuo Ozu <yasuo@ozu.email>"]
 
 [features]
