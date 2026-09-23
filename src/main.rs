@@ -1041,9 +1041,10 @@ struct SplitRegion<'a> {
     len: usize,
     /// The source lines that were replaced.
     original: &'a [String],
-    /// The expansion's own lines as `(source index, text)`. The `// -- expanded: X --`
-    /// / `// -- end X --` markers are dropped: the block header already names the
-    /// macro. Keeping the source index means the cursor still lines up after the drop.
+    /// The expansion's own lines as `(source index, text)`. The region's own
+    /// `// -- expanded: X --` / `// -- end X --` markers are dropped: the block frame
+    /// stands for them (see `block_row_of`), and the header already names the macro.
+    /// Keeping the source index means the cursor still lines up after the drop.
     right: Vec<(usize, &'a str)>,
     /// Name of the macro that produced the expansion.
     name: &'a str,
@@ -1053,6 +1054,41 @@ impl SplitRegion<'_> {
     /// Body rows in the block: the taller of the two columns.
     fn rows(&self) -> usize {
         self.right.len().max(self.original.len())
+    }
+
+    /// The block row that stands for source line `idx` of this region: the body row of
+    /// its right-column line when it is shown, else the header for the region's first
+    /// line (its start marker) and the footer for anything else (its end marker).
+    /// Enter leaves the cursor on the start marker, and Tab parks it there, so those
+    /// lines need a row of their own or the cursor is nowhere on screen.
+    fn block_row_of(&self, idx: usize) -> usize {
+        match self.right.iter().position(|&(i, _)| i == idx) {
+            Some(k) => k + 1,
+            None if idx == self.start => 0,
+            None => self.rows() + 1,
+        }
+    }
+}
+
+/// Display row of source line `idx` once the split blocks are laid out: outside every
+/// block, the line plus the rows the blocks before it added; inside one, the block row
+/// standing for it. The old rule added only the blocks *before* the line, so a marker
+/// line inside a block landed where its inline text would have been — up to
+/// `rows + 2 - len` rows above the frame row that shows it, which for an attribute
+/// stripping a long item left `ensure_cursor_visible` sure the footer was on screen
+/// while it was well below the viewport.
+fn display_row_of(regions: &[SplitRegion], idx: usize) -> usize {
+    let extra: usize = regions
+        .iter()
+        .filter(|r| r.start + r.len <= idx)
+        .map(|r| (r.rows() + 2).saturating_sub(r.len))
+        .sum();
+    match regions
+        .iter()
+        .find(|r| r.start <= idx && idx < r.start + r.len)
+    {
+        Some(r) => r.start + extra + r.block_row_of(idx),
+        None => idx + extra,
     }
 }
 
@@ -1493,45 +1529,40 @@ impl App {
             return;
         }
         let total = self.source_lines.len();
-        // Only each region's geometry matters here. Collecting it into plain tuples
-        // ends the borrow of `self` that the regions hold, so `scroll_offset` can be
-        // assigned below.
-        let regions: Vec<(usize, usize, usize)> = self
-            .split_regions()
-            .iter()
-            .map(|r| (r.start, r.len, r.rows()))
-            .collect();
-        let display_row_of = |source_idx: usize| -> usize {
-            source_idx
-                + regions
-                    .iter()
-                    .filter(|&&(start, len, _)| start + len <= source_idx)
-                    .map(|&(_, len, rows)| (rows + 2).saturating_sub(len))
-                    .sum::<usize>()
+        // The regions borrow `self`, so the new offset is worked out in a local and
+        // stored once they are no longer needed.
+        let regions = self.split_regions();
+        let display_row_of = |idx: usize| display_row_of(&regions, idx);
+        // The source line whose display row is the lowest one at or below `want`.
+        // Not the first such line: inside a block the mapping is not monotonic — the
+        // own end marker maps to the footer, below the lifted tail that follows it in
+        // source order — and taking the first match could scroll past the tail row.
+        let first_row_at_or_after = |want: usize| -> usize {
+            (0..total)
+                .filter(|&i| display_row_of(i) >= want)
+                .min_by_key(|&i| display_row_of(i))
+                .unwrap_or(0)
         };
 
         let cursor_idx = self.cursor_line.saturating_sub(1);
         let cur_disp = display_row_of(cursor_idx);
-        let top_disp = display_row_of(self.scroll_offset);
+        let mut scroll = self.scroll_offset;
+        let top_disp = display_row_of(scroll);
 
         if cur_disp < top_disp {
-            self.scroll_offset = cursor_idx;
+            scroll = cursor_idx;
         } else if cur_disp >= top_disp + view_h {
             // Scroll down just enough to bring the cursor row into view.
-            let want = cur_disp + 1 - view_h;
-            let idx = (0..total).find(|&i| display_row_of(i) >= want).unwrap_or(0);
-            self.scroll_offset = idx;
+            scroll = first_row_at_or_after(cur_disp + 1 - view_h);
         }
 
         // Clamp scroll so the viewport doesn't extend past the last row.
         let total_disp = display_row_of(total);
-        let max_disp = total_disp.saturating_sub(view_h);
-        let max_scroll = (0..total)
-            .find(|&i| display_row_of(i) >= max_disp)
-            .unwrap_or(0);
-        if self.scroll_offset > max_scroll {
-            self.scroll_offset = max_scroll;
+        let max_scroll = first_row_at_or_after(total_disp.saturating_sub(view_h));
+        if scroll > max_scroll {
+            scroll = max_scroll;
         }
+        self.scroll_offset = scroll;
     }
 
     /// The column range a node occupies on `line`, if it has a meaningful one there.
@@ -1712,10 +1743,24 @@ impl App {
                 // inside this node's output grows the range it occupies, and a stale
                 // length here makes the row accounting below underflow.
                 let len = self.actual_expanded_line_count(n.id).max(1);
+                // Only the region's own two markers go — the frame stands for them. A
+                // child expanded inside gets no block of its own, so its markers are
+                // the one thing that sets its output apart from the parent's; dropping
+                // every marker also made the cursor vanish whenever Tab or Enter parked
+                // it on one. The own end marker is the *last* `// -- end name --` in the
+                // range: a same-named child's sits above it.
+                let end_marker = format!("// -- end {} --", n.call.name);
+                let own_end = (start..start + len).rev().find(|&idx| {
+                    self.source_lines
+                        .get(idx)
+                        .is_some_and(|t| t.trim() == end_marker)
+                });
                 let right = (start..start + len)
                     .filter_map(|idx| {
                         let text = self.source_lines.get(idx)?;
-                        (!is_expansion_marker(text)).then_some((idx, text.as_str()))
+                        let own_marker =
+                            (idx == start && is_expansion_marker(text)) || Some(idx) == own_end;
+                        (!own_marker).then_some((idx, text.as_str()))
                     })
                     .collect();
                 Some(SplitRegion {
@@ -1760,8 +1805,16 @@ impl App {
         }
     }
 
-    /// Rebuild the visible_nodes list based on tree structure and visibility
+    /// Rebuild the visible_nodes list based on tree structure and visibility.
+    ///
+    /// The selection follows the node it was on rather than staying a bare index: the
+    /// list can lose entries *before* that node — expanding the second derive of
+    /// `#[derive(Debug, Clone)]` swallows the root `Debug` — and the index then pointed
+    /// at the expansion's first child while the cursor stayed on `Clone`, so the tree
+    /// highlighted one node, the source pane another, and the next Enter expanded the
+    /// child instead of undoing. The index is kept only when the node is gone.
     fn rebuild_visible_nodes(&mut self) {
+        let anchor = self.selected_node_id();
         self.visible_nodes.clear();
 
         // Collect root nodes (no parent)
@@ -1777,6 +1830,9 @@ impl App {
             self.collect_visible_nodes(root_id);
         }
 
+        if let Some(idx) = anchor.and_then(|id| self.visible_nodes.iter().position(|&n| n == id)) {
+            self.selected_idx = idx;
+        }
         // Adjust selection if needed
         if self.selected_idx >= self.visible_nodes.len() {
             self.selected_idx = self.visible_nodes.len().saturating_sub(1);
@@ -2747,12 +2803,25 @@ impl App {
 
         self.rebuild_visible_nodes();
 
-        // Collapsing is the only mutation that shrinks the buffer. Without re-clamping,
-        // a cursor that was sitting inside the expansion is left past the end: the pane
-        // renders blank and `j`/`k` stop responding until the user presses `G`.
-        self.cursor_line = self.cursor_line.min(self.source_lines.len().max(1));
+        // A cursor inside the range just collapsed — where Enter from any line of the
+        // expansion leaves it — is parked on the restored call, line and column, the
+        // way Tab parks it. Clamping it to the buffer instead left it on whatever line
+        // now had that number (`}` after undoing `foo!()` just above it) with nothing
+        // selected, so Enter, Enter did not round-trip; and a cursor past the new end
+        // rendered the pane blank with `j`/`k` dead until `G`. Snapping the column
+        // would move a derive's selection to the first derive on the line.
+        let inside = self.cursor_line >= line && self.cursor_line < line + num_expanded_lines;
+        match self.get_node(node_id).map(Self::node_cursor_pos) {
+            Some((own_line, col)) if inside => {
+                self.cursor_line = own_line;
+                self.cursor_col = col;
+            }
+            _ => {
+                self.cursor_line = self.cursor_line.min(self.source_lines.len().max(1));
+                self.snap_cursor_col();
+            }
+        }
         self.ensure_cursor_visible();
-        self.snap_cursor_col();
         self.sync_selection_to_cursor();
 
         self.status = format!("Undid expansion of '{}'", name);
@@ -3465,16 +3534,10 @@ fn ui(frame: &mut Frame, app: &mut App) {
     // Inner width of the source pane, minus the 7-char line-number gutter.
     let content_w = main_chunks[1].width.saturating_sub(2).saturating_sub(7) as usize;
 
-    // Display rows the split blocks add before source line `idx`. Same arithmetic as
-    // `ensure_cursor_visible`, but over the regions already built above rather than
-    // re-deriving (and re-cloning) them.
-    let extra_before = |idx: usize| -> usize {
-        regions
-            .iter()
-            .filter(|r| r.start + r.len <= idx)
-            .map(|r| (r.rows() + 2).saturating_sub(r.len))
-            .sum()
-    };
+    // The same mapping `ensure_cursor_visible` scrolls by, over the regions already
+    // built above rather than re-deriving them: the two have to agree on which display
+    // row a source line is, or the cursor it just brought on screen is drawn elsewhere.
+    let display_row_of = |idx: usize| display_row_of(&regions, idx);
 
     // Build only the rows that fit in the viewport. Rendering the whole buffer meant
     // re-tokenizing and re-allocating every line ~10x/second: on a 5k-line buffer a
@@ -3486,7 +3549,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
     // scrolling behaves identically.
     let view_h = main_chunks[1].height.saturating_sub(2) as usize;
     let top_src = app.scroll_offset;
-    let top_disp = top_src + extra_before(top_src);
+    let top_disp = display_row_of(top_src);
 
     // Start the walk at the beginning of the split region containing the top source
     // line — its block may be partially scrolled off the top — or at the top line
@@ -3500,7 +3563,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
 
     let mut source_lines: Vec<Line> = Vec::with_capacity(view_h);
     let mut i = start_i; // source-line index
-    let mut row = start_i + extra_before(start_i); // display row of source line `i`
+    let mut row = display_row_of(start_i); // display row of source line `i`
     while i < app.source_lines.len() && row < top_disp + view_h {
         if let Some(region) = regions.iter().find(|r| r.start == i) {
             let block_rows = region.rows() + 2;
@@ -3919,15 +3982,33 @@ fn render_split_block_rows(
     let head_left_w = left_w + 2;
     let head_right_w = right_w + 1;
 
+    // The block row standing for the cursor's line, when that line is in this region.
+    // The region's own marker lines are not in `right`, so they map to the header and
+    // footer: Enter leaves the cursor on the start marker, and without this the cursor
+    // was nowhere on screen after every expansion in split view — on the one row where
+    // Enter undoes the expansion instead of acting on a child inside it.
+    let cursor_row = cursor_line
+        .checked_sub(1)
+        .filter(|&idx| region.start <= idx && idx < region.start + region.len)
+        .map(|idx| region.block_row_of(idx));
+    let frame = |on: bool| {
+        if on {
+            rule.bg(Color::DarkGray).bold()
+        } else {
+            rule
+        }
+    };
+
     // Header: ├─ original ──┬─ expanded (name) ──
     if rows.contains(&0) {
+        let style = frame(cursor_row == Some(0));
         out.push(Line::from(vec![
-            Span::styled("     ├", gutter),
-            Span::styled(head("original", head_left_w), rule),
-            Span::styled("┬", rule),
+            Span::styled("     ├", style),
+            Span::styled(head("original", head_left_w), style),
+            Span::styled("┬", style),
             Span::styled(
                 head(&format!("expanded: {}", region.name), head_right_w),
-                rule,
+                style,
             ),
         ]));
     }
@@ -3938,10 +4019,7 @@ fn render_split_block_rows(
         let left = region.original.get(k).map(String::as_str).unwrap_or("");
         // The cursor moves over `source_lines`, which inside a split region are the
         // expanded lines — so it belongs to the right column.
-        let is_cursor = region
-            .right
-            .get(k)
-            .is_some_and(|(idx, _)| idx + 1 == cursor_line);
+        let is_cursor = cursor_row == Some(block_row);
         let right_base = if is_cursor {
             Style::default().bg(Color::DarkGray).bold()
         } else {
@@ -3965,11 +4043,12 @@ fn render_split_block_rows(
 
     // Footer: ├────┴────
     if rows.contains(&(total - 1)) {
+        let style = frame(cursor_row == Some(total - 1));
         out.push(Line::from(vec![
-            Span::styled("     ├", gutter),
-            Span::styled("─".repeat(head_left_w), rule),
-            Span::styled("┴", rule),
-            Span::styled("─".repeat(head_right_w), rule),
+            Span::styled("     ├", style),
+            Span::styled("─".repeat(head_left_w), style),
+            Span::styled("┴", style),
+            Span::styled("─".repeat(head_right_w), style),
         ]));
     }
 }
@@ -5694,6 +5773,183 @@ struct B;
                 "== #[derive(foo)] ==",
                 "== quote_token! ==",
             ]
+        );
+    }
+
+    /// Render one frame the way `run_app` does, at the given terminal size.
+    fn render(app: &mut App, width: u16, height: u16) -> Buffer {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, app)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// Rows of the source pane that carry the cursor's background, as `(row, text)`.
+    fn cursor_rows(buf: &Buffer) -> Vec<(u16, String)> {
+        let area = buf.area;
+        // The same split `ui` makes, so the tree pane's own highlight is excluded.
+        let panes = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
+            .split(Rect::new(0, 0, area.width, area.height.saturating_sub(3)));
+        let src = panes[1];
+        (src.y..src.y + src.height)
+            .filter_map(|y| {
+                let cells: Vec<&ratatui::buffer::Cell> =
+                    (src.x..src.x + src.width).map(|x| &buf[(x, y)]).collect();
+                cells
+                    .iter()
+                    .any(|c| c.bg == Color::DarkGray)
+                    .then(|| (y, cells.iter().map(|c| c.symbol()).collect::<String>()))
+            })
+            .collect()
+    }
+
+    fn title_row(buf: &Buffer) -> String {
+        (0..buf.area.width).map(|x| buf[(x, 0)].symbol()).collect()
+    }
+
+    /// Tab to the second derive of `#[derive(Debug, Clone)]` and press Enter. The
+    /// expansion swallows the root `Debug` node, so the visible list loses an entry
+    /// *before* the selected one; keeping the selection as a bare index moved it onto
+    /// the expansion's first child while the cursor stayed on `Clone`. The tree then
+    /// highlighted a node the source pane did not, and the next Enter expanded that
+    /// child instead of undoing `Clone`.
+    #[test]
+    fn expanding_a_later_derive_keeps_it_selected() {
+        let mut app = test_app("#[derive(Debug, Clone)]\nstruct S;\n");
+        let clone = node_named(&app, "Clone");
+        render(&mut app, 100, 20);
+        app.next();
+        assert_eq!(app.selected_node_id(), Some(clone));
+
+        app.expand_node(clone, Some("impl Clone for S {}".into()));
+        assert_eq!(
+            app.selected_node_id(),
+            Some(clone),
+            "selection drifted to {:?}",
+            app.selected_node().map(|n| n.call.name.clone())
+        );
+        let buf = render(&mut app, 100, 20);
+        assert!(
+            title_row(&buf).contains("Clone at line 1"),
+            "{}",
+            title_row(&buf)
+        );
+
+        // Enter again undoes what Enter expanded, and the selection stays put.
+        app.toggle_expansion();
+        assert!(!app.get_node(clone).unwrap().expanded, "{}", app.status);
+        assert_eq!(
+            app.source_lines,
+            vec!["#[derive(Debug, Clone)]", "struct S;"]
+        );
+        assert_eq!(app.selected_node_id(), Some(clone));
+    }
+
+    /// After Enter expands a macro the cursor sits on its `// -- expanded: X --` line.
+    /// The split block drops that line, so with `v` on the cursor was nowhere on
+    /// screen — and the only row where Enter reliably undoes the expansion (rather
+    /// than acting on a child inside it) was the one the user could not see. The
+    /// block's header stands for that line and has to show the cursor.
+    #[test]
+    fn split_view_shows_the_cursor_on_an_expansions_own_row() {
+        let mut app = test_app("fn main() {\n    foo!(1);\n}\n");
+        let foo = node_named(&app, "foo");
+        render(&mut app, 100, 12);
+        select(&mut app, foo);
+        app.update_scroll();
+        app.expand_node(foo, Some("a();\nb();".into()));
+        app.toggle_split_view();
+
+        let buf = render(&mut app, 100, 12);
+        let rows = cursor_rows(&buf);
+        assert!(
+            rows.iter().any(|(_, t)| t.contains("expanded: foo")),
+            "cursor row not on the block header: {:?}",
+            rows
+        );
+
+        app.toggle_expansion();
+        assert!(!app.get_node(foo).unwrap().expanded, "{}", app.status);
+    }
+
+    /// Undo from a body line inside the expansion. Clamping the cursor to the buffer
+    /// left it on whatever line now had that number (`}` here) with nothing selected,
+    /// so Enter, Enter did not round-trip: the macro just collapsed was no longer the
+    /// one the next Enter would act on.
+    #[test]
+    fn undo_leaves_the_cursor_on_the_restored_call() {
+        let mut app = test_app("fn main() {\n    foo!(1);\n}\n");
+        let foo = node_named(&app, "foo");
+        render(&mut app, 100, 12);
+        select(&mut app, foo);
+        app.update_scroll();
+        app.expand_node(foo, Some("a();\nb();".into()));
+        app.cursor_down();
+        assert_eq!(app.selected_node_id(), Some(foo));
+
+        app.toggle_expansion();
+        assert!(!app.get_node(foo).unwrap().expanded, "{}", app.status);
+        assert_eq!((app.cursor_line, app.cursor_col), (2, 4));
+        assert_eq!(app.selected_node_id(), Some(foo));
+    }
+
+    /// Only the region's own two markers are dropped from the right column. A child
+    /// expanded inside it has no block header of its own, so its markers are the only
+    /// thing that sets its output apart — and the cursor parked on them (Tab, or Enter
+    /// on the child) vanished from the screen when they were dropped too.
+    #[test]
+    fn nested_markers_stay_in_the_split_block() {
+        let mut app = test_app("fn main() {\n    foo!(1);\n}\n");
+        let foo = node_named(&app, "foo");
+        app.expand_node(foo, Some("bar!(2);".into()));
+        let bar = node_named(&app, "bar");
+        app.expand_node(bar, Some("x();".into()));
+        app.toggle_split_view();
+
+        let regions = app.split_regions();
+        assert_eq!(regions.len(), 1);
+        let right: Vec<&str> = regions[0].right.iter().map(|(_, t)| t.trim()).collect();
+        assert!(
+            right.contains(&"// -- expanded: bar --") && right.contains(&"// -- end bar --"),
+            "{:?}",
+            right
+        );
+        assert!(
+            !right.contains(&"// -- expanded: foo --") && !right.contains(&"// -- end foo --"),
+            "{:?}",
+            right
+        );
+    }
+
+    /// An attribute that strips a long item leaves a block far taller than the three
+    /// source lines it occupies. Mapping the cursor's line to a display row by adding
+    /// only the blocks *before* it put the `// -- end --` line three rows down, while
+    /// its footer row is thirteen down — off a six-row viewport, so no scroll happened
+    /// and the cursor was off screen.
+    #[test]
+    fn cursor_on_an_end_marker_is_scrolled_into_view() {
+        let mut src = String::from("#[my_attr]\nfn f() {\n");
+        for i in 0..8 {
+            src.push_str(&format!("    let v{} = {};\n", i, i));
+        }
+        src.push_str("}\n");
+        let mut app = test_app(&src);
+        let attr = node_named(&app, "my_attr");
+        render(&mut app, 100, 11);
+        app.expand_node(attr, Some("fn f() {}".into()));
+        app.toggle_split_view();
+        assert_eq!(app.source_lines.len(), 3);
+
+        app.cursor_line = 3;
+        app.ensure_cursor_visible();
+        let buf = render(&mut app, 100, 11);
+        let rows = cursor_rows(&buf);
+        assert!(
+            rows.iter().any(|(_, t)| t.contains('┴')),
+            "cursor row not on the block footer: {:?}",
+            rows
         );
     }
 }
