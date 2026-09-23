@@ -3782,17 +3782,15 @@ fn find_source_file(args: &Args) -> io::Result<PathBuf> {
             .iter()
             .find(|t| t.is_kind(TargetKind::Lib) || t.is_kind(TargetKind::ProcMacro))
     } else if let Some(ref test_name) = args.test {
-        // --test: first try kind=test with matching name, then fall back to lib
+        // No fallback to the lib when the name matches nothing. `--test typo` used to
+        // open `src/lib.rs` and report "No macro expansions found", which reads as
+        // "this crate has no macros" rather than "there is no such test" — and the
+        // `--test typo` macra forwards to cargo fails anyway, so the fallback could
+        // never have produced a trace. `--bin` and `--example` already error.
         package
             .targets
             .iter()
             .find(|t| t.is_kind(TargetKind::Test) && t.name == *test_name)
-            .or_else(|| {
-                package
-                    .targets
-                    .iter()
-                    .find(|t| t.is_kind(TargetKind::Lib) || t.is_kind(TargetKind::ProcMacro))
-            })
     } else if let Some(ref example_name) = args.example {
         package
             .targets
@@ -3808,12 +3806,45 @@ fn find_source_file(args: &Args) -> io::Result<PathBuf> {
     };
 
     let target = target.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("no matching target found in package '{}'", package.name),
-        )
+        // Name what was asked for *and* what exists. A bare "no matching target" cannot
+        // be told apart from a typo, so `--test tyop` used to look like a crate with no
+        // macros rather than a mistyped name.
+        let listing = |found: Vec<&str>| {
+            if found.is_empty() {
+                " (this package has none)".to_string()
+            } else {
+                format!(" (available: {})", found.join(", "))
+            }
+        };
+        let msg = if let Some(name) = &args.bin {
+            let f = package
+                .targets
+                .iter()
+                .filter(|t| t.is_kind(TargetKind::Bin))
+                .map(|t| t.name.as_str())
+                .collect();
+            format!("no bin target named `{name}`{}", listing(f))
+        } else if let Some(name) = &args.test {
+            let f = package
+                .targets
+                .iter()
+                .filter(|t| t.is_kind(TargetKind::Test))
+                .map(|t| t.name.as_str())
+                .collect();
+            format!("no test target named `{name}`{}", listing(f))
+        } else if let Some(name) = &args.example {
+            let f = package
+                .targets
+                .iter()
+                .filter(|t| t.is_kind(TargetKind::Example))
+                .map(|t| t.name.as_str())
+                .collect();
+            format!("no example target named `{name}`{}", listing(f))
+        } else {
+            format!("no lib or bin target in package `{}`", package.name)
+        };
+        io::Error::new(io::ErrorKind::NotFound, msg)
     })?;
-
     let src_path = target.src_path.clone().into_std_path_buf();
     if !src_path.exists() {
         return Err(io::Error::new(
