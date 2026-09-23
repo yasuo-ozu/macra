@@ -3898,7 +3898,21 @@ fn resolve_module_path(top_level: &Path, module_str: &str) -> io::Result<(PathBu
     Ok((current_file, module_path))
 }
 
-fn main() -> io::Result<()> {
+fn main() -> std::process::ExitCode {
+    match run_main() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        // `io::Result` from `main` prints the error's `Debug`, which wraps a perfectly
+        // readable sentence in `Custom { kind: Unsupported, error: "..." }`. These are
+        // messages for a person — an unsupported toolchain, a manifest that is not
+        // there — so print the `Display` and nothing else.
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_main() -> io::Result<()> {
     let mut args = Args::parse();
 
     // When invoked via `cargo run -- symbol` (without "macra" subcommand),

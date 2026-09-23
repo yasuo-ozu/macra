@@ -323,6 +323,12 @@ impl BridgeAbi {
     }
 }
 
+/// The oldest rustc macra will drive at all, as `major.minor`.
+///
+/// Distinct from [`bridge_abi_for`] returning `None`: that means "no proc-macro
+/// capture, everything else still works", whereas below this the tool refuses outright.
+pub const MIN_SUPPORTED_RUSTC: &str = "1.86";
+
 /// A rustc version as (major, minor), whether it is a pre-release, and the date of
 /// the commit it was built from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -475,7 +481,17 @@ pub fn bridge_abi_for(v: RustcVersion) -> Option<BridgeAbi> {
         // 2026-09-23 (e4d8f07417, 16-bit support, changes only `arena.rs` and
         // `fxhash.rs`, neither on the wire). Not yet released, so this is the one arm
         // established from source alone; the nightly above is the same code.
-        (1, 100) => abi(TableLayout::ClientSlice, FLAT_100),
+        // 1.100 and everything after it: assume the newest shape we have verified —
+        // the client slice, with 1.100's tag numbering. A deliberate guess, because
+        // refusing every future release means macra goes dark the day rustc's minor
+        // bumps, which is the failure users actually hit.
+        //
+        // Affordable because the name scan gates independently: for a release whose
+        // metadata layout is unverified, `rustc_meta` refuses, the hook hands rustc its
+        // own table back untouched, and nothing of ours ever issues an RPC — so a tag
+        // numbering that has since shifted is never exercised. Being wrong here costs
+        // capture, not a live compiler, for exactly as long as that gate stays honest.
+        (1, 100..) => abi(TableLayout::ClientSlice, FLAT_100),
         // Anything newer is unverified. Guessing does not fail cleanly, see above.
         _ => None,
     }
@@ -736,8 +752,18 @@ mod abi_tests {
                 "a 1.100 pre-release dated {date:?} has the shifted tags"
             );
         }
-        // The date rule is specific to the 1.100 boundary; it does not vouch for a
-        // later minor just because it is recent.
+        // Releases past the last verified one take the newest known shape rather than
+        // being refused, so a minor bump does not silently end proc-macro capture.
+        for minor in [101, 120] {
+            assert_eq!(
+                bridge_abi_for(v(minor, false)),
+                Some(slice(flat_100)),
+                "1.{minor} should be attempted with the newest verified shape"
+            );
+        }
+        // The date rule is specific to the 1.100 boundary and must not leak forward: a
+        // later pre-release is attempted on the newest verified shape like any other
+        // unverified release, not judged against 1.100's landing day.
         assert_eq!(
             bridge_abi_for(RustcVersion {
                 major: 1,
@@ -745,12 +771,13 @@ mod abi_tests {
                 prerelease: true,
                 commit_date: Some((2026, 9, 30)),
             }),
-            None
+            Some(slice(flat_100))
         );
-        // Newer minors are unverified and select nothing.
-        assert_eq!(bridge_abi_for(v(101, false)), None);
-        assert_eq!(bridge_abi_for(v(101, true)), None);
+        // Below the client-slice layout there is nothing to guess with: 1.85 and older
+        // predate every table shape the hook knows. (The driver refuses those outright
+        // rather than running without capture — see `MIN_SUPPORTED_RUSTC`.)
         assert_eq!(bridge_abi_for(v(85, false)), None);
+        assert_eq!(bridge_abi_for(v(70, false)), None);
         assert_eq!(
             bridge_abi_for(RustcVersion {
                 major: 2,

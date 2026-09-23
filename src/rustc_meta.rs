@@ -111,17 +111,25 @@ pub fn version_string(meta: &[u8]) -> Option<String> {
 /// How many `LazyArray` fields sit between the scalar prefix of `CrateRoot` and
 /// `proc_macro_data`, per rustc version.
 ///
-/// This is the one place the three supported releases differ: 1.99 inserted
-/// `canonical_symbols`. Anything else is unknown and decodes to nothing — a later
-/// rustc that moves a field would otherwise be read as garbage, and while the
-/// structural checks downstream would almost certainly reject it, "almost" is
-/// not the standard here.
+/// This is the one place the verified releases differ: 1.99 inserted
+/// `canonical_symbols`. A release newer than any we have checked is decoded with that
+/// same shape rather than refused outright, so macra keeps working across a minor bump
+/// instead of going dark the day one lands. That is safe only because the decode is
+/// checked, not trusted: a root that grew another field fails one of the structural
+/// invariants and returns `None`, which costs capture rather than mislabelling a macro.
+/// Anything older than 1.98 is a different table layout entirely and decodes to nothing.
 fn lazy_arrays_before_proc_macro_data(version: &str) -> Option<usize> {
     let rest = version.strip_prefix("rustc 1.")?;
     let digits = rest.find(|c: char| !c.is_ascii_digit())?;
     match rest[..digits].parse::<u32>().ok()? {
         98 => Some(15),
-        99 | 100 => Some(16),
+        // 1.99 inserted `canonical_symbols`. Later releases are assumed to keep that
+        // shape: trying the newest verified layout is what lets macra keep working
+        // across a minor bump instead of going dark the day one lands. The decode
+        // validates roughly twenty invariants before it believes anything, so a root
+        // that has grown another field fails closed rather than renaming a macro —
+        // which is the only outcome that would be worse than capturing nothing.
+        99.. => Some(16),
         _ => None,
     }
 }
@@ -801,14 +809,23 @@ mod tests {
             lazy_arrays_before_proc_macro_data("rustc 1.100.0-nightly (cea272fa3 2026-09-07)"),
             Some(16)
         );
-        // Neither older nor newer releases are decoded: fail closed.
+        // Older releases put the names in the table itself, so there is no metadata
+        // layout to guess at: fail closed.
         assert_eq!(
             lazy_arrays_before_proc_macro_data("rustc 1.97.0 (2d8144b78 2026-07-07)"),
             None
         );
+        // A newer release is attempted on the newest shape we have verified rather
+        // than refused, so a minor bump does not end proc-macro capture on its own.
+        // Whether those bytes really decode is then the decoder's business, and it
+        // has roughly twenty invariants to say no with.
         assert_eq!(
             lazy_arrays_before_proc_macro_data("rustc 1.101.0-nightly (0 2026-10-01)"),
-            None
+            Some(16)
+        );
+        assert_eq!(
+            lazy_arrays_before_proc_macro_data("rustc 1.120.0 (0 2028-01-01)"),
+            Some(16)
         );
         assert_eq!(lazy_arrays_before_proc_macro_data("rustc 2.0.0"), None);
         assert_eq!(lazy_arrays_before_proc_macro_data("clang 1.98.0"), None);

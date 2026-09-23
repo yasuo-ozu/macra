@@ -226,6 +226,24 @@ impl TraceMacros {
         // it is left out entirely: `-Z trace-macros` still yields bang macros, which
         // degrades the feature instead of aborting the build.
         let detected = self.detect_rustc_version();
+        // Below macra's own MSRV this is not a degraded run, it is the wrong tool: the
+        // bridge predates every table layout the hook knows, and `-Z trace-macros`
+        // output from that era has not been checked against the parser either. Refuse
+        // rather than produce a half-empty view the user would have to disbelieve.
+        if let Some(v) = detected {
+            if (v.major, v.minor) < (1, 86) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!(
+                        "rustc {}.{} is older than macra's minimum supported {}; \
+                         run it under a newer toolchain, e.g. `cargo +stable macra`",
+                        v.major,
+                        v.minor,
+                        crate::MIN_SUPPORTED_RUSTC
+                    ),
+                ));
+            }
+        }
         let abi = detected.and_then(crate::bridge_abi_for);
         if std::env::var_os("MACRA_HOOK_DEBUG").is_some() {
             eprintln!(
