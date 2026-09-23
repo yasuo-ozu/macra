@@ -98,6 +98,10 @@ struct HookRecord {
     #[serde(default)]
     krate: String,
     kind: String,
+    /// Absent from records the hook writes for non-derives, and from those of older
+    /// hooks.
+    #[serde(default)]
+    helpers: Vec<String>,
     #[serde(default)]
     arguments: String,
     input: String,
@@ -132,6 +136,7 @@ fn parse_hook_json(json: &str) -> Option<MacroExpansion> {
         name: record.name,
         kind,
         input: record.input,
+        helpers: record.helpers,
     })
 }
 
@@ -946,6 +951,17 @@ mod tests {
         assert_eq!(exp.name, "Debug");
         assert_eq!(exp.kind, MacroExpansionKind::Derive);
         assert_eq!(exp.expanding, "Debug");
+    }
+
+    /// The helper list rides on the derive's own record; a record without the field
+    /// (an attribute, a bang, or an older hook) parses to an empty list.
+    #[test]
+    fn test_parse_hook_json_derive_helpers() {
+        let json = r##"{"name":"Ast","kind":"CustomDerive","helpers":["subast"],"arguments":"","input":"#[subast(Line)] struct Page {}","output":""}"##;
+        let exp = parse_hook_json(json).unwrap();
+        assert_eq!(exp.helpers, ["subast".to_string()]);
+        let json = r#"{"name":"Debug","kind":"CustomDerive","arguments":"","input":"struct Foo {}","output":"impl Debug for Foo {}"}"#;
+        assert!(parse_hook_json(json).unwrap().helpers.is_empty());
     }
 
     #[test]

@@ -252,6 +252,16 @@ struct TraceCandidate {
     output: String,
 }
 
+/// Helper attribute name -> the derives that declare it (`subast` -> `[Ast]` for
+/// `#[proc_macro_derive(Ast, attributes(subast))]`).
+///
+/// Learnt from the trace: the hook copies each derive's declared helpers onto its
+/// expansion records, so a helper is known once a derive declaring it has expanded.
+/// The source alone cannot tell `#[subast(..)]` from an attribute macro, and treating
+/// it as one hid the `Ast` and `Debug` derives on the user's item behind a node that
+/// can never expand.
+type HelperAttrs = std::collections::HashMap<String, Vec<String>>;
+
 struct CacheInner {
     expansions: Vec<MacroExpansion>,
     /// `normalize_tokens` of each expansion's `input` and `arguments`, computed once
@@ -272,6 +282,8 @@ struct CacheInner {
     /// Only one hop is stored per entry; `alias_definitions` follows chains, so a
     /// hand-written `use Line as L;` on top of the generated re-export resolves too.
     aliases: std::collections::HashMap<String, Vec<String>>,
+    /// See [`HelperAttrs`]; filled from every derive record as it is pushed.
+    helper_attrs: HelperAttrs,
     done: bool,
     error: Option<String>,
     /// Stored build failure message (non-zero exit from cargo check).
@@ -287,6 +299,14 @@ impl CacheInner {
         normalized: (String, String),
         aliases: Vec<(String, String)>,
     ) {
+        if exp.kind == MacroExpansionKind::Derive {
+            for helper in &exp.helpers {
+                let owners = self.helper_attrs.entry(helper.clone()).or_default();
+                if !owners.contains(&exp.name) {
+                    owners.push(exp.name.clone());
+                }
+            }
+        }
         self.expansions.push(exp);
         self.normalized.push(normalized);
         self.add_aliases(aliases);
@@ -567,6 +587,7 @@ impl ExpansionCache {
                 expansions: Vec::new(),
                 normalized: Vec::new(),
                 aliases: std::collections::HashMap::new(),
+                helper_attrs: HelperAttrs::new(),
                 done: false,
                 error: None,
                 build_error: None,
@@ -1176,6 +1197,23 @@ impl ExpansionCache {
         let inner = mutex.lock().unwrap();
         inner.build_error.clone()
     }
+
+    /// The helper attributes reported so far (see [`HelperAttrs`]). Non-blocking: it
+    /// reports what has streamed in, which may be nothing yet.
+    fn helper_attributes(&self) -> HelperAttrs {
+        let (ref mutex, _) = *self.inner;
+        mutex.lock().unwrap().helper_attrs.clone()
+    }
+
+    /// Whether the trace holds an attribute-macro expansion invoked as `name`.
+    fn attribute_macro_seen(&self, name: &str) -> bool {
+        let (ref mutex, _) = *self.inner;
+        let inner = mutex.lock().unwrap();
+        inner
+            .expansions
+            .iter()
+            .any(|e| e.kind == MacroExpansionKind::Attribute && e.name == name)
+    }
 }
 
 impl Drop for ExpansionCache {
@@ -1199,6 +1237,8 @@ struct ModuleState {
     cursor_col: usize,
     file_path: PathBuf,
     module_path: Vec<String>,
+    /// `App::roots_helper_count` for the saved nodes.
+    helper_count: usize,
 }
 
 struct App {
@@ -1252,6 +1292,13 @@ struct App {
     module_path: Vec<String>,
     /// Stack of saved module states for returning to parent modules
     module_stack: Vec<ModuleState>,
+    /// Every helper attribute the trace has reported, merged across reloads (they
+    /// are facts about the proc-macro crates, not about one run). Read by the
+    /// node list, by `build_root_nodes`, and by `expand_node`.
+    inert_attrs: HelperAttrs,
+    /// `inert_attrs.len()` when the current root nodes were built. The roots are
+    /// rebuilt when it falls behind — see `rebuild_roots_if_untouched`.
+    roots_helper_count: usize,
     /// When set, each expanded range is rendered as a two-column block comparing the
     /// original source (left) with the expansion (right). Code outside those ranges
     /// stays full width. Toggled with `v`.
@@ -1493,11 +1540,32 @@ fn shift_nodes(
     }
 }
 
+/// Status line for an attempt to expand a derive's helper attribute.
+fn helper_attribute_status(name: &str, owners: &[String]) -> String {
+    let owners: Vec<String> = owners.iter().map(|o| format!("#[derive({o})]")).collect();
+    format!(
+        "'{}' is a helper attribute of {}: it is inert and has no expansion.",
+        name,
+        owners.join(", ")
+    )
+}
+
 /// Build the top-level macro nodes for one file.
 ///
 /// Shared by the initial file and by `enter_submodule` so a module behaves exactly
 /// like the root file.
-fn build_root_nodes(source: &str, source_lines: &[String]) -> (Vec<MacroNode>, usize) {
+///
+/// `inert` is the helper attributes the trace has reported so far. A helper such as
+/// `#[subast(..)]` gets a node — it is in the file and the user may want to know
+/// what it is — but it is not a macro: it neither claims an item's attribute-macro
+/// slot nor stands between the source and the derives on the item. The set may
+/// still be empty when the file is first shown; `App::refresh_helper_knowledge`
+/// rebuilds the roots once the trace fills it in.
+fn build_root_nodes(
+    source: &str,
+    source_lines: &[String],
+    inert: &HelperAttrs,
+) -> (Vec<MacroNode>, usize) {
     let macros = find_macros(source);
 
     let mut nodes = Vec::new();
@@ -1508,13 +1576,6 @@ fn build_root_nodes(source: &str, source_lines: &[String]) -> (Vec<MacroNode>, u
     // each one's output contains the remaining attributes, so only the first can
     // be expanded from the original source. The rest appear as children later.
     let mut item_first_attr: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    // Items that carry a non-built-in attribute macro. Derives on such an item
-    // cannot be expanded until that attribute has run, so they stay hidden.
-    let attr_gated_items: std::collections::HashSet<usize> = macros
-        .iter()
-        .filter(|m| m.kind == MacroKind::Attribute && !is_builtin_attribute(&m.name))
-        .map(|m| m.item_line_end)
-        .collect();
 
     // Derives of one `#[derive(...)]` share both their attribute's line and their
     // item, so key the group on the pair — the group id is the first member's node
@@ -1534,19 +1595,30 @@ fn build_root_nodes(source: &str, source_lines: &[String]) -> (Vec<MacroNode>, u
                 if is_builtin_attribute(&mac.name) {
                     continue;
                 }
-                if !item_first_attr.insert(mac.item_line_end) {
+                // A derive's helper is inert too, but it keeps its node (drawn as
+                // `[Helper]`, and refused with an explanation rather than a lookup
+                // that can only fail). It must not take the item's attribute-macro
+                // slot: `#[subast(..)] #[my_attr]` would otherwise leave `my_attr`
+                // with no node at all.
+                if !inert.contains_key(&mac.name) && !item_first_attr.insert(mac.item_line_end) {
                     // Already have a top-level attribute macro for this item.
                     continue;
                 }
             }
             MacroKind::Derive => {
                 // Derives within one `#[derive(..)]` are order-independent: each
-                // receives the same item and appends its own output. So every
+                // receives the same item and appends its own output, so every
                 // derive gets its own top-level node and the user can expand them
-                // in any order — provided no attribute macro has to run first.
-                if attr_gated_items.contains(&mac.item_line_end) {
-                    continue;
-                }
+                // in any order.
+                //
+                // This used to skip every derive on an item that carried a
+                // non-built-in attribute, on the grounds that an attribute macro
+                // rewrites the item before the derives run. From the source alone
+                // that test cannot tell such a macro from a derive's own helper
+                // (`#[subast(..)]` next to `#[derive(Ast)]`), and it hid `Ast` and
+                // `Debug` behind an attribute that can never be expanded. The derive
+                // is offered regardless; `expand_node` explains a real gate when the
+                // lookup fails, with the trace available to tell the two apart.
             }
             MacroKind::Functional => {}
         }
@@ -1604,7 +1676,11 @@ impl App {
     ) -> Self {
         let source_lines: Vec<String> = source.lines().map(|s| s.to_string()).collect();
         let line_origins: Vec<Option<usize>> = (1..=source_lines.len()).map(Some).collect();
-        let (nodes, next_id) = build_root_nodes(&source, &source_lines);
+        // Usually empty here — the build has only just been spawned — but a cache
+        // that already holds records (a test's, or a fast rebuild) is honoured.
+        let inert_attrs = expansion_cache.helper_attributes();
+        let roots_helper_count = inert_attrs.len();
+        let (nodes, next_id) = build_root_nodes(&source, &source_lines, &inert_attrs);
 
         let visible_nodes: Vec<usize> = nodes.iter().map(|n| n.id).collect();
         let list_state = ListState::default();
@@ -1633,6 +1709,8 @@ impl App {
             crate_root,
             module_path,
             module_stack: Vec::new(),
+            inert_attrs,
+            roots_helper_count,
             split_view: false,
         };
         app.seed_source_aliases();
@@ -1658,6 +1736,116 @@ impl App {
             .chain(std::iter::once(self.file_path.clone()));
         self.expansion_cache
             .add_aliases(source_aliases_in_tree(starts));
+    }
+
+    /// Merge the helper attributes the trace has reported so far into
+    /// `inert_attrs`.
+    fn absorb_helper_knowledge(&mut self) {
+        for (helper, owners) in self.expansion_cache.helper_attributes() {
+            let known = self.inert_attrs.entry(helper).or_default();
+            for owner in owners {
+                if !known.contains(&owner) {
+                    known.push(owner);
+                }
+            }
+        }
+    }
+
+    /// Once per event-loop tick: learn any newly reported helpers and, if that
+    /// changes which attributes are inert, bring the root nodes up to date.
+    ///
+    /// The roots are built when the file is shown, before the build has produced a
+    /// single record, so at that point every non-built-in attribute has to be taken
+    /// for an attribute macro. The derives are offered regardless (see
+    /// `build_root_nodes`), but a helper that happens to precede an attribute macro
+    /// on its item still holds that item's only attribute slot until this runs.
+    fn refresh_helper_knowledge(&mut self) {
+        self.absorb_helper_knowledge();
+        self.rebuild_roots_if_untouched();
+    }
+
+    /// Rebuild the root nodes with the current `inert_attrs` if they were built with
+    /// fewer helpers known — and only while nothing has been expanded, failed or
+    /// left half-decided, when a rebuild is indistinguishable from having shown the
+    /// file a moment later. Anything else is left alone: an expanded node's buffer
+    /// state, undo snapshots and children cannot be carried across a rebuild, and
+    /// the knowledge still reaches the list and `expand_node` through `inert_attrs`.
+    fn rebuild_roots_if_untouched(&mut self) {
+        if self.inert_attrs.len() == self.roots_helper_count {
+            return;
+        }
+        let untouched = self.pending_choice.is_none()
+            && self
+                .nodes
+                .iter()
+                .all(|n| n.parent_id.is_none() && !n.expanded && !n.expansion_failed);
+        if !untouched {
+            return;
+        }
+        // Tab moves the selection without the cursor, so the selection is carried
+        // over by identity rather than re-derived from the cursor.
+        let selected = self.selected_node().map(|n| {
+            (
+                n.call.kind,
+                n.call.name.clone(),
+                n.call.line,
+                n.call.col_start,
+            )
+        });
+        let source = self.source_lines.join("\n");
+        let (nodes, next_id) = build_root_nodes(&source, &self.source_lines, &self.inert_attrs);
+        let before = self.nodes.len();
+        self.visible_nodes = nodes.iter().map(|n| n.id).collect();
+        self.nodes = nodes;
+        self.next_id = next_id;
+        self.roots_helper_count = self.inert_attrs.len();
+        let idx = selected.and_then(|(kind, name, line, col)| {
+            self.visible_nodes.iter().position(|&id| {
+                self.get_node(id).is_some_and(|n| {
+                    n.call.kind == kind
+                        && n.call.name == name
+                        && n.call.line == line
+                        && n.call.col_start == col
+                })
+            })
+        });
+        match idx {
+            Some(idx) => {
+                self.selected_idx = idx;
+                self.list_state.select(Some(idx));
+            }
+            None => self.sync_selection_to_cursor(),
+        }
+        if self.nodes.len() != before {
+            self.status = format!("Found {} macros.", self.nodes.len());
+        }
+    }
+
+    /// The attribute macro that rustc runs before the derive at `derive_line` on the
+    /// item ending at `item_line_end`, among the nodes under `parent`, if any.
+    ///
+    /// Attributes expand outside-in and `#[derive]` takes its turn in that order, so
+    /// an attribute macro *ahead* of the derive rewrites the item first and the
+    /// derive receives tokens the source cannot predict; one after the derive runs
+    /// on the derive's output and leaves the derive's input as written. Helpers are
+    /// inert and never count.
+    fn attribute_macro_ahead_of(
+        &self,
+        parent: Option<usize>,
+        derive_line: usize,
+        item_line_end: usize,
+    ) -> Option<String> {
+        self.nodes
+            .iter()
+            .find(|n| {
+                n.parent_id == parent
+                    && n.consumed_by.is_none()
+                    && n.call.kind == MacroKind::Attribute
+                    && n.call.item_line_end == item_line_end
+                    && n.call.line < derive_line
+                    && !self.inert_attrs.contains_key(&n.call.name)
+            })
+            .map(|n| n.call.name.clone())
     }
 
     fn selected_node(&self) -> Option<&MacroNode> {
@@ -2248,6 +2436,7 @@ impl App {
             already_expanded,
             sibling_derives,
             derive_group,
+            parent_id,
         ) = {
             let node = match self.get_node(node_id) {
                 Some(n) => n,
@@ -2268,12 +2457,23 @@ impl App {
                 node.expanded,
                 node.call.sibling_derives.clone(),
                 node.derive_group,
+                node.parent_id,
             )
         };
 
         if already_expanded {
             self.status = format!("'{}' already expanded. Press Enter to undo.", name);
             return;
+        }
+
+        // A derive's helper attribute is inert: rustc never expands it, so no trace
+        // can match and the lookup below would only wait out the build to report a
+        // failure that is not one. Not marked failed either — nothing went wrong.
+        if kind == MacroKind::Attribute {
+            if let Some(owners) = self.inert_attrs.get(&name) {
+                self.status = helper_attribute_status(&name, owners);
+                return;
+            }
         }
 
         // Find the matching trace. This waits on the background stream, so poll for
@@ -2330,9 +2530,46 @@ impl App {
                 return;
             }
             TraceLookup::Exhausted => {
+                // The lookup waited for the stream to end, so every derive's helpers
+                // are known now — including any that arrived after the last tick,
+                // when this attribute may still have passed for a macro.
+                self.absorb_helper_knowledge();
+                if kind == MacroKind::Attribute {
+                    if let Some(owners) = self.inert_attrs.get(&name) {
+                        self.status = helper_attribute_status(&name, owners);
+                        return;
+                    }
+                }
+
                 // Mark as failed and show error
                 if let Some(node) = self.get_node_mut(node_id) {
                     node.expansion_failed = true;
+                }
+
+                // A derive behind an attribute macro received the macro's output,
+                // not the source, so no trace can match the source — this is what
+                // hiding such derives used to guard against, now explained instead.
+                // Only stated when the trace confirms the attribute is a macro; an
+                // attribute it has never seen expand gets the ordinary report below.
+                // The siblings share the item and would fail the same way, so the
+                // retry is skipped.
+                if kind == MacroKind::Derive {
+                    let gate = self
+                        .attribute_macro_ahead_of(parent_id, line, item_line_end)
+                        .filter(|gate| self.expansion_cache.attribute_macro_seen(gate));
+                    if let Some(gate) = gate {
+                        self.error_message = Some(format!(
+                            "Expansion Error: No trace found for '{name}' (type: {})\n\n\
+                             #[{gate}] is an attribute macro and precedes #[derive({name})] \
+                             on this item, so it rewrote the item before '{name}' ran; \
+                             the trace holds no expansion of the source as written.\n\n\
+                             Expand #[{gate}] first — '{name}' is then offered among its \
+                             children.\n\n\
+                             Press Enter to dismiss.",
+                            kind.as_str(),
+                        ));
+                        return;
+                    }
                 }
 
                 // For derive macros with siblings, try the next sibling
@@ -2715,8 +2952,23 @@ impl App {
         let mut consumed_ids: Vec<usize> = Vec::new();
         let removed_end = line + lines_removed;
         for node in &mut self.nodes {
+            // A derive's child discovery re-parses the item it sits on (see
+            // `content_for_parsing`), so an attribute on the item's lines comes back as
+            // a child with the right coordinates. The root node that already stands
+            // for it goes the same way as the derives on this derive's own line, or
+            // the tree shows `#[subast(..)]` twice — once as a root, once as a child —
+            // as soon as the `Ast` next to it is expanded. Until derives on such items
+            // were offered, only built-in attributes could be here, and those have no
+            // root node. Limited to attributes: a derive in a second `#[derive(..)]`
+            // on the item keeps its root node and is shifted instead (see
+            // `separate_derive_attributes_on_one_item_are_separate_groups`).
+            let on_item = kind == MacroKind::Derive
+                && node.call.kind == MacroKind::Attribute
+                && node.call.line > line_end
+                && node.call.line <= item_line_end;
             let inside = node.call.line > line && node.call.line < removed_end
-                || node.call.line == line && kind != MacroKind::Functional;
+                || node.call.line == line && kind != MacroKind::Functional
+                || on_item;
             if node.id != node_id
                 && node.consumed_by.is_none()
                 && inside
@@ -3171,7 +3423,9 @@ impl App {
                 // all describe the previous run of the previous file.
                 self.source_lines = source.lines().map(|s| s.to_string()).collect();
                 self.line_origins = (1..=self.source_lines.len()).map(Some).collect();
-                let (nodes, next_id) = build_root_nodes(&source, &self.source_lines);
+                let (nodes, next_id) =
+                    build_root_nodes(&source, &self.source_lines, &self.inert_attrs);
+                self.roots_helper_count = self.inert_attrs.len();
                 self.visible_nodes = nodes.iter().map(|n| n.id).collect();
                 self.nodes = nodes;
                 self.next_id = next_id;
@@ -3193,7 +3447,9 @@ impl App {
                     let text = expand_tabs(&text);
                     saved.source_lines = text.lines().map(|s| s.to_string()).collect();
                     saved.line_origins = (1..=saved.source_lines.len()).map(Some).collect();
-                    let (nodes, next_id) = build_root_nodes(&text, &saved.source_lines);
+                    let (nodes, next_id) =
+                        build_root_nodes(&text, &saved.source_lines, &self.inert_attrs);
+                    saved.helper_count = self.inert_attrs.len();
                     saved.visible_nodes = nodes.iter().map(|n| n.id).collect();
                     saved.nodes = nodes;
                     saved.next_id = next_id;
@@ -3303,6 +3559,7 @@ impl App {
             cursor_col: self.cursor_col,
             file_path: self.file_path.clone(),
             module_path: self.module_path.clone(),
+            helper_count: self.roots_helper_count,
         };
         self.module_stack.push(saved);
 
@@ -3312,7 +3569,8 @@ impl App {
         // Same rules as the top-level file. This used to dedupe derives per item as
         // well as attributes, which left every derive after the first in a
         // `#[derive(A, B)]` with no node at all — unreachable by Tab, h/l, or cursor.
-        let (nodes, next_id) = build_root_nodes(&source, &source_lines);
+        let (nodes, next_id) = build_root_nodes(&source, &source_lines, &self.inert_attrs);
+        self.roots_helper_count = self.inert_attrs.len();
 
         let visible_nodes: Vec<usize> = nodes.iter().map(|n| n.id).collect();
         let list_state = ListState::default();
@@ -3359,6 +3617,9 @@ impl App {
         self.cursor_col = saved.cursor_col;
         self.file_path = saved.file_path;
         self.module_path = saved.module_path;
+        // Helpers reported while the submodule was open apply here too; the next
+        // tick's `rebuild_roots_if_untouched` sees the gap and catches up.
+        self.roots_helper_count = saved.helper_count;
         self.status = format!(
             "Returned to module '{}'",
             self.module_path.last().unwrap_or(&"crate".to_string()),
@@ -3522,6 +3783,9 @@ fn run_app(
     // clean quit and always restores the terminal.
     let result = (|| -> io::Result<()> {
         loop {
+            // The trace streams in behind the TUI; what it says about helper
+            // attributes has to reach the node list without a key press.
+            app.refresh_helper_knowledge();
             if app.needs_full_redraw {
                 app.needs_full_redraw = false;
                 terminal.clear()?;
@@ -3716,16 +3980,32 @@ fn ui(frame: &mut Frame, app: &mut App) {
                 (" ", Style::default())
             };
 
-            let kind_style = match node.call.kind {
-                MacroKind::Functional => Style::default().fg(Color::Cyan),
-                MacroKind::Attribute => Style::default().fg(Color::Yellow),
-                MacroKind::Derive => Style::default().fg(Color::Magenta),
+            // A derive's helper attribute is listed — it is in the file — but drawn
+            // as what it is: inert, with nothing to expand. Hiding it would leave
+            // the user wondering why an attribute in the source has no node.
+            let inert = node.call.kind == MacroKind::Attribute
+                && app.inert_attrs.contains_key(&node.call.name);
+            let kind_label = if inert {
+                "Helper"
+            } else {
+                node.call.kind.as_str()
+            };
+            let kind_style = if inert {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                match node.call.kind {
+                    MacroKind::Functional => Style::default().fg(Color::Cyan),
+                    MacroKind::Attribute => Style::default().fg(Color::Yellow),
+                    MacroKind::Derive => Style::default().fg(Color::Magenta),
+                }
             };
 
             let name_style = if node.expanded {
                 Style::default().fg(Color::Green).bold()
             } else if node.expansion_failed {
                 Style::default().fg(Color::Red)
+            } else if inert {
+                Style::default().fg(Color::DarkGray)
             } else {
                 Style::default().fg(Color::White).bold()
             };
@@ -3734,7 +4014,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
                 Span::raw(indent),
                 Span::raw(branch),
                 Span::raw(collapse_indicator),
-                Span::styled(format!("[{}] ", node.call.kind.as_str()), kind_style),
+                Span::styled(format!("[{}] ", kind_label), kind_style),
                 Span::styled(node.call.name.clone(), name_style),
                 Span::styled(
                     format!(" L{}", node.call.line),
@@ -4850,7 +5130,7 @@ struct A;
 struct B;
 ";
         let source_lines: Vec<String> = source.lines().map(|s| s.to_string()).collect();
-        let (nodes, _) = build_root_nodes(source, &source_lines);
+        let (nodes, _) = build_root_nodes(source, &source_lines, &HelperAttrs::new());
 
         let derives: Vec<&MacroNode> = nodes
             .iter()
@@ -4864,6 +5144,62 @@ struct B;
         assert_ne!(derives[0].derive_group, derives[2].derive_group);
         // The group id is a node id, so it is stable and unique rather than a position.
         assert_eq!(derives[0].derive_group, derives[0].id);
+    }
+
+    /// The reported shape: a derive next to its own helper attribute. `subast` is
+    /// declared by `#[proc_macro_derive(Ast, attributes(subast))]`, never expands, and
+    /// never rewrites the item — yet it was counted as an attribute macro and both
+    /// derives were dropped, leaving nothing on the item but the one node that can
+    /// only ever fail.
+    #[test]
+    fn derives_next_to_a_helper_attribute_are_selectable() {
+        let source = "\
+#[derive(Debug, Ast)]
+#[subast(crate::ast::Line)]
+pub struct Page {
+    pub placed: Vec<(Length, Line)>,
+}
+";
+        let source_lines: Vec<String> = source.lines().map(|s| s.to_string()).collect();
+        // Nothing is known about `subast` yet: this is the state at start-up, before
+        // the build has produced a record, and the derives must be there already.
+        let (nodes, _) = build_root_nodes(source, &source_lines, &HelperAttrs::new());
+        let names: Vec<&str> = nodes.iter().map(|n| n.call.name.as_str()).collect();
+        assert!(names.contains(&"Ast"), "Ast must be selectable: {names:?}");
+        assert!(
+            names.contains(&"Debug"),
+            "Debug must be selectable: {names:?}"
+        );
+        // The helper stays listed: it is in the file, and the list marks it inert
+        // once the trace has said so rather than making it vanish.
+        assert!(names.contains(&"subast"), "{names:?}");
+        assert_eq!(nodes.len(), 3, "{names:?}");
+    }
+
+    /// A helper attribute that precedes an attribute macro on its item must not take
+    /// the item's one attribute-macro slot. It does until the trace has named it,
+    /// which is why the roots are rebuilt when that knowledge arrives.
+    #[test]
+    fn a_known_helper_does_not_take_the_attribute_slot() {
+        let source = "\
+#[derive(Ast)]
+#[subast(crate::ast::Line)]
+#[my_attr]
+pub struct Page;
+";
+        let source_lines: Vec<String> = source.lines().map(|s| s.to_string()).collect();
+        let names = |inert: &HelperAttrs| -> Vec<String> {
+            build_root_nodes(source, &source_lines, inert)
+                .0
+                .iter()
+                .map(|n| n.call.name.clone())
+                .collect()
+        };
+        // Before the trace has spoken, `subast` looks like the item's attribute macro.
+        assert_eq!(names(&HelperAttrs::new()), ["Ast", "subast"]);
+        // Once it is known to be `Ast`'s helper, `my_attr` gets the slot.
+        let inert = HelperAttrs::from([("subast".to_string(), vec!["Ast".to_string()])]);
+        assert_eq!(names(&inert), ["Ast", "subast", "my_attr"]);
     }
 
     #[test]
@@ -5149,6 +5485,7 @@ struct B;
             name: "impl_char".to_string(),
             kind: MacroExpansionKind::Bang,
             input: String::new(),
+            helpers: Vec::new(),
         };
 
         assert!(ExpansionCache::expansion_matches(
@@ -5172,6 +5509,7 @@ struct B;
             name: "foo".to_string(),
             kind: MacroExpansionKind::Bang,
             input: "a".to_string(),
+            helpers: Vec::new(),
         };
 
         assert!(!ExpansionCache::expansion_matches(
@@ -5197,6 +5535,7 @@ struct B;
             name: "mystruct_hello".to_string(),
             kind: MacroExpansionKind::Bang,
             input: String::new(),
+            helpers: Vec::new(),
         };
 
         assert!(ExpansionCache::expansion_matches(
@@ -5223,6 +5562,7 @@ struct B;
             name: "my_attr".to_string(),
             kind: MacroExpansionKind::Attribute,
             input: "fn a() {}".to_string(),
+            helpers: Vec::new(),
         };
 
         let matches = |input: &str, strict: bool| {
@@ -5261,6 +5601,7 @@ struct B;
             name: "Ast".to_string(),
             kind: MacroExpansionKind::Derive,
             input: hook_input.to_string(),
+            helpers: Vec::new(),
         };
         // The item as syn re-renders it (a `# [` split and quoted doc text included).
         let syn_input = "# [doc = \" One `graphics` element.\"] \
@@ -5293,6 +5634,7 @@ struct B;
             name: name.to_string(),
             kind: MacroExpansionKind::Bang,
             input: input.to_string(),
+            helpers: Vec::new(),
         }
     }
 
@@ -5302,6 +5644,7 @@ struct B;
             expansions: Vec::new(),
             normalized: Vec::new(),
             aliases: std::collections::HashMap::new(),
+            helper_attrs: HelperAttrs::new(),
             done: false,
             error: None,
             build_error: None,
@@ -5512,6 +5855,7 @@ struct B;
             name: "__Parse_temporal_9874485626140785372".to_string(),
             kind: MacroExpansionKind::Bang,
             input: "args".to_string(),
+            helpers: Vec::new(),
         };
 
         // Exact match fails
@@ -5560,19 +5904,16 @@ struct B;
 
     /// An `App` over `source` with an idle, empty expansion cache.
     fn test_app(source: &str) -> App {
+        test_app_with(source, Vec::new())
+    }
+
+    /// An `App` over `source` whose finished cache already holds `expansions`.
+    fn test_app_with(source: &str, expansions: Vec<MacroExpansion>) -> App {
         let child = std::process::Command::new("true").spawn().unwrap();
+        let mut inner = cache_inner_of(expansions);
+        inner.done = true;
         let cache = ExpansionCache {
-            inner: Arc::new((
-                Mutex::new(CacheInner {
-                    expansions: Vec::new(),
-                    normalized: Vec::new(),
-                    aliases: std::collections::HashMap::new(),
-                    done: true,
-                    error: None,
-                    build_error: None,
-                }),
-                Condvar::new(),
-            )),
+            inner: Arc::new((Mutex::new(inner), Condvar::new())),
             child: Arc::new(Mutex::new(child)),
         };
         let tm = TraceMacros::new(
@@ -5896,6 +6237,7 @@ struct B;
             kind: MacroExpansionKind::Attribute,
             input: "mod ast { }".to_string(),
             krate: String::new(),
+            helpers: Vec::new(),
         };
         let input = "@ ast $crate::_imp::syan_macro::__visitor_build { @ base {} }";
         let norm_input = cargo_macra::normalize_tokens(input);
@@ -6463,5 +6805,245 @@ struct B;
             "cursor row not on the block footer: {:?}",
             rows
         );
+    }
+
+    /// Append `exp` to the app's cache the way the reader thread would.
+    fn push_expansion(app: &App, exp: MacroExpansion) {
+        let normalized = (
+            cargo_macra::normalize_tokens(&exp.input),
+            cargo_macra::normalize_tokens(&exp.arguments),
+        );
+        let aliases = alias_targets(&exp.to);
+        let (ref mutex, _) = *app.expansion_cache.inner;
+        mutex.lock().unwrap().push(exp, normalized, aliases);
+    }
+
+    /// A hook record for a derive that declares `helpers`.
+    fn derive_expansion(name: &str, input: &str, to: &str, helpers: &[&str]) -> MacroExpansion {
+        MacroExpansion {
+            krate: String::new(),
+            expanding: name.to_string(),
+            arguments: String::new(),
+            to: to.to_string(),
+            name: name.to_string(),
+            kind: MacroExpansionKind::Derive,
+            input: input.to_string(),
+            helpers: helpers.iter().map(|h| h.to_string()).collect(),
+        }
+    }
+
+    /// A hook record for an attribute macro.
+    fn attribute_expansion(name: &str, input: &str, to: &str) -> MacroExpansion {
+        MacroExpansion {
+            krate: String::new(),
+            expanding: input.to_string(),
+            arguments: String::new(),
+            to: to.to_string(),
+            name: name.to_string(),
+            kind: MacroExpansionKind::Attribute,
+            input: input.to_string(),
+            helpers: Vec::new(),
+        }
+    }
+
+    const PAGE: &str = "\
+#[derive(Debug, Ast)]
+#[subast(crate::ast::Line)]
+pub struct Page {
+    pub placed: Vec<(Length, Line)>,
+}
+";
+
+    fn node_names(app: &App) -> Vec<String> {
+        app.visible_nodes
+            .iter()
+            .filter_map(|&id| app.get_node(id))
+            .map(|n| n.call.name.clone())
+            .collect()
+    }
+
+    /// The user's case end to end at the app level: the `Ast` record carries its
+    /// helper, the derive is offered, and expanding it works. The helper itself is
+    /// refused with an explanation instead of failing — nothing went wrong.
+    #[test]
+    fn expanding_the_derive_works_and_its_helper_is_refused_with_a_reason() {
+        let input =
+            "#[subast(crate::ast::Line)] pub struct Page { pub placed: Vec<(Length, Line)>, }";
+        let mut app = test_app_with(
+            PAGE,
+            vec![derive_expansion(
+                "Ast",
+                input,
+                "impl Ast for Page {}",
+                &["subast"],
+            )],
+        );
+        assert_eq!(node_names(&app), ["Debug", "Ast", "subast"]);
+
+        let subast = node_named(&app, "subast");
+        app.expand_node(subast, None);
+        assert_eq!(
+            app.status,
+            "'subast' is a helper attribute of #[derive(Ast)]: it is inert and has no expansion."
+        );
+        assert!(app.error_message.is_none(), "{:?}", app.error_message);
+        let node = app.get_node(subast).unwrap();
+        assert!(!node.expansion_failed && !node.expanded);
+
+        let ast = node_named(&app, "Ast");
+        app.expand_node(ast, None);
+        assert!(app.get_node(ast).unwrap().expanded, "{}", app.status);
+        assert!(
+            app.source_lines
+                .iter()
+                .any(|l| l.contains("impl Ast for Page"))
+        );
+    }
+
+    /// The helper's record can arrive after the file was shown and after the user
+    /// pressed Enter on it: the lookup runs, finds nothing, and the verdict is still
+    /// "inert", not "failed".
+    #[test]
+    fn a_helper_learnt_during_the_lookup_is_still_not_a_failure() {
+        let mut app = test_app(PAGE);
+        push_expansion(
+            &app,
+            derive_expansion("Ast", "unrelated input", "", &["subast"]),
+        );
+        let subast = node_named(&app, "subast");
+        app.expand_node(subast, None);
+        assert!(
+            app.status.contains("helper attribute of #[derive(Ast)]"),
+            "{}",
+            app.status
+        );
+        assert!(app.error_message.is_none());
+        assert!(!app.get_node(subast).unwrap().expansion_failed);
+    }
+
+    /// The guard the old gate provided, kept at expansion time: a derive behind a
+    /// real attribute macro is offered, and when the lookup fails the report says
+    /// why and what to do — instead of a generic "no trace" plus a retry of every
+    /// sibling, which would fail identically.
+    #[test]
+    fn a_derive_behind_an_attribute_macro_is_explained_not_hidden() {
+        let source = "#[my_attr]\n#[derive(Debug, Clone)]\nstruct S;\n";
+        let mut app = test_app_with(
+            source,
+            vec![attribute_expansion(
+                "my_attr",
+                "#[derive(Debug, Clone)] struct S;",
+                "struct S; struct Extra;",
+            )],
+        );
+        assert_eq!(node_names(&app), ["my_attr", "Debug", "Clone"]);
+
+        let debug = node_named(&app, "Debug");
+        app.expand_node(debug, None);
+        let msg = app.error_message.clone().unwrap_or_default();
+        assert!(
+            msg.contains("#[my_attr] is an attribute macro")
+                && msg.contains("Expand #[my_attr] first"),
+            "{msg}"
+        );
+        assert!(app.get_node(debug).unwrap().expansion_failed);
+        // No sibling retry: `Clone` sits behind the same attribute.
+        assert!(
+            !app.get_node(node_named(&app, "Clone"))
+                .unwrap()
+                .expansion_failed
+        );
+    }
+
+    /// An attribute *after* the derive runs on the derive's output, not before it, so
+    /// the derive's input is the source as written and the ordinary lookup applies.
+    #[test]
+    fn an_attribute_macro_after_the_derive_does_not_gate_it() {
+        let source = "#[derive(Debug)]\n#[my_attr]\nstruct S;\n";
+        let mut app = test_app_with(
+            source,
+            vec![
+                attribute_expansion("my_attr", "struct S;", "struct S;"),
+                derive_expansion("Debug", "#[my_attr] struct S;", "impl Debug for S {}", &[]),
+            ],
+        );
+        let debug = node_named(&app, "Debug");
+        app.expand_node(debug, None);
+        assert!(app.get_node(debug).unwrap().expanded, "{}", app.status);
+    }
+
+    /// The trace arrives after the roots were built. While nothing has been touched
+    /// the roots follow it — `my_attr` gains its node and the selection stays on the
+    /// same macro — and once something has been expanded they are left alone.
+    #[test]
+    fn late_helper_knowledge_rebuilds_untouched_roots_only() {
+        let source = "#[derive(Ast)]\n#[subast(X)]\n#[my_attr]\npub struct Page;\n";
+        let mut app = test_app(source);
+        assert_eq!(node_names(&app), ["Ast", "subast"]);
+        // Select `subast` by Tab, with the cursor left on line 1.
+        app.next();
+        assert_eq!(app.selected_node().unwrap().call.name, "subast");
+
+        app.refresh_helper_knowledge();
+        assert_eq!(
+            node_names(&app),
+            ["Ast", "subast"],
+            "nothing learnt, nothing rebuilt"
+        );
+
+        push_expansion(&app, derive_expansion("Ast", "", "", &["subast"]));
+        app.refresh_helper_knowledge();
+        assert_eq!(node_names(&app), ["Ast", "subast", "my_attr"]);
+        assert_eq!(app.selected_node().unwrap().call.name, "subast");
+        assert_eq!(app.status, "Found 3 macros.");
+
+        // Same again, but with `Ast` expanded before the record arrives.
+        let mut app = test_app(source);
+        app.expand_node(node_named(&app, "Ast"), Some("impl Ast for Page {}".into()));
+        let roots_before: Vec<usize> = app.nodes.iter().map(|n| n.id).collect();
+        push_expansion(&app, derive_expansion("Ast", "", "", &["subast"]));
+        app.refresh_helper_knowledge();
+        assert_eq!(app.roots_helper_count, 0, "an expanded tree is not rebuilt");
+        assert_eq!(
+            app.nodes.iter().map(|n| n.id).collect::<Vec<_>>(),
+            roots_before
+        );
+        // The knowledge itself is not lost: the helper is known to the list and to
+        // `expand_node`.
+        assert!(app.inert_attrs.contains_key("subast"));
+    }
+
+    /// Expanding a derive re-discovers the item's attributes as children; the root
+    /// node for `#[subast]` must be swallowed with them, not shown a second time,
+    /// and must come back on undo.
+    #[test]
+    fn expanding_a_derive_does_not_duplicate_the_attributes_on_its_item() {
+        let mut app = test_app(PAGE);
+        let subast = node_named(&app, "subast");
+        let ast = node_named(&app, "Ast");
+        app.expand_node(ast, Some("impl Ast for Page {}".into()));
+        assert!(app.get_node(ast).unwrap().expanded, "{}", app.status);
+        let names = node_names(&app);
+        assert_eq!(
+            names.iter().filter(|n| *n == "subast").count(),
+            1,
+            "{names:?}"
+        );
+        assert_eq!(app.get_node(subast).unwrap().consumed_by, Some(ast));
+        // The visible one is the child, at the line the attribute now sits on.
+        let visible = app
+            .visible_nodes
+            .iter()
+            .filter_map(|&id| app.get_node(id))
+            .find(|n| n.call.name == "subast")
+            .unwrap();
+        assert_eq!(visible.parent_id, Some(ast));
+        assert_eq!(visible.call.line, line_of(&app, "#[subast"));
+
+        select(&mut app, ast);
+        app.undo_selected();
+        assert!(!app.get_node(ast).unwrap().expanded, "{}", app.status);
+        assert_eq!(node_names(&app), ["Debug", "Ast", "subast"]);
+        assert_eq!(app.get_node(subast).unwrap().call.line, 2);
     }
 }

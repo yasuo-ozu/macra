@@ -27,6 +27,8 @@ struct TrampolineSlot {
     krate: String,
     /// Macro kind string
     kind: String,
+    /// A derive's helper attributes; empty for the other kinds.
+    helpers: Vec<String>,
 }
 
 static SLOTS: Mutex<Vec<Option<TrampolineSlot>>> = Mutex::new(Vec::new());
@@ -63,7 +65,7 @@ fn extract_input_handles(input_buf: &[u8], kind: &str) -> Vec<u32> {
 /// 3. Calls the original `run` function with the modified config
 /// 4. Extracts output handle from result and calls to_string (after run, still in session)
 fn trampoline_impl(idx: usize, config: BridgeConfig<'_>) -> Buffer {
-    let (original_run, name, krate, kind) = {
+    let (original_run, name, krate, kind, helpers) = {
         let slots = SLOTS.lock().unwrap();
         match slots.get(idx).and_then(|s| s.as_ref()) {
             Some(slot) => (
@@ -71,6 +73,7 @@ fn trampoline_impl(idx: usize, config: BridgeConfig<'_>) -> Buffer {
                 slot.name.clone(),
                 slot.krate.clone(),
                 slot.kind.clone(),
+                slot.helpers.clone(),
             ),
             None => {
                 eprintln!("[macra-hook] No slot for trampoline index {idx}");
@@ -154,6 +157,7 @@ fn trampoline_impl(idx: usize, config: BridgeConfig<'_>) -> Buffer {
             name,
             krate,
             kind,
+            helpers,
             arguments,
             input,
             output,
@@ -232,6 +236,7 @@ pub unsafe fn intercept_proc_macro_table(dlsym_result: *mut libc::c_void) -> *mu
                     name: trait_name.to_string(),
                     krate: crates.get(i).cloned().unwrap_or_default(),
                     kind: "CustomDerive".to_string(),
+                    helpers: attributes.iter().map(|a| a.to_string()).collect(),
                 });
 
                 new_table.push(ProcMacro::CustomDerive {
@@ -263,6 +268,7 @@ pub unsafe fn intercept_proc_macro_table(dlsym_result: *mut libc::c_void) -> *mu
                     name: name.to_string(),
                     krate: crates.get(i).cloned().unwrap_or_default(),
                     kind: "Attr".to_string(),
+                    helpers: Vec::new(),
                 });
 
                 new_table.push(ProcMacro::Attr {
@@ -280,6 +286,7 @@ pub unsafe fn intercept_proc_macro_table(dlsym_result: *mut libc::c_void) -> *mu
                     name: name.to_string(),
                     krate: crates.get(i).cloned().unwrap_or_default(),
                     kind: "Bang".to_string(),
+                    helpers: Vec::new(),
                 });
 
                 new_table.push(ProcMacro::Bang {
@@ -504,6 +511,7 @@ pub unsafe fn intercept_client_slice_table(dlsym_result: *mut libc::c_void) -> *
                 _ => "Bang",
             }
             .to_string(),
+            helpers: entry.helpers.clone(),
         });
         new_table.push(ClientSlim {
             run: TRAMPOLINE_FNS[slot_idx],

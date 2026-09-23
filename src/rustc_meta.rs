@@ -64,6 +64,11 @@ pub struct ProcMacroEntry {
     /// The name the macro is invoked by: a derive's trait name, otherwise the
     /// function's own name.
     pub name: String,
+    /// A derive's helper attributes (`attributes(..)` in its declaration); empty
+    /// for the other kinds. They are inert — `#[serde(..)]` never expands — and
+    /// the driver needs to know that: it used to take `#[subast(..)]` on a
+    /// `#[derive(Ast)]` item for an attribute macro and hid the derive behind it.
+    pub helpers: Vec<String>,
 }
 
 /// `rust\0\0\0` followed by `METADATA_VERSION`, which is 10 on 1.98 through 1.100.
@@ -363,21 +368,25 @@ fn record_at(blob: &[u8], pos: usize) -> Option<ProcMacroEntry> {
     if !is_identifier(name) {
         return None;
     }
+    let mut helpers = Vec::new();
     if kind == KIND_DERIVE {
         // attributes: Vec<String> — the helper attributes.
-        let helpers = r.leb()?;
-        if helpers > blob.len() {
+        let count = r.leb()?;
+        if count > blob.len() {
             return None;
         }
-        for _ in 0..helpers {
-            if !is_identifier(r.str()?) {
+        for _ in 0..count {
+            let helper = r.str()?;
+            if !is_identifier(helper) {
                 return None;
             }
+            helpers.push(helper.to_string());
         }
     }
     Some(ProcMacroEntry {
         kind,
         name: name.to_string(),
+        helpers,
     })
 }
 
@@ -832,11 +841,12 @@ mod tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
-    fn entries(v: &[(u8, &str)]) -> Vec<ProcMacroEntry> {
+    fn entries(v: &[(u8, &str, &[&str])]) -> Vec<ProcMacroEntry> {
         v.iter()
-            .map(|(k, n)| ProcMacroEntry {
+            .map(|(k, n, h)| ProcMacroEntry {
                 kind: *k,
                 name: n.to_string(),
+                helpers: names(h),
             })
             .collect()
     }
@@ -865,14 +875,14 @@ mod tests {
         "tag_it",
         "last_bang",
     ];
-    const PROBE_ENTRIES: [(u8, &str); 7] = [
-        (KIND_DERIVE, "Frobnicate"),
-        (KIND_DERIVE, "Display"),
-        (KIND_DERIVE, "Serialize"),
-        (KIND_DERIVE, "TwoHelpers"),
-        (KIND_DERIVE, "OldDerive"),
-        (KIND_ATTR, "tag_it"),
-        (KIND_BANG, "last_bang"),
+    const PROBE_ENTRIES: [(u8, &str, &[&str]); 7] = [
+        (KIND_DERIVE, "Frobnicate", &[]),
+        (KIND_DERIVE, "Display", &[]),
+        (KIND_DERIVE, "Serialize", &["serde"]),
+        (KIND_DERIVE, "TwoHelpers", &["alpha", "beta"]),
+        (KIND_DERIVE, "OldDerive", &[]),
+        (KIND_ATTR, "tag_it", &[]),
+        (KIND_BANG, "last_bang", &[]),
     ];
 
     fn probe_macros() -> Vec<Macro> {
@@ -1014,7 +1024,7 @@ mod tests {
     #[test]
     fn disagreeing_counts_fail_closed_and_agreeing_ones_do_not() {
         let fns = names(&["derive_real"]);
-        let real = entries(&[(KIND_DERIVE, "Real")]);
+        let real = entries(&[(KIND_DERIVE, "Real", &[])]);
 
         let mut synth = Synth::new(
             "rustc 1.98.0 (88d9e12ae 2026-08-18)",
@@ -1029,7 +1039,7 @@ mod tests {
         assert_eq!(decode(blob, root, 15, &fns), Some(real.clone()));
         assert_eq!(
             decode(blob, root, 17, &fns),
-            Some(entries(&[(KIND_DERIVE, "Decoy")]))
+            Some(entries(&[(KIND_DERIVE, "Decoy", &[])]))
         );
         assert_eq!(counts_that_decode(&sec, &fns), vec![15, 17]);
         // Together they are a tie, and a tie is refused.

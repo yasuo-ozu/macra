@@ -15,6 +15,11 @@ pub struct ExpansionRecord {
     /// comparison against a bare macro name keeps working.
     pub krate: String,
     pub kind: String,
+    /// A derive's helper attributes, from its `attributes(..)` declaration. Only a
+    /// derive has any, and the field is left out of the line when empty so every
+    /// record that does not need it is byte-identical to what older drivers read.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub helpers: Vec<String>,
     pub arguments: String,
     pub input: String,
     pub output: String,

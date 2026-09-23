@@ -1,4 +1,4 @@
-use test_proc_macros::{Describe, Greet, add_hello_method, make_answer};
+use test_proc_macros::{Describe, Greet, WithHelpers, add_hello_method, make_answer};
 
 // --- MBE macro definitions ---
 
@@ -97,6 +97,16 @@ pub struct MultiDeriveOneAttr;
 #[derive(Greet)]
 #[derive(Describe)]
 pub struct MultiDeriveTwoAttr;
+
+// --- Derive with a helper attribute on the same item ---
+
+// `helper_one` is declared by `#[proc_macro_derive(WithHelpers, attributes(helper_one,
+// helper_two))]`: it is inert, never expands, and the hook must report it on the
+// derive's record so the TUI does not take it for an attribute macro standing in
+// front of the derive.
+#[derive(WithHelpers)]
+#[helper_one]
+pub struct HelperUser;
 
 #[allow(dead_code)]
 pub fn call_generated_path_macros() {

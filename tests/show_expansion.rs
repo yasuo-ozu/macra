@@ -706,6 +706,48 @@ __TAG_ARGS_FOR_MultiAttrStruct : & str = "role = \"primary\"";"#,
 }"#,
     );
 
+    // 19. #[derive(WithHelpers)] on HelperUser: the record names the derive's helper
+    // attributes, on both table layouts (the `ProcMacro` enum through 1.97, the
+    // `.rustc` metadata from 1.98). `#[helper_one]` itself never expands.
+    let with_helpers: Vec<&MacroExpansion> = expansions
+        .iter()
+        .filter(|e| e.kind == MacroExpansionKind::Derive && e.name == "WithHelpers")
+        .collect();
+    assert_eq!(
+        with_helpers.len(),
+        1,
+        "Expected exactly one #[derive(WithHelpers)] expansion: {with_helpers:?}"
+    );
+    assert!(
+        normalize_delimiters(with_helpers[0].input.trim())
+            .contains("#[helper_one] pub struct HelperUser;"),
+        "input: {:?}",
+        with_helpers[0].input
+    );
+    assert_eq!(
+        with_helpers[0].helpers,
+        ["helper_one".to_string(), "helper_two".to_string()]
+    );
+    assert!(
+        !expansions
+            .iter()
+            .any(|e| e.kind == MacroExpansionKind::Attribute && e.name == "helper_one"),
+        "a helper attribute must not be reported as an attribute-macro expansion"
+    );
+    // Every other derive declares none, and the field is not confused across records.
+    assert!(
+        expansions
+            .iter()
+            .filter(|e| e.kind == MacroExpansionKind::Derive && e.name != "WithHelpers")
+            .all(|e| e.helpers.is_empty()),
+        "{:?}",
+        expansions
+            .iter()
+            .filter(|e| !e.helpers.is_empty())
+            .map(|e| (&e.name, &e.helpers))
+            .collect::<Vec<_>>()
+    );
+
     assert_trace_macro_blocks(&expansions);
 }
 

@@ -29,6 +29,13 @@ pub struct MacroExpansion {
     pub kind: MacroExpansionKind,
     /// Raw input token stream that the macro receives.
     pub input: String,
+    /// For a derive, the helper attributes it declares (`attributes(subast)` in
+    /// `#[proc_macro_derive(Ast, attributes(subast))]`). Empty for every other kind
+    /// and for `-Z trace-macros` output, which does not report them. A helper is
+    /// inert: it never expands and never rewrites its item, so the TUI must not
+    /// treat `#[subast(..)]` as an attribute macro standing between the source and
+    /// the derives next to it.
+    pub helpers: Vec<String>,
 }
 
 /// A group of macro expansions from a single `note: trace_macro` block.
@@ -267,6 +274,7 @@ impl<R: Read> TraceParser<R> {
                             name,
                             kind: MacroExpansionKind::Bang,
                             input,
+                            helpers: Vec::new(),
                         });
                         break;
                     } else if to_line.starts_with("note: trace_macro")
