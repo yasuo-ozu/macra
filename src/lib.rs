@@ -10,6 +10,31 @@ pub mod trace_macros;
 /// - Removes spaces adjacent to punctuation (e.g., `a :: b` -> `a::b`)
 /// - Collapses remaining whitespace to a single space
 /// - Normalizes bracket types (`{}`, `[]` -> `()`)
+/// - Folds every doc comment, however it was rendered, to a bare `#(doc)` /
+///   `#!(doc)` marker (see below)
+///
+/// The two sides of a comparison render doc comments differently. rustc hands a
+/// proc macro the item with its doc comments still in `///` form, and that is what
+/// the hook captures; macra's own side re-renders the item through syn, whose
+/// `to_token_stream()` turns each one into `#[doc = "..."]`. An exact input match is
+/// what identifies a derive's expansion, so before this fold no derive on a
+/// documented item could ever be matched -- `#[derive(Debug, Ast)]` on a documented
+/// `pub struct Page` simply had no trace.
+///
+/// The doc *text* is deliberately dropped rather than canonicalised. Keeping it would
+/// mean unescaping the attribute form's string literal exactly as proc-macro2 escaped
+/// it (`\"`, `\\`, `\t`, `\u{..}` for anything non-printable) and then agreeing on
+/// whitespace inside the text, and every case that slipped through would be another
+/// documented item with no trace -- the very failure this fixes. Dropping it means two
+/// items that differ only in their docs now compare equal, which surfaces as the
+/// ambiguity popup: a benign, visible outcome rather than a silent miss. The marker
+/// itself stays so that a documented item and its undocumented twin still differ.
+///
+/// This is a character scan, not a tokenizer, so string literals (including raw
+/// ones), char literals and ordinary comments are stepped over as opaque spans: a
+/// `///` or `#[doc = ...]` inside `"..."` or after `//` is content, not a doc comment.
+/// Those spans otherwise go through the same whitespace and bracket treatment as
+/// before, so text without doc comments normalizes exactly as it always did.
 pub fn normalize_tokens(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
     let mut result = String::with_capacity(chars.len());
@@ -18,8 +43,23 @@ pub fn normalize_tokens(s: &str) -> String {
         !c.is_alphanumeric() && c != '_' && c != '"' && c != '\'' && !c.is_whitespace()
     }
 
+    // Characters below this index belong to a string literal, char literal or plain
+    // comment and are copied without being inspected for doc-comment syntax.
+    let mut opaque_until = 0;
     let mut i = 0;
     while i < chars.len() {
+        if i >= opaque_until {
+            if let Some((inner, end)) = doc_comment_span(&chars, i) {
+                // `#` and `/` are both punctuation, so the whitespace decision already
+                // made for the run preceding this comment holds for the marker too.
+                result.push_str(if inner { "#!(doc)" } else { "#(doc)" });
+                i = end;
+                continue;
+            }
+            if let Some(end) = opaque_span(&chars, i) {
+                opaque_until = end;
+            }
+        }
         let c = chars[i];
         if c.is_whitespace() {
             let prev = result.chars().last();
@@ -43,6 +83,179 @@ pub fn normalize_tokens(s: &str) -> String {
     }
 
     result
+}
+
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// The doc comment starting at `i`, if any, as `(is_inner, end)` with `end` the index
+/// just past it. Recognizes all four forms both sides can produce: `///` and `//!`
+/// (to the end of the line), `/** */` and `/*! */`, and `#[doc = "..."]` /
+/// `#![doc = "..."]` with any whitespace between the tokens, since syn prints the
+/// attribute as `# [doc = "..."]`.
+///
+/// Follows rustc's lexer for what counts as a doc comment: `////` and `/***` are
+/// plain comments, as are `/**/` and `/***/`. `#[doc(hidden)]`, `#[doc(alias = "x")]`
+/// and `#[doc = include_str!(..)]` are not doc comments -- the hook and syn agree on
+/// them already -- and are left for the ordinary scan.
+fn doc_comment_span(chars: &[char], i: usize) -> Option<(bool, usize)> {
+    match chars.get(i)? {
+        '/' => match (chars.get(i + 1)?, chars.get(i + 2)) {
+            ('/', Some('!')) => Some((true, line_end(chars, i))),
+            ('/', Some('/')) if chars.get(i + 3) != Some(&'/') => Some((false, line_end(chars, i))),
+            ('*', Some('!')) => Some((true, block_comment_end(chars, i))),
+            ('*', Some('*')) if !matches!(chars.get(i + 3), Some('*') | Some('/')) => {
+                Some((false, block_comment_end(chars, i)))
+            }
+            _ => None,
+        },
+        '#' => {
+            // syn prints an inner attribute as `# ! [doc = "..."]`, one space per token.
+            let mut j = skip_ws(chars, i + 1);
+            let inner = chars.get(j) == Some(&'!');
+            if inner {
+                j = skip_ws(chars, j + 1);
+            }
+            if chars.get(j) != Some(&'[') {
+                return None;
+            }
+            j = skip_ws(chars, j + 1);
+            if chars.get(j..j + 3) != Some(&['d', 'o', 'c']) {
+                return None;
+            }
+            j += 3;
+            if chars.get(j).copied().is_some_and(is_ident_char) {
+                return None;
+            }
+            j = skip_ws(chars, j);
+            if chars.get(j) != Some(&'=') {
+                return None;
+            }
+            j = skip_ws(chars, j + 1);
+            j = string_literal_end(chars, j)?;
+            j = skip_ws(chars, j);
+            if chars.get(j) != Some(&']') {
+                return None;
+            }
+            Some((inner, j + 1))
+        }
+        _ => None,
+    }
+}
+
+/// The end of the string literal, char literal or plain comment starting at `i`, if
+/// one does. Such a span is copied without being inspected, so the `///` in
+/// `"a /// b"` or in `// see /// here`, and the `"]` in `"a \"]\" b"`, never pass for
+/// doc-comment syntax. `'` is a span only when it opens a char literal (`'"'` is the
+/// case that would otherwise unbalance the quotes); a lifetime is left alone.
+fn opaque_span(chars: &[char], i: usize) -> Option<usize> {
+    match chars[i] {
+        '"' | 'r' | 'b' | 'c' => string_literal_end(chars, i),
+        '\'' => match chars.get(i + 1)? {
+            '\\' => {
+                // Past the escaped character, then to the closing quote: covers `'\''`,
+                // `'\\'`, `'\x41'` and `'\u{1F600}'` alike.
+                let close = (i + 3..chars.len()).find(|&j| chars[j] == '\'')?;
+                Some(close + 1)
+            }
+            _ if chars.get(i + 2) == Some(&'\'') => Some(i + 3),
+            _ => None,
+        },
+        '/' => match chars.get(i + 1)? {
+            '/' => Some(line_end(chars, i)),
+            '*' => Some(block_comment_end(chars, i)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The index just past the string literal starting at `i`, which may be a plain
+/// `"..."` (with `\"` escapes) or a raw `r#"..."#` with any number of hashes, either
+/// with a `b`/`c` prefix. A prefix letter counts only at an identifier boundary, so
+/// the `r` of `bar` or the `b` of `pub` starts nothing. An unterminated literal runs
+/// to the end of the text, keeping the rest opaque rather than half-inspected.
+fn string_literal_end(chars: &[char], i: usize) -> Option<usize> {
+    if chars[i] != '"' && i > 0 && is_ident_char(chars[i - 1]) {
+        return None;
+    }
+    let mut j = i;
+    if matches!(chars[j], 'b' | 'c') {
+        j += 1;
+    }
+    if chars.get(j) == Some(&'r') {
+        let mut k = j + 1;
+        while chars.get(k) == Some(&'#') {
+            k += 1;
+        }
+        if chars.get(k) != Some(&'"') {
+            return None;
+        }
+        let hashes = k - (j + 1);
+        let closes = |k: usize| {
+            chars[k] == '"'
+                && chars
+                    .get(k + 1..k + 1 + hashes)
+                    .is_some_and(|tail| tail.iter().all(|&c| c == '#'))
+        };
+        return Some(
+            (k + 1..chars.len())
+                .find(|&k| closes(k))
+                .map_or(chars.len(), |close| close + 1 + hashes),
+        );
+    }
+    if chars.get(j) != Some(&'"') {
+        return None;
+    }
+    let mut k = j + 1;
+    while k < chars.len() {
+        match chars[k] {
+            '\\' => k += 2,
+            '"' => return Some(k + 1),
+            _ => k += 1,
+        }
+    }
+    Some(chars.len())
+}
+
+fn skip_ws(chars: &[char], mut j: usize) -> usize {
+    while chars.get(j).is_some_and(|c| c.is_whitespace()) {
+        j += 1;
+    }
+    j
+}
+
+/// Index of the newline ending the line comment at `i` (or the end of the text). The
+/// newline itself is left for the whitespace scan.
+fn line_end(chars: &[char], i: usize) -> usize {
+    (i..chars.len())
+        .find(|&j| chars[j] == '\n')
+        .unwrap_or(chars.len())
+}
+
+/// Index just past the block comment opening at `i`. Rust block comments nest, so
+/// `/* a /* b */ c */` is one comment. Unterminated runs to the end of the text.
+fn block_comment_end(chars: &[char], i: usize) -> usize {
+    let mut depth = 0usize;
+    let mut j = i;
+    while j + 1 < chars.len() {
+        match (chars[j], chars[j + 1]) {
+            ('/', '*') => {
+                depth += 1;
+                j += 2;
+            }
+            ('*', '/') => {
+                depth -= 1;
+                j += 2;
+                if depth == 0 {
+                    return j;
+                }
+            }
+            _ => j += 1,
+        }
+    }
+    chars.len()
 }
 
 #[cfg(target_os = "macos")]
@@ -516,6 +729,171 @@ pub fn hook_build_id() -> u64 {
         HOOK_LIB_BYTES.hash(&mut h);
         h.finish()
     })
+}
+
+#[cfg(test)]
+mod normalize_tests {
+    use super::normalize_tokens;
+
+    /// The hook's `///` rendering and syn's `# [doc = "..."]` rendering of one and the
+    /// same item -- the exact pair that left every documented derive without a trace.
+    #[test]
+    fn doc_comment_renderings_compare_equal() {
+        let hook = "/// One `graphics` element.\n#[subast(crate::graphics::GraphicsElem)]\n\
+                    pub enum GraphicsElem { Fill(Color, Path), }";
+        let syn = "# [doc = \" One `graphics` element.\"] \
+                   # [subast (crate :: graphics :: GraphicsElem)] \
+                   pub enum GraphicsElem { Fill (Color , Path) , }";
+        assert_eq!(normalize_tokens(hook), normalize_tokens(syn));
+        assert_eq!(
+            normalize_tokens(hook),
+            "#(doc)#(subast(crate::graphics::GraphicsElem))pub enum GraphicsElem(Fill(Color,Path),)"
+        );
+    }
+
+    /// Each `///` line is one attribute on the syn side, and a `/** */` block is one
+    /// too -- the markers have to line up one for one.
+    #[test]
+    fn multi_line_doc_blocks_fold_line_for_line() {
+        let lines = "/// first\n/// second\n///\n/// fourth\nstruct A;";
+        let attrs =
+            "#[doc = \" first\"] #[doc = \" second\"] #[doc = \"\"] #[doc = \" fourth\"] struct A;";
+        assert_eq!(normalize_tokens(lines), normalize_tokens(attrs));
+        assert_eq!(normalize_tokens(lines), "#(doc)#(doc)#(doc)#(doc)struct A;");
+
+        let block = "/** first\n * second\n */\nstruct A;";
+        let attr = "#[doc = \" first\\n * second\\n \"] struct A;";
+        assert_eq!(normalize_tokens(block), normalize_tokens(attr));
+        assert_eq!(normalize_tokens(block), "#(doc)struct A;");
+    }
+
+    /// A documented item and its undocumented twin are still different inputs; only
+    /// items that differ in nothing but their docs collapse together (by design).
+    #[test]
+    fn doc_text_is_dropped_but_its_presence_is_kept() {
+        assert_eq!(
+            normalize_tokens("/// a\nstruct A;"),
+            normalize_tokens("/// b\nstruct A;")
+        );
+        assert_ne!(
+            normalize_tokens("/// a\nstruct A;"),
+            normalize_tokens("struct A;")
+        );
+    }
+
+    /// `#[doc(alias = "x")]`, `#[doc(hidden)]` and `#[doc = include_str!(..)]` are
+    /// not doc comments and both sides already agree on them; they must pass through
+    /// the ordinary scan untouched.
+    #[test]
+    fn non_comment_doc_attributes_are_left_intact() {
+        assert_eq!(
+            normalize_tokens("#[doc(alias = \"x\")] struct A;"),
+            "#(doc(alias=\"x\"))struct A;"
+        );
+        assert_eq!(
+            normalize_tokens("#[doc(hidden)] struct A;"),
+            "#(doc(hidden))struct A;"
+        );
+        assert_eq!(
+            normalize_tokens("#[doc = include_str!(\"README.md\")] struct A;"),
+            "#(doc=include_str!(\"README.md\"))struct A;"
+        );
+        // `docs` is a different identifier, not `doc` followed by more tokens.
+        assert_eq!(
+            normalize_tokens("#[docs = \"x\"] struct A;"),
+            "#(docs=\"x\")struct A;"
+        );
+    }
+
+    /// The scan is character based, so string literals have to be stepped over: a
+    /// `///` or `//!` inside one is text, and an escaped `\"]` must not end the
+    /// `#[doc = "..."]` early and leave the tail of the literal in the output.
+    #[test]
+    fn string_literals_are_opaque() {
+        assert_eq!(
+            normalize_tokens("const S: &str = \"see /// here\";"),
+            "const S:&str=\"see///here\";"
+        );
+        assert_eq!(
+            normalize_tokens("const S: &str = \"//! not inner\";"),
+            "const S:&str=\"//!not inner\";"
+        );
+        assert_eq!(
+            normalize_tokens("#[doc = \"a \\\"]\\\" b\"] struct A;"),
+            "#(doc)struct A;"
+        );
+        assert_eq!(
+            normalize_tokens("/// He said \"hi\"\nstruct A;"),
+            normalize_tokens("#[doc = \" He said \\\"hi\\\"\"] struct A;")
+        );
+        // Raw strings, with hashes, and a `"#` inside that is not the terminator.
+        assert_eq!(
+            normalize_tokens("#[doc = r##\"a \"# /// b\"##] struct A;"),
+            "#(doc)struct A;"
+        );
+        assert_eq!(
+            normalize_tokens("let s = r#\"x /// y\"#;"),
+            "let s=r#\"x///y\"#;"
+        );
+        // A char literal holding a quote must not open a string.
+        assert_eq!(
+            normalize_tokens("let c = '\"'; /// not a doc\nlet d = '\\'';"),
+            "let c='\"';#(doc)let d='\\'';"
+        );
+        // A lifetime is not a char literal; the string after it is still a string.
+        assert_eq!(
+            normalize_tokens("fn f<'a>(s: &'a str) { \"///\" }"),
+            "fn f<'a>(s:&'a str)(\"///\")"
+        );
+    }
+
+    /// `///` after `//` is part of a plain comment, and `////` is itself plain.
+    #[test]
+    fn plain_comments_are_not_doc_comments() {
+        assert_eq!(
+            normalize_tokens("// see /// this\nstruct A;"),
+            "//see///this struct A;"
+        );
+        assert_eq!(
+            normalize_tokens("//// rule\nstruct A;"),
+            "////rule struct A;"
+        );
+        assert_eq!(normalize_tokens("/**/ struct A;"), "/**/struct A;");
+        assert_eq!(normalize_tokens("/*** x */ struct A;"), "/***x*/struct A;");
+        assert_eq!(
+            normalize_tokens("/* a /** nested */ b */ struct A;"),
+            "/*a/**nested*/b*/struct A;"
+        );
+    }
+
+    /// Inner doc comments (`//!`, `/*! */`) and syn's `# ! [doc = "..."]` fold to a
+    /// distinct inner marker, so inner and outer docs still differ.
+    #[test]
+    fn inner_doc_comments_fold_to_the_inner_marker() {
+        let hook = "mod m {\n    //! Module docs.\n    fn f() {}\n}";
+        let syn = "mod m { # ! [doc = \" Module docs.\"] fn f () { } }";
+        assert_eq!(normalize_tokens(hook), normalize_tokens(syn));
+        assert_eq!(normalize_tokens(hook), "mod m(#!(doc)fn f()())");
+        assert_eq!(
+            normalize_tokens("/*! inner block */ fn f() {}"),
+            normalize_tokens("#![doc = \" inner block \"] fn f() {}")
+        );
+        assert_ne!(
+            normalize_tokens("//! a\nfn f() {}"),
+            normalize_tokens("/// a\nfn f() {}")
+        );
+    }
+
+    /// Text without doc comments normalizes exactly as before the fold was added.
+    #[test]
+    fn plain_text_is_unchanged() {
+        assert_eq!(
+            normalize_tokens("a :: b < T > { x : [ u8 ; 4 ] }"),
+            "a::b<T>(x:(u8;4))"
+        );
+        assert_eq!(normalize_tokens("  foo   bar  "), "foo bar");
+        assert_eq!(normalize_tokens(""), "");
+    }
 }
 
 #[cfg(test)]

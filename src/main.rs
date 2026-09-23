@@ -436,12 +436,17 @@ impl ExpansionCache {
                     .and_then(|rest| rest.strip_prefix(macro_name))
                     .is_some_and(|tail| tail.is_empty() || tail.starts_with('_')));
         let input_matches = if kind == MacroKind::Attribute {
-            // Hook-captured attribute macros serialize doc comments differently than
-            // syn (`///` vs `#[doc = "..."]`), so the inputs legitimately differ and
-            // this comparison cannot simply be required. But skipping it outright
-            // reduces the key to name + arguments, and two bare `#[my_attr]`s on
-            // different items then collide — expanding the second showed the first
-            // one's output. So try the input first and only fall back to ignoring it.
+            // The hook-captured input and syn's re-rendering of the source item can
+            // legitimately differ for an attribute macro, so this comparison cannot
+            // simply be required. Doc comments used to be the visible case (`///` vs
+            // `#[doc = "..."]`); `normalize_tokens` now folds those, and derives — which
+            // compare inputs exactly — rely on that. What remains is stacked
+            // attributes: for `#[a] #[b] fn f() {}` rustc runs `b` on whatever `a`
+            // emitted, while the source-side input for `b` is `#[a] fn f() {}`. But
+            // skipping the comparison outright reduces the key to name + arguments,
+            // and two bare `#[my_attr]`s on different items then collide — expanding
+            // the second showed the first one's output. So try the input first and
+            // only fall back to ignoring it.
             !strict_input || exp_norm_input == norm_input
         } else if exp.input.is_empty() {
             // Either both inputs are empty (normal match), or rustc may
@@ -4709,8 +4714,8 @@ struct B;
     }
 
     /// Two bare `#[my_attr]`s differ only by the item they wrap. The strict pass has
-    /// to tell them apart; the lenient pass still has to accept the doc-comment
-    /// divergence the hook produces (`///` vs `#[doc = "..."]`).
+    /// to tell them apart; the lenient pass still has to accept an input the hook
+    /// captured differently from the source (stacked attribute macros).
     #[test]
     fn attribute_input_is_compared_strictly_first_then_ignored() {
         let exp = MacroExpansion {
@@ -4740,6 +4745,46 @@ struct B;
         assert!(!matches("fn b() {}", true));
         // Lenient fallback: input ignored, as before.
         assert!(matches("fn b() {}", false));
+    }
+
+    /// rustc hands a derive the item with its doc comments still in `///` form; the
+    /// query is built through syn, whose `to_token_stream()` renders them as
+    /// `#[doc = "..."]`. Derives compare inputs exactly, so before `normalize_tokens`
+    /// folded the two renderings no derive on a documented item could ever match --
+    /// `#[derive(Debug, Ast)]` on a documented `pub struct Page` had no trace.
+    #[test]
+    fn derive_on_documented_item_matches_across_doc_renderings() {
+        let hook_input = "/// One `graphics` element.\n#[subast(crate::graphics::GraphicsElem)]\n\
+                          pub enum GraphicsElem { Fill(Color, Path), }";
+        let exp = MacroExpansion {
+            krate: String::new(),
+            expanding: format!("#[derive(Ast)] {hook_input}"),
+            arguments: String::new(),
+            to: "impl Ast for GraphicsElem {}".to_string(),
+            name: "Ast".to_string(),
+            kind: MacroExpansionKind::Derive,
+            input: hook_input.to_string(),
+        };
+        // The item as syn re-renders it (a `# [` split and quoted doc text included).
+        let syn_input = "# [doc = \" One `graphics` element.\"] \
+                         # [subast (crate :: graphics :: GraphicsElem)] \
+                         pub enum GraphicsElem { Fill (Color , Path) , }";
+        let matches = |input: &str| {
+            ExpansionCache::expansion_matches(
+                &exp,
+                input,
+                "",
+                "Ast",
+                MacroKind::Derive,
+                false,
+                true,
+            )
+        };
+        assert!(matches(syn_input));
+        // Still a strict comparison otherwise: a different item does not match.
+        assert!(!matches(
+            "# [doc = \" One `graphics` element.\"] pub enum GraphicsElem { Stroke (Color) , }"
+        ));
     }
 
     fn bang_expansion(name: &str, input: &str, to: &str) -> MacroExpansion {
