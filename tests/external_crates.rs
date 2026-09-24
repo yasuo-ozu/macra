@@ -76,7 +76,32 @@ fn min_rustc_for_crate(repo: &str) -> u32 {
     }
 }
 
+/// Whether macra claims to capture proc macros with this rustc on this target.
+///
+/// Reported once. Every crate here asserts on hook output, so on a combination macra
+/// does not claim — Windows at 1.98+, where the slice table is not implemented — the
+/// callers treat an empty result as a skip rather than failing for support that was
+/// never promised.
+fn capture_claimed() -> bool {
+    static CLAIMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CLAIMED.get_or_init(|| {
+        let claimed = cargo_macra::proc_macro_capture_supported()
+            .expect("could not probe `rustc -vV`; refusing to skip the suite silently");
+        if !claimed {
+            eprintln!(
+                "skipping external_crate proc-macro tests: macra claims no bridge ABI \
+                 for this rustc on this target"
+            );
+        }
+        claimed
+    })
+}
+
 fn run_trace_for_repo(repo: &str, test: Option<&str>) -> Vec<MacroExpansion> {
+    if !capture_claimed() {
+        return Vec::new();
+    }
+
     // Serialize tests per repo so parallel `cargo check` processes don't race
     // over the same target directory (prevents flaky hook-output loss on Windows).
     let _lock = repo_lock(repo).lock().unwrap_or_else(|e| e.into_inner());

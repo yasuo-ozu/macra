@@ -594,6 +594,46 @@ fn parse_ymd(s: &str) -> Option<(u32, u32, u32)> {
     parts.next().is_none().then_some((year, month, day))
 }
 
+/// Whether the rustc that will run the build is one macra can capture proc macros
+/// from, or `None` when the compiler could not be probed at all.
+///
+/// Both halves matter: the version must map to a bridge ABI *and* this target must be
+/// able to drive that ABI's table (see `client_slice_drivable`). The test suite uses
+/// this to skip proc-macro assertions on a combination macra does not claim, rather
+/// than reporting a wall of failures for support that was never promised.
+///
+/// `None` is kept distinct from `Some(false)`: a missing or broken `rustc` means
+/// "unknown", not "unsupported", and collapsing the two would let an environment fault
+/// turn the suite green by skipping everything.
+pub fn proc_macro_capture_supported() -> Option<bool> {
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let out = std::process::Command::new(rustc).arg("-vV").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let version = parse_rustc_version(&String::from_utf8_lossy(&out.stdout))?;
+    Some(bridge_abi_for(version).is_some())
+}
+
+/// Whether this build can actually drive the 1.98+ client-slice table.
+///
+/// The layout is mapped from 1.98 on, but driving it needs the symbol and `.rustc`
+/// reads that only the unix path implements: `hook_windows.rs` refuses `ClientSlice`
+/// outright and hands rustc its own table back. Claiming support that the hook then
+/// declines turns what used to be a clean skip into a wall of failures — on Windows CI
+/// at 1.98, `show_expansion` captured nothing at all and 45 of 46 external-crate tests
+/// failed, while every `<=1.97` cell on the same runner passed.
+///
+/// linux-aarch64 is excluded for a different and less understood reason: the same CI
+/// run captured the workspace's own proc macros there (`show_expansion` green) but
+/// none of the external crates' (45 of 46 failed), while macOS aarch64 and linux
+/// x86_64 were clean. Until that gap is explained it is not support macra can promise.
+/// Losing capture is recoverable; reporting nothing where the user was told to expect
+/// expansions is not.
+const fn client_slice_drivable() -> bool {
+    cfg!(unix) && !cfg!(all(target_os = "linux", target_arch = "aarch64"))
+}
+
 /// Which bridge shape this rustc exposes, or `None` when it is one macra has not
 /// been verified against.
 ///
@@ -642,6 +682,14 @@ pub fn bridge_abi_for(v: RustcVersion) -> Option<BridgeAbi> {
     // misjudged; rustup never shipped one.)
     const FLAT_100_LANDED: (u32, u32, u32) = (2026, 8, 31);
     let abi = |table, rpc| Some(BridgeAbi { table, rpc });
+    // Only claimed where the hook can actually drive it — see `client_slice_drivable`.
+    let slice = |rpc| {
+        if client_slice_drivable() {
+            abi(TableLayout::ClientSlice, rpc)
+        } else {
+            None
+        }
+    };
     match (v.major, v.minor) {
         // A pre-release's number does not say which side of an ABI change it is on.
         // rustc's master bumps its minor when the previous beta branches, so every
@@ -677,7 +725,7 @@ pub fn bridge_abi_for(v: RustcVersion) -> Option<BridgeAbi> {
         // hand-driving the hook with `slice,flat,9,10`: 1.98.0 and 1.99.0-beta.7 both
         // exit 0 with all fourteen bang, attribute and derive expansions intercepted
         // and no panic.
-        (1, 98..=99) => abi(TableLayout::ClientSlice, FLAT_95),
+        (1, 98..=99) => slice(FLAT_95),
         // A 1.100 pre-release is a boundary case like 95: the tag shift landed sixteen
         // days into the cycle, so `1.100.0-nightly` names both numberings. Unlike 95
         // the landing is pinned to a day (`FLAT_100_LANDED`), so the commit-date
@@ -686,7 +734,7 @@ pub fn bridge_abi_for(v: RustcVersion) -> Option<BridgeAbi> {
         // nightly from those sixteen days is not one anybody is still building with.
         // An undated line (`(unknown)`) is unmapped for the same reason.
         (1, 100) if v.prerelease => match v.commit_date {
-            Some(date) if date >= FLAT_100_LANDED => abi(TableLayout::ClientSlice, FLAT_100),
+            Some(date) if date >= FLAT_100_LANDED => slice(FLAT_100),
             _ => None,
         },
         // A stable 1.100 necessarily contains the merge — its beta branches from master
@@ -704,7 +752,7 @@ pub fn bridge_abi_for(v: RustcVersion) -> Option<BridgeAbi> {
         // own table back untouched, and nothing of ours ever issues an RPC — so a tag
         // numbering that has since shifted is never exercised. Being wrong here costs
         // capture, not a live compiler, for exactly as long as that gate stays honest.
-        (1, 100..) => abi(TableLayout::ClientSlice, FLAT_100),
+        (1, 100..) => slice(FLAT_100),
         // Anything newer is unverified. Guessing does not fail cleanly, see above.
         _ => None,
     }
@@ -1019,9 +1067,18 @@ mod abi_tests {
             from_str: 8,
             to_string: 9,
         };
-        let slice = |rpc| BridgeAbi {
-            table: TableLayout::ClientSlice,
-            rpc,
+        // Mirrors `client_slice_drivable`: on a target whose hook cannot drive the
+        // slice table, 1.98+ is deliberately claimed as unsupported, and asserting
+        // `Some(..)` here would fail on exactly the platforms the gate exists for.
+        let slice = |rpc| {
+            if client_slice_drivable() {
+                Some(BridgeAbi {
+                    table: TableLayout::ClientSlice,
+                    rpc,
+                })
+            } else {
+                None
+            }
         };
 
         // The table stayed an enum through 1.97, but 1.95 flattened the RPC tags —
@@ -1043,13 +1100,9 @@ mod abi_tests {
         // 1.98 swapped the table for a slice of `Client`s and kept the 1.95 tags; 1.99
         // touched neither. 1.100 dropped `injected_env_var` and both tags moved down.
         for minor in 98..=99 {
-            assert_eq!(
-                bridge_abi_for(v(minor, false)),
-                Some(slice(flat_95)),
-                "1.{minor}"
-            );
+            assert_eq!(bridge_abi_for(v(minor, false)), slice(flat_95), "1.{minor}");
         }
-        assert_eq!(bridge_abi_for(v(100, false)), Some(slice(flat_100)));
+        assert_eq!(bridge_abi_for(v(100, false)), slice(flat_100));
 
         // Every nightly of a cycle carries the same number, so `1.95.0-nightly` names
         // both a nested-tag and a flat-tag compiler (nightly-2026-01-22 vs
@@ -1076,8 +1129,15 @@ mod abi_tests {
             (97, flat_95),
             (99, flat_95),
         ] {
-            let abi = bridge_abi_for(v(minor, true))
-                .unwrap_or_else(|| panic!("1.{minor} pre-release is not at an ABI boundary"));
+            let Some(abi) = bridge_abi_for(v(minor, true)) else {
+                // 1.99 needs the slice table, which some targets cannot drive; that is
+                // the gate doing its job, not a missing boundary.
+                assert!(
+                    minor >= 98 && !client_slice_drivable(),
+                    "1.{minor} pre-release is not at an ABI boundary"
+                );
+                continue;
+            };
             assert_eq!(abi.rpc, rpc, "1.{minor}-nightly");
         }
         // 1.100 is a boundary whose landing day is known (the shift merged on
@@ -1105,7 +1165,7 @@ mod abi_tests {
         for date in [(2026, 8, 31), (2026, 9, 7), (2026, 10, 1)] {
             assert_eq!(
                 bridge_abi_for(dated(date)),
-                Some(slice(flat_100)),
+                slice(flat_100),
                 "a 1.100 pre-release dated {date:?} has the shifted tags"
             );
         }
@@ -1114,7 +1174,7 @@ mod abi_tests {
         for minor in [101, 120] {
             assert_eq!(
                 bridge_abi_for(v(minor, false)),
-                Some(slice(flat_100)),
+                slice(flat_100),
                 "1.{minor} should be attempted with the newest verified shape"
             );
         }
@@ -1128,7 +1188,7 @@ mod abi_tests {
                 prerelease: true,
                 commit_date: Some((2026, 9, 30)),
             }),
-            Some(slice(flat_100))
+            slice(flat_100)
         );
         // Below the client-slice layout there is nothing to guess with: 1.85 and older
         // predate every table shape the hook knows. (The driver refuses those outright
@@ -1148,14 +1208,18 @@ mod abi_tests {
 
     #[test]
     fn abi_round_trips_through_the_handshake() {
+        // 98 and 100 are only claimed where the slice table is drivable, so skip them
+        // rather than `expect` on a target that deliberately reports no ABI.
         for minor in [86, 95, 97, 98, 100] {
-            let abi = bridge_abi_for(RustcVersion {
+            let Some(abi) = bridge_abi_for(RustcVersion {
                 major: 1,
                 minor,
                 prerelease: false,
                 commit_date: None,
-            })
-            .expect("supported");
+            }) else {
+                assert!(minor >= 98 && !client_slice_drivable(), "1.{minor}");
+                continue;
+            };
             assert_eq!(BridgeAbi::from_env(&abi.as_env()), Some(abi), "1.{minor}");
         }
         // The tag numbering has to survive the round trip, not just the shape.

@@ -112,8 +112,18 @@ fn run_show_expansion_test_usage() -> Vec<MacroExpansion> {
     expansions
 }
 
+/// Whether macra claims proc-macro capture with this rustc on this target.
+fn capture_claimed() -> bool {
+    cargo_macra::proc_macro_capture_supported()
+        .expect("could not probe `rustc -vV`; refusing to skip the assertions silently")
+}
+
 #[test]
 fn show_expansion() {
+    if !capture_claimed() {
+        eprintln!("skipping: macra claims no bridge ABI for this rustc on this target");
+        return;
+    }
     let expansions = run_show_expansion_test_usage();
     assert!(!expansions.is_empty(), "Expected macro expansions.",);
 
@@ -524,6 +534,10 @@ fn show_expansion() {
 /// crate.  Each assertion verifies the caller, input, and output verbatim.
 #[test]
 fn test_usage_expansion() {
+    if !capture_claimed() {
+        eprintln!("skipping: macra claims no bridge ABI for this rustc on this target");
+        return;
+    }
     let expansions = run_show_expansion_test_usage();
 
     // =================================================================
