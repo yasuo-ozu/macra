@@ -13,7 +13,7 @@
 //! returns `None` for anything older or for any byte that does not match. The one
 //! way those releases differ from each other — how many `LazyArray` fields precede
 //! `proc_macro_data` — is not looked up by version but discovered, see
-//! [`LAZY_ARRAY_COUNTS`], so a later release that only adds or drops such a field
+//! `LAZY_ARRAY_COUNTS`, so a later release that only adds or drops such a field
 //! keeps decoding. The caller then reports no names rather than wrong ones.
 //!
 //! # Layout
