@@ -2134,6 +2134,33 @@ impl App {
         Some((node.call.col_start, end.max(node.call.col_start + 1)))
     }
 
+    /// Character-column ranges on `line` of the macros that can still be expanded.
+    ///
+    /// Underlined in the source pane so a reader can see where the tool will do
+    /// something before trying. Deliberately excludes what it would refuse: a node
+    /// already expanded, one whose lookup ran the trace to completion without a match,
+    /// and the inert ones (a compiler built-in derive, a derive's helper attribute).
+    /// A pending lookup still counts — until the stream ends, an absent record proves
+    /// nothing, and promising too little is as misleading as promising too much.
+    fn expandable_spans_on(&self, line: usize) -> Vec<(usize, usize)> {
+        let mut spans: Vec<(usize, usize)> = self
+            .visible_nodes
+            .iter()
+            .filter_map(|&id| self.get_node(id))
+            .filter(|n| !n.expanded && !n.expansion_failed)
+            .filter(|n| {
+                let inert = n.call.kind == MacroKind::Attribute
+                    && self.inert_attrs.contains_key(&n.call.name);
+                !inert && !self.is_builtin_derive(n.call.kind, &n.call.krate, &n.call.name)
+            })
+            .filter_map(|n| Self::node_col_span(n, line))
+            .filter(|(s, e)| e > s)
+            .collect();
+        spans.sort_unstable();
+        spans.dedup();
+        spans
+    }
+
     /// The cursor position that puts the source cursor on `node` itself: its own line
     /// (`derive_line` for derives — the line `node_col_span` keys their span on, which
     /// differs from `call.line` in a multi-line `#[derive(...)]` list) and the start of
@@ -4262,6 +4289,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
                 i + 1,
                 cursor_line,
                 sel_span,
+                &app.expandable_spans_on(i + 1),
             ));
         }
         row += 1;
@@ -4527,7 +4555,7 @@ fn fit_to_width(s: &str, w: usize) -> String {
 /// Syntax-highlight `text` into spans that own their content, so callers can pass
 /// temporaries (padded/truncated cells) rather than borrowing from `source_lines`.
 fn highlight_owned(text: &str, base: Style) -> Vec<Span<'static>> {
-    highlight_spans(text, base, None)
+    highlight_spans(text, base, None, &[])
         .into_iter()
         .map(|s| Span::styled(s.content.into_owned(), s.style))
         .collect()
@@ -4540,6 +4568,8 @@ fn render_plain_line(
     display_idx: usize,
     cursor_line: usize,
     sel_span: Option<(usize, usize)>,
+    // Character-column ranges of macros on this line that can still be expanded.
+    underline: &[(usize, usize)],
 ) -> Line<'static> {
     let is_cursor = display_idx == cursor_line;
     let is_expanded = origin.is_none();
@@ -4575,7 +4605,7 @@ fn render_plain_line(
     let sel = sel_span.filter(|_| is_cursor);
     let mut spans = vec![Span::styled(line_num_str, line_num_style)];
     spans.extend(
-        highlight_spans(line, base_style, sel)
+        highlight_spans(line, base_style, sel, underline)
             .into_iter()
             .map(|s| Span::styled(s.content.into_owned(), s.style)),
     );
@@ -4748,7 +4778,12 @@ fn token_style(kind: pretty::TokenKind) -> Style {
 /// given, that half-open range of *character* columns is instead rendered as the
 /// selected-macro marker (black on yellow), splitting tokens if it lands inside
 /// one.
-fn highlight_spans<'a>(line: &'a str, base: Style, sel: Option<(usize, usize)>) -> Vec<Span<'a>> {
+fn highlight_spans<'a>(
+    line: &'a str,
+    base: Style,
+    sel: Option<(usize, usize)>,
+    underline: &[(usize, usize)],
+) -> Vec<Span<'a>> {
     let sel_style = base.patch(Style::default().fg(Color::Black).bg(Color::Yellow).bold());
     let mut spans: Vec<Span<'a>> = Vec::new();
     let mut push = |text: &'a str, style: Style| {
@@ -4762,20 +4797,56 @@ fn highlight_spans<'a>(line: &'a str, base: Style, sel: Option<(usize, usize)>) 
         let text = &line[range];
         let len = text.chars().count();
         let style = base.patch(token_style(kind));
-        match sel {
-            // Clamp the selection into this token's own column space; the
-            // helper is character-based, so multi-byte text is safe.
-            Some((cs, ce)) if ce > cs && ce > col && cs < col + len => {
-                let (a, b, c) = split_at_cols(
-                    text,
-                    cs.saturating_sub(col).min(len),
-                    ce.saturating_sub(col).min(len),
-                );
-                push(a, style);
-                push(b, sel_style);
-                push(c, style);
+
+        // Split the token wherever the underline turns on or off. A macro's columns
+        // rarely line up with token boundaries — `vec` inside `&vec![1]` is part of a
+        // larger run — so marking it means cutting the token, not restyling it whole.
+        let mut edges: Vec<usize> = vec![0, len];
+        for &(us, ue) in underline {
+            if ue > col && us < col + len {
+                edges.push(us.saturating_sub(col).min(len));
+                edges.push(ue.saturating_sub(col).min(len));
             }
-            _ => push(text, style),
+        }
+        edges.sort_unstable();
+        edges.dedup();
+
+        for w in edges.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let (_, piece, _) = split_at_cols(text, a, b);
+            let abs = col + a;
+            let width = b - a;
+            let marked = underline.iter().any(|&(us, ue)| us <= abs && abs < ue);
+            let piece_style = if marked {
+                style.add_modifier(Modifier::UNDERLINED)
+            } else {
+                style
+            };
+            match sel {
+                // Clamp the selection into this piece's own column space; the helper
+                // is character-based, so multi-byte text is safe.
+                Some((cs, ce)) if ce > cs && ce > abs && cs < abs + width => {
+                    let (x, y, z) = split_at_cols(
+                        piece,
+                        cs.saturating_sub(abs).min(width),
+                        ce.saturating_sub(abs).min(width),
+                    );
+                    push(x, piece_style);
+                    // The selected macro is still expandable, so it keeps the
+                    // underline under the cursor highlight rather than appearing to
+                    // lose it the moment it is selected.
+                    push(
+                        y,
+                        if marked {
+                            sel_style.add_modifier(Modifier::UNDERLINED)
+                        } else {
+                            sel_style
+                        },
+                    );
+                    push(z, piece_style);
+                }
+                _ => push(piece, piece_style),
+            }
         }
         col += len;
     }
@@ -5562,7 +5633,7 @@ pub struct Page;
     #[test]
     fn highlight_spans_colors_each_token_separately() {
         let line = "    pub fn f() { foo!(\"s\"); } // c";
-        let spans = highlight_spans(line, Style::default(), None);
+        let spans = highlight_spans(line, Style::default(), None, &[]);
         assert_eq!(spans_text(&spans), line);
         let colored = |text: &str| {
             spans
@@ -5587,7 +5658,7 @@ pub struct Page;
     #[test]
     fn highlight_spans_keeps_the_base_background() {
         let base = Style::default().bg(Color::DarkGray).bold();
-        let spans = highlight_spans("let x = 1;", base, None);
+        let spans = highlight_spans("let x = 1;", base, None, &[]);
         assert!(spans.iter().all(|s| s.style.bg == Some(Color::DarkGray)));
         assert!(spans.iter().any(|s| s.style.fg == Some(Color::Blue)));
     }
@@ -5596,7 +5667,7 @@ pub struct Page;
     fn highlight_spans_marks_the_selected_macro_columns() {
         let line = "#[derive(Greet, Describe)]";
         let start = line.find("Describe").unwrap();
-        let spans = highlight_spans(line, Style::default(), Some((start, start + 8)));
+        let spans = highlight_spans(line, Style::default(), Some((start, start + 8)), &[]);
         assert_eq!(spans_text(&spans), line);
         let marked: Vec<&str> = spans
             .iter()
@@ -5618,7 +5689,7 @@ pub struct Page;
         // with multi-byte text before the range, byte offsets would mis-split.
         let line = "let s = \"日本語\"; foo!();";
         let start = line.chars().position(|c| c == 'f').unwrap();
-        let spans = highlight_spans(line, Style::default(), Some((start, start + 4)));
+        let spans = highlight_spans(line, Style::default(), Some((start, start + 4)), &[]);
         assert_eq!(spans_text(&spans), line);
         let marked: String = spans
             .iter()
@@ -7406,6 +7477,75 @@ pub struct Page {
         assert!(
             !app.is_builtin_derive(MacroKind::Derive, "", "Debug"),
             "a traced Debug is an ordinary derive"
+        );
+    }
+
+    /// The source pane underlines what Enter would act on, so a reader can see where
+    /// the tool will do something without trying every macro in the file.
+    #[test]
+    fn expandable_macros_are_underlined_in_the_source() {
+        let mut app = test_app("fn t() {\n    foo!(1);\n}\n");
+        app.absorb_trace_knowledge();
+        let buf = render(&mut app, 100, 20);
+
+        // Text of every underlined run in the source pane, by row.
+        let mut marked: Vec<String> = Vec::new();
+        for y in 0..buf.area.height {
+            let mut run = String::new();
+            for x in 0..buf.area.width {
+                let cell = &buf[(x, y)];
+                if cell.modifier.contains(Modifier::UNDERLINED) {
+                    run.push_str(cell.symbol());
+                } else if !run.is_empty() {
+                    marked.push(std::mem::take(&mut run));
+                }
+            }
+            if !run.is_empty() {
+                marked.push(std::mem::take(&mut run));
+            }
+        }
+        assert!(
+            marked.iter().any(|m| m.contains("foo")),
+            "the expandable `foo!` should be underlined; underlined runs = {marked:?}"
+        );
+        // Ordinary code is not underlined.
+        assert!(
+            !marked.iter().any(|m| m.contains("fn t")),
+            "only macros are underlined; got {marked:?}"
+        );
+
+        // What macra would refuse is not underlined: a compiler built-in derive gets
+        // no promise, while the proc-macro derive beside it does.
+        let mut app = test_app("#[derive(Debug, Greet)]\npub struct S;\n");
+        app.absorb_trace_knowledge();
+        let buf = render(&mut app, 100, 20);
+        let mut marked = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                let cell = &buf[(x, y)];
+                if cell.modifier.contains(Modifier::UNDERLINED) {
+                    marked.push_str(cell.symbol());
+                }
+            }
+        }
+        assert!(
+            marked.contains("Greet"),
+            "the proc-macro derive should be underlined; got {marked:?}"
+        );
+        // Asserted on the ranges rather than the rendered cells: `Debug` is also the
+        // selected node here, and the cursor highlight would hide an underline that
+        // was wrongly emitted, letting this pass for the wrong reason.
+        let spans = app.expandable_spans_on(1);
+        let debug_cols = app
+            .visible_nodes
+            .iter()
+            .filter_map(|&id| app.get_node(id))
+            .find(|n| n.call.name == "Debug")
+            .map(|n| (n.call.col_start, n.call.col_end))
+            .expect("Debug node");
+        assert!(
+            !spans.contains(&debug_cols),
+            "a built-in derive must not be offered; spans={spans:?} debug={debug_cols:?}"
         );
     }
 }
