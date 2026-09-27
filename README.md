@@ -96,7 +96,8 @@ cargo macra expand
 ```
 
 Unlike `cargo-expand`, you can expand *one macro at a time*. `cargo macra list`
-numbers what is expandable:
+numbers what can be expanded (compiler built-ins and derive helper attributes are
+left out, since they have no expansion to show):
 
 ```bash
 $ cargo macra list

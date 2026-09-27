@@ -5390,7 +5390,7 @@ fn parse_selector(raw: &str) -> Selector<'_> {
 /// them — `--macro Ast` means "the first `Ast` here". A number is the way to reach a
 /// later one. Only a selector matching nothing at all is an error, and it lists what
 /// would have worked.
-fn resolve_one(app: &App, candidates: &[usize], raw: &str) -> io::Result<usize> {
+fn resolve_one(app: &App, candidates: &[usize], hidden: &[usize], raw: &str) -> io::Result<usize> {
     let leaf = |id: usize| {
         app.get_node(id)
             .map(|n| macro_leaf(&n.call.name).to_string())
@@ -5423,6 +5423,23 @@ fn resolve_one(app: &App, candidates: &[usize], raw: &str) -> io::Result<usize> 
     } else {
         names.join(", ")
     };
+    // A name that matches something `list` deliberately leaves out gets the reason
+    // rather than "no such macro", which would be true but unhelpful: the macro is
+    // right there in the source, it simply has no expansion to show.
+    if let Selector::Name(name) = parse_selector(raw) {
+        for &id in hidden {
+            if leaf(id) == name {
+                let tag = app
+                    .get_node(id)
+                    .and_then(|n| app.unexpandable_tag(n))
+                    .unwrap_or("not expandable");
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("'{name}' is a {tag}: it has no expansion, so it is not listed"),
+                ));
+            }
+        }
+    }
     Err(io::Error::new(
         io::ErrorKind::InvalidInput,
         format!("no macro matches --macro '{raw}' here (available: {numbers}; names: {names})"),
@@ -5440,21 +5457,26 @@ fn resolve_one(app: &App, candidates: &[usize], raw: &str) -> io::Result<usize> 
 ///
 /// `list` then prints the macros this returns; `expand` prints the buffer they sit in.
 fn walk_macro_path(app: &mut App, selectors: &[String]) -> io::Result<MacroPath> {
-    let mut frontier: Vec<usize> = app.nodes.iter().map(|n| n.id).collect();
+    // Split every level into what can be expanded and what cannot. `list` shows only
+    // the former and numbers it 1..n, and `--macro` resolves against that same list —
+    // they have to be the one list, or a number the user read off `list` would index
+    // something else here.
+    let split = |app: &App, ids: Vec<usize>| -> (Vec<usize>, Vec<usize>) {
+        ids.into_iter().partition(|&id| {
+            app.get_node(id)
+                .map(|n| app.unexpandable_tag(n).is_none())
+                .unwrap_or(false)
+        })
+    };
+    let all: Vec<usize> = app.nodes.iter().map(|n| n.id).collect();
+    let (mut frontier, mut hidden) = split(app, all);
     let mut last = None;
     for raw in selectors {
-        let id = resolve_one(app, &frontier, raw)?;
+        let id = resolve_one(app, &frontier, &hidden, raw)?;
         let name = app
             .get_node(id)
             .map(|n| n.call.name.clone())
             .unwrap_or_default();
-        // Asked for by name, so it gets a reason rather than an empty result.
-        if let Some(tag) = app.get_node(id).and_then(|n| app.unexpandable_tag(n)) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("'{name}' is a {tag}: there is no expansion to look inside"),
-            ));
-        }
         app.expand_node(id, None);
         let (expanded, children) = match app.get_node(id) {
             Some(n) => (n.expanded, n.children.clone()),
@@ -5481,7 +5503,9 @@ fn walk_macro_path(app: &mut App, selectors: &[String]) -> io::Result<MacroPath>
             return Err(io::Error::other(why));
         }
         last = Some(id);
-        frontier = children;
+        let split_children = split(app, children);
+        frontier = split_children.0;
+        hidden = split_children.1;
     }
     Ok(MacroPath { frontier, last })
 }
@@ -5493,8 +5517,13 @@ struct MacroPath {
     last: Option<usize>,
 }
 
-/// `cargo macra list`: number the macros on offer, in source order, marking the ones
-/// macra already knows it cannot expand instead of hiding them.
+/// `cargo macra list`: number the macros that can be expanded, in source order.
+///
+/// Macros macra already knows have no expansion — compiler built-in derives, derive
+/// helper attributes — are left out entirely rather than listed and marked. They are
+/// excluded from the numbered list `--macro` resolves against too, so the numbers here
+/// and the numbers a selector accepts cannot drift apart. Naming one of them explicitly
+/// still gets a reason rather than "no such macro" (see `resolve_one`).
 ///
 /// With no `--macro` those are the file's own macros. With `--macro` it first walks
 /// that path (see `walk_macro_path`) and lists the macros found *inside* the last
@@ -5527,10 +5556,7 @@ fn run_list(args: &Args) -> io::Result<()> {
             node.call.name,
             node.call.line,
         );
-        match app.unexpandable_tag(node) {
-            Some(tag) => println!("{line}  [{tag}, not expandable]"),
-            None => println!("{line}"),
-        }
+        println!("{line}");
         if args.context > 0 {
             print_context(&app, id, args.context);
         }
@@ -8481,8 +8507,8 @@ pub struct Page {
         let at = |i: usize| app.get_node(frontier[i]).unwrap().call.name.clone();
 
         // A number is 1-based over exactly that list.
-        assert_eq!(resolve_one(&app, &frontier, "1").unwrap(), frontier[0]);
-        assert_eq!(resolve_one(&app, &frontier, "3").unwrap(), frontier[2]);
+        assert_eq!(resolve_one(&app, &frontier, &[], "1").unwrap(), frontier[0]);
+        assert_eq!(resolve_one(&app, &frontier, &[], "3").unwrap(), frontier[2]);
 
         // A name takes the FIRST macro with that name, not every one of them: there
         // are two `Greet`s here, and a later one is reachable only by number.
@@ -8491,11 +8517,14 @@ pub struct Page {
             .copied()
             .find(|&id| app.get_node(id).unwrap().call.name == "Greet")
             .unwrap();
-        assert_eq!(resolve_one(&app, &frontier, "Greet").unwrap(), first_greet);
+        assert_eq!(
+            resolve_one(&app, &frontier, &[], "Greet").unwrap(),
+            first_greet
+        );
         assert_ne!(at(0), "Greet", "fixture should not start with Greet");
 
         // Nothing matched is an error that says what would have.
-        let err = resolve_one(&app, &frontier, "nope").unwrap_err();
+        let err = resolve_one(&app, &frontier, &[], "nope").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("no macro matches"), "{msg}");
         assert!(
@@ -8503,8 +8532,8 @@ pub struct Page {
             "should name the available names: {msg}"
         );
         // A number past the end is the same kind of refusal, not a silent clamp.
-        assert!(resolve_one(&app, &frontier, "99").is_err());
-        assert!(resolve_one(&app, &frontier, "0").is_err());
+        assert!(resolve_one(&app, &frontier, &[], "99").is_err());
+        assert!(resolve_one(&app, &frontier, &[], "0").is_err());
     }
 
     /// With no selectors the walk expands nothing and offers the file's own macros, so
