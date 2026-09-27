@@ -105,6 +105,18 @@ $ cargo macra list
   3. derive  Greet  (line 30)
 ```
 
+Add `-C N` to see the surrounding source, so an entry can be recognised without
+opening the file:
+
+```bash
+$ cargo macra list -C 2
+  3. derive  Greet  (line 30)
+          28 │ 
+          29 │ // Derive macro (emits format! + stringify!)
+      >   30 │ #[derive(Greet)]
+          31 │ pub struct Greeter;
+```
+
 `--macro` then picks one, by number or by name (the first macro with that name):
 
 ```bash

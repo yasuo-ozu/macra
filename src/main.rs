@@ -81,12 +81,19 @@ struct Args {
     /// (`cargo macra -- expand`) so it is not mistaken for that subcommand.
     module: Option<String>,
 
-    /// Select which macro(s) `list`/`expand` operate on: a 1-based number from
-    /// `list`'s output, or a macro name matched on its last path segment (so
-    /// `syan::visit::Ast` is selectable as `Ast`). Repeatable; a name selects every
-    /// macro with that name. Ignored — and rejected — outside `list`/`expand`.
+    /// Select which macro `list`/`expand` operate on: a 1-based number from `list`'s
+    /// output, or a macro name matched on its last path segment (so `syan::visit::Ast`
+    /// is selectable as `Ast`, and a name takes the first such macro). Repeat it to go
+    /// one level deeper — each step picks from the macros inside the previous step's
+    /// expansion. Rejected outside `list`/`expand`.
     #[arg(long = "macro", value_name = "SELECTOR")]
     macro_selectors: Vec<String>,
+
+    /// With `list`, also print this many source lines either side of each macro, so an
+    /// entry can be recognised without opening the file. 0 (the default) prints just
+    /// the one-line entries.
+    #[arg(short = 'C', long, value_name = "N", default_value_t = 0)]
+    context: usize,
 
     /// Additional arguments to pass to cargo, after a literal `--`
     /// (e.g. `cargo macra expand foo -- --release`).
@@ -5099,6 +5106,15 @@ fn run_main() -> io::Result<()> {
         ));
     }
 
+    // Same reasoning for `--context`: it shapes `list`'s output and has nowhere to go
+    // anywhere else, so accepting it silently would suggest it did something.
+    if args.context > 0 && verb != Some(Verb::List) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--context requires the `list` subcommand",
+        ));
+    }
+
     match verb {
         Some(Verb::List) => return run_list(&args),
         Some(Verb::Expand) => return run_expand(&args),
@@ -5515,8 +5531,58 @@ fn run_list(args: &Args) -> io::Result<()> {
             Some(tag) => println!("{line}  [{tag}, not expandable]"),
             None => println!("{line}"),
         }
+        if args.context > 0 {
+            print_context(&app, id, args.context);
+        }
     }
     Ok(())
+}
+
+/// The 0-based line window `print_context` prints: `(first, centre, last)`, inclusive,
+/// clamped to the buffer.
+///
+/// Separated from the printing so the arithmetic is testable: a window at the very first
+/// or last line of a file is where an off-by-one would show up, and that is invisible in
+/// a printed block.
+fn context_window(app: &App, id: usize, context: usize) -> Option<(usize, usize, usize)> {
+    let node = app.get_node(id)?;
+    if app.source_lines.is_empty() {
+        return None;
+    }
+    let (own_line, _) = App::node_cursor_pos(node);
+    let centre = own_line.saturating_sub(1).min(app.source_lines.len() - 1);
+    Some((
+        centre.saturating_sub(context),
+        centre,
+        (centre + context).min(app.source_lines.len() - 1),
+    ))
+}
+
+/// The lines around one macro, so a listing entry can be recognised without opening the
+/// file.
+///
+/// Centred on the line the macro's *name* sits on rather than `call.line`: for a
+/// `#[derive(A,\n  B)]` spanning several lines those differ, and centring on the
+/// attribute's first line can push the derive being listed out of the window entirely.
+///
+/// The lines come from the current buffer, not from disk — under `list --macro` that
+/// buffer already has the outer macro expanded, which is the whole point: the context
+/// shown is the code the numbers refer to.
+fn print_context(app: &App, id: usize, context: usize) {
+    let Some((first, centre, last)) = context_window(app, id, context) else {
+        return;
+    };
+    for idx in first..=last {
+        let Some(text) = app.source_lines.get(idx) else {
+            continue;
+        };
+        // `>` marks which line in the window the macro is actually on — the entry's own
+        // `(line N)` says which, but scanning for it in a block of code is work the
+        // marker does instead. It cannot tell two derives of one `#[derive(A, B)]`
+        // apart; they share a line, so their windows are identical by nature.
+        let marker = if idx == centre { '>' } else { ' ' };
+        println!("      {marker}{:>5} │ {}", idx + 1, text);
+    }
 }
 
 /// Just the lines one expanded macro now occupies — its own output, including
@@ -8458,5 +8524,32 @@ pub struct Page {
             app.source_lines, before,
             "nothing should have been expanded"
         );
+    }
+
+    /// `-C N` clamps at both ends of the file instead of underflowing or running past
+    /// the last line — the two places an off-by-one here would panic or print nothing.
+    #[test]
+    fn a_context_window_clamps_at_both_ends_of_the_file() {
+        // The macro is on line 1, so a window of 3 has nothing above it.
+        let app = test_app("foo!();\nlet a = 1;\nlet b = 2;\n");
+        let first_id = app.nodes[0].id;
+        let (first, centre, last) = context_window(&app, first_id, 3).unwrap();
+        assert_eq!((first, centre), (0, 0), "must not underflow past line 1");
+        assert_eq!(
+            last,
+            app.source_lines.len() - 1,
+            "must stop at the last line, not past it"
+        );
+
+        // A window of 0 is the macro's own line only.
+        assert_eq!(context_window(&app, first_id, 0).unwrap(), (0, 0, 0));
+
+        // And a macro at the end clamps the other way.
+        let app = test_app("let a = 1;\nlet b = 2;\nfoo!();\n");
+        let last_macro = app.nodes.last().unwrap().id;
+        let (first, centre, last) = context_window(&app, last_macro, 5).unwrap();
+        assert_eq!(first, 0);
+        assert_eq!(last, app.source_lines.len() - 1);
+        assert_eq!(centre, 2, "centred on the macro's own line");
     }
 }
