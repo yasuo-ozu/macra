@@ -218,6 +218,14 @@ struct MacroNode {
     original_lines: Vec<String>,
     /// The expanded content (if expanded)
     expanded_content: Option<String>,
+    /// Lines of `expanded_content`, counted from its start, that are this macro's
+    /// own output — the markers and the content between them, never a trailing
+    /// sibling `#[derive(..)]` line, a rescued item tail, or a bare trailing
+    /// fragment. 0 (meaningless) until `expanded` is set; see the computation of
+    /// `own_trailing_lines` in `expand_node` for what it excludes and why.
+    /// Deliberately not read by `actual_expanded_line_count` or `shift_nodes` —
+    /// only by `print_expanded_region`'s printing path.
+    own_expanded_line_count: usize,
     /// Child node IDs
     children: Vec<usize>,
     /// Whether children are visible (collapsed/expanded in tree view)
@@ -420,6 +428,12 @@ struct CacheInner {
     /// proc-macro bridge, so the hook cannot record it — from `derive_more::Debug`,
     /// which is a proc macro and does leave a record under that same name.
     traced_derives: std::collections::HashSet<String>,
+    /// Every name an attribute-macro record has been pushed under — the same idea
+    /// as `traced_derives`, one level up: what tells `#[test]` from `std`/`core`
+    /// (rustc expands it itself, inside the compiler, never through the
+    /// proc-macro bridge) from a user's own `#[proc_macro_attribute] fn test`,
+    /// which does leave a record under that same name.
+    traced_attrs: std::collections::HashSet<String>,
     done: bool,
     error: Option<String>,
     /// Stored build failure message (non-zero exit from cargo check).
@@ -443,6 +457,9 @@ impl CacheInner {
                     owners.push(exp.name.clone());
                 }
             }
+        }
+        if exp.kind == MacroExpansionKind::Attribute {
+            self.traced_attrs.insert(exp.name.clone());
         }
         self.expansions.push(exp);
         self.normalized.push(normalized);
@@ -726,6 +743,7 @@ impl ExpansionCache {
                 aliases: std::collections::HashMap::new(),
                 helper_attrs: HelperAttrs::new(),
                 traced_derives: std::collections::HashSet::new(),
+                traced_attrs: std::collections::HashSet::new(),
                 done: false,
                 error: None,
                 build_error: None,
@@ -1379,6 +1397,13 @@ impl ExpansionCache {
         mutex.lock().unwrap().traced_derives.clone()
     }
 
+    /// The names attribute-macro records have arrived under so far (see
+    /// `CacheInner::traced_attrs`). Non-blocking, like `helper_attributes`.
+    fn traced_attrs(&self) -> std::collections::HashSet<String> {
+        let (ref mutex, _) = *self.inner;
+        mutex.lock().unwrap().traced_attrs.clone()
+    }
+
     /// Whether the trace holds an attribute-macro expansion invoked as `name`.
     fn attribute_macro_seen(&self, name: &str) -> bool {
         let (ref mutex, _) = *self.inner;
@@ -1478,6 +1503,9 @@ struct App {
     /// tell a compiler built-in derive from a proc macro sharing its name — see
     /// `is_builtin_derive`.
     traced_derives: std::collections::HashSet<String>,
+    /// Every attribute name the trace has recorded an expansion under — the same
+    /// role as `traced_derives`, one level up. Read by `is_builtin_attr`.
+    traced_attrs: std::collections::HashSet<String>,
     /// Whether the expansion stream has ended. Until it has, a derive name with no
     /// record is merely unclassified, not proved to be a compiler built-in.
     trace_finished: bool,
@@ -1763,6 +1791,54 @@ fn is_builtin_derive(name: &str) -> bool {
     )
 }
 
+/// Whether `name` is a compiler built-in *attribute* macro — one rustc genuinely
+/// expands (as opposed to a marker like `#[inline]` or `#[repr]` that is never
+/// expanded at all and is filtered out before it ever gets a node; see
+/// `macro_finder::is_builtin_attribute`). `#[test]` is the motivating case: it
+/// rewrites the function it sits on into a test descriptor and a wrapper, entirely
+/// inside the compiler, so — like the derives in `is_builtin_derive` — no call
+/// crosses the proc-macro bridge and no lookup for it can ever succeed.
+///
+/// From rustc's own `register_attr!` list in
+/// `rustc_builtin_macros::register_builtin_macros` (checked against `master` as of
+/// this writing): `test`, `bench`, `test_case`, `cfg_eval`, `cfg_accessible`,
+/// `alloc_error_handler`, `derive_const`. Left out of that list on purpose:
+/// `derive` itself, which `syn` always parses as `#[derive(..)]` and which
+/// therefore never reaches here as an ordinary attribute node; `global_allocator`,
+/// which is already excluded before it gets a node at all (see
+/// `macro_finder::is_builtin_attribute`) and so never reaches this check either;
+/// and a handful of nightly-only experiments gated behind their own unstable
+/// features (`autodiff_forward`/`autodiff_reverse`, `define_opaque`, `eii` and its
+/// siblings, `offload_kernel`) that have no stable surface to reproduce against and
+/// whose omission costs nothing worse than the ordinary "no trace found" message.
+///
+/// `panic_handler` is included even though it is not in rustc's `register_attr!`
+/// list — it is a plain marker rustc recognises by name, like `automatically_derived`,
+/// not something it expands — because unlike `automatically_derived` it was never
+/// added to `macro_finder::is_builtin_attribute` either, so it fell through the same
+/// crack `#[test]` did: an ordinary node, a lookup with nothing to find. Naming it
+/// here costs nothing (the evidence check below still requires no trace to have
+/// arrived under it) and gets it the same "built-in, no expansion" message instead
+/// of a bare "no such macro" or a failed lookup.
+///
+/// A name here is only a hint, never a verdict on its own — the same caveat
+/// `is_builtin_derive` carries, for the same reason: a crate can name its own
+/// `#[proc_macro_attribute]` `test`, and that does leave a trace record, so callers
+/// pair this with `CacheInner::traced_attrs` (see `App::is_builtin_attr`).
+fn is_builtin_attr_macro(name: &str) -> bool {
+    matches!(
+        name,
+        "test"
+            | "bench"
+            | "test_case"
+            | "cfg_eval"
+            | "cfg_accessible"
+            | "alloc_error_handler"
+            | "derive_const"
+            | "panic_handler"
+    )
+}
+
 /// The last segment of a macro path as the source spells it: `syan :: visit :: Ast`
 /// (a `MacroCall::name` is the path's token text) is the derive `Ast`.
 fn macro_leaf(name: &str) -> &str {
@@ -1781,6 +1857,15 @@ fn builtin_derive_status(name: &str, others: &[String]) -> String {
         status.push_str(&format!(" Proc-macro derives here: {}.", others.join(", ")));
     }
     status
+}
+
+/// Status line for an attempt to expand a compiler built-in attribute macro —
+/// `builtin_derive_status`'s counterpart for `#[test]` and friends.
+fn builtin_attr_status(name: &str) -> String {
+    format!(
+        "'{}' is a compiler built-in attribute: rustc expands it itself and leaves no trace.",
+        name
+    )
 }
 
 /// Build the top-level macro nodes for one file.
@@ -1885,6 +1970,7 @@ fn build_root_nodes(
             expansion_failed: false,
             original_lines,
             expanded_content: None,
+            own_expanded_line_count: 0,
             children: Vec::new(),
             children_visible: true,
             original_line_origins: Vec::new(),
@@ -1913,6 +1999,7 @@ impl App {
         // that already holds records (a test's, or a fast rebuild) is honoured.
         let inert_attrs = expansion_cache.helper_attributes();
         let traced_derives = expansion_cache.traced_derives();
+        let traced_attrs = expansion_cache.traced_attrs();
         let roots_helper_count = inert_attrs.len();
         let (nodes, next_id) = build_root_nodes(&source, &source_lines, &inert_attrs);
 
@@ -1946,6 +2033,7 @@ impl App {
             inert_attrs,
             roots_helper_count,
             traced_derives,
+            traced_attrs,
             trace_finished: false,
             split_view: false,
         };
@@ -1974,8 +2062,8 @@ impl App {
             .add_aliases(source_aliases_in_tree(starts));
     }
 
-    /// Merge what the trace has reported so far into `inert_attrs` and
-    /// `traced_derives`.
+    /// Merge what the trace has reported so far into `inert_attrs`,
+    /// `traced_derives` and `traced_attrs`.
     fn absorb_trace_knowledge(&mut self) {
         for (helper, owners) in self.expansion_cache.helper_attributes() {
             let known = self.inert_attrs.entry(helper).or_default();
@@ -1987,6 +2075,8 @@ impl App {
         }
         self.traced_derives
             .extend(self.expansion_cache.traced_derives());
+        self.traced_attrs
+            .extend(self.expansion_cache.traced_attrs());
         self.trace_finished = self.expansion_cache.stream_done();
     }
 
@@ -2011,9 +2101,25 @@ impl App {
             && self.trace_finished
     }
 
+    /// `is_builtin_derive`'s counterpart for attribute macros: whether `name` of
+    /// `kind`, reached through `krate`, is a compiler built-in attribute rustc
+    /// expands itself, given everything the trace has said so far. Same evidence
+    /// rule, same reason for it — a name in `is_builtin_attr_macro` is a hint, not
+    /// a verdict, because a crate can define its own `#[proc_macro_attribute] fn
+    /// test`, and that leaves a `traced_attrs` record under the same name.
+    fn is_builtin_attr(&self, kind: MacroKind, krate: &str, name: &str) -> bool {
+        let leaf = macro_leaf(name);
+        kind == MacroKind::Attribute
+            && matches!(krate, "" | "std" | "core")
+            && is_builtin_attr_macro(leaf)
+            && !self.traced_attrs.contains(leaf)
+            && self.trace_finished
+    }
+
     /// The short reason `node` cannot be expanded — a derive's own helper attribute
-    /// (inert; never runs) or a compiler built-in derive (rustc expands it itself and
-    /// leaves no trace) — or `None` when it is an ordinary macro a lookup might find.
+    /// (inert; never runs), a compiler built-in derive, or a compiler built-in
+    /// attribute (the latter two: rustc expands them itself and leaves no trace) —
+    /// or `None` when it is an ordinary macro a lookup might find.
     ///
     /// The single place both checks live, so `expandable_spans_on` (which decides
     /// what gets underlined in the source) and the `list`/`expand` subcommands
@@ -2026,6 +2132,9 @@ impl App {
         }
         if self.is_builtin_derive(node.call.kind, &node.call.krate, &node.call.name) {
             return Some("builtin derive");
+        }
+        if self.is_builtin_attr(node.call.kind, &node.call.krate, &node.call.name) {
+            return Some("builtin attribute");
         }
         None
     }
@@ -2867,6 +2976,14 @@ impl App {
                     return;
                 }
 
+                // Same reasoning, one level up: `#[test]` and its kin have no trace
+                // by nature, so an empty lookup means "compiler built-in", not
+                // "expansion failed".
+                if self.is_builtin_attr(kind, &krate, &name) {
+                    self.status = builtin_attr_status(macro_leaf(&name));
+                    return;
+                }
+
                 // Mark as failed and show error
                 if let Some(node) = self.get_node_mut(node_id) {
                     node.expansion_failed = true;
@@ -3138,6 +3255,31 @@ impl App {
             (lines, num_lines_removed)
         };
 
+        // How many lines at the *end* of `formatted_lines` are not this macro's own
+        // output: the sibling `#[derive(..)]` line for the derives of one
+        // `#[derive(A, B)]` that are still unexpanded, and/or the item text rescued
+        // onto its own line when the attribute and its item shared one line
+        // (`derive_tail`) — or, for a single-line functional macro, a bare trailing
+        // fragment left after the call (the `;` of `make_answer!(get_answer);` used
+        // as a statement). All of these are appended after the `// -- end name --`
+        // marker so the buffer keeps showing them and the rest of `expand_node`
+        // keeps treating them as part of this expansion's line count (undo, child
+        // discovery, `shift_nodes` all depend on that — see `actual_expanded_line_count`,
+        // which is left untouched on purpose). But none of them are what this macro
+        // produced, and `print_expanded_region` — which prints one macro's own
+        // result for `expand --macro N` — wants only the block the markers bracket.
+        let own_trailing_lines: usize = match kind {
+            MacroKind::Functional => usize::from(tail_rebase.is_some()),
+            MacroKind::Derive => {
+                usize::from(!remaining_derives.is_empty()) + usize::from(!derive_tail.is_empty())
+            }
+            MacroKind::Attribute => 0,
+        };
+        let own_expanded_line_count = formatted_lines
+            .len()
+            .saturating_sub(own_trailing_lines)
+            .max(1);
+
         // expanded_content stores full output including markers (for correct undo line count)
         // content_for_parsing is just the code (for finding child macros)
         // For derive macros, include expansion + remaining derives + remaining attrs + item
@@ -3305,6 +3447,7 @@ impl App {
             // expanded, and permanently excluded it from the derive-sibling retry.
             node.expansion_failed = false;
             node.expanded_content = Some(expanded_content.clone());
+            node.own_expanded_line_count = own_expanded_line_count;
             node.original_lines = replaced_lines;
             node.original_line_origins = replaced_origins;
             node.tail_relocation_snapshot = tail_relocation;
@@ -3404,6 +3547,7 @@ impl App {
                 expansion_failed: false,
                 original_lines: child_original_lines,
                 expanded_content: None,
+                own_expanded_line_count: 0,
                 children: Vec::new(),
                 children_visible: true,
                 original_line_origins: Vec::new(),
@@ -3441,6 +3585,48 @@ impl App {
             .as_ref()
             .map(|c| c.lines().count().max(1))
             .unwrap_or(1);
+
+        let children = node.children.clone();
+        let child_delta: isize = children
+            .iter()
+            .filter_map(|&cid| self.get_node(cid))
+            .filter(|c| c.expanded)
+            .map(|c| {
+                let actual = self.actual_expanded_line_count(c.id) as isize;
+                let original = c.original_lines.len().max(1) as isize;
+                actual - original
+            })
+            .sum();
+
+        (base_count as isize + child_delta) as usize
+    }
+
+    /// Lines belonging to `node`'s own expansion when it is printed standalone —
+    /// `expand --macro N`'s "just this macro's result", as opposed to
+    /// `actual_expanded_line_count`'s "how much of the buffer this node's presence
+    /// currently accounts for".
+    ///
+    /// Grows with expanded descendants exactly like `actual_expanded_line_count`
+    /// does — a deeper `--macro` step still has to show up in the printed region —
+    /// but starts from `own_expanded_line_count` instead of the full
+    /// `expanded_content`, so a trailing sibling `#[derive(..)]` line or rescued
+    /// item tail on `node` itself never leaks into the printed block. A *child*'s
+    /// own such trailing lines are not stripped here: they are still real text
+    /// sitting inside `node`'s region in the buffer, between `node`'s start and end
+    /// markers, so the region printed for `node` has to keep enclosing them (only
+    /// the outermost, selected node's own trailing lines are foreign to what the
+    /// user asked to see).
+    ///
+    /// Deliberately a separate method rather than a parameter on
+    /// `actual_expanded_line_count`: that function's result also drives undo and
+    /// `shift_nodes`, where the trailing lines are not foreign at all — they are
+    /// exactly what has to be removed/shifted along with the rest.
+    fn printed_expansion_line_count(&self, node_id: usize) -> usize {
+        let node = match self.get_node(node_id) {
+            Some(n) => n,
+            None => return 0,
+        };
+        let base_count = node.own_expanded_line_count.max(1);
 
         let children = node.children.clone();
         let child_delta: isize = children
@@ -4322,10 +4508,12 @@ fn ui(frame: &mut Frame, app: &mut App) {
             // the user wondering why an attribute in the source has no node.
             let inert = node.call.kind == MacroKind::Attribute
                 && app.inert_attrs.contains_key(&node.call.name);
-            // A compiler built-in derive is the same kind of thing — in the source,
-            // never expandable — and gets the same treatment, unless the trace has
-            // shown a proc macro answering to its name (`derive_more::Debug`).
-            let builtin = app.is_builtin_derive(node.call.kind, &node.call.krate, &node.call.name);
+            // A compiler built-in derive — or attribute, like `#[test]` — is the
+            // same kind of thing — in the source, never expandable — and gets the
+            // same treatment, unless the trace has shown a proc macro answering to
+            // its name (`derive_more::Debug`, or a crate's own `#[test]`).
+            let builtin = app.is_builtin_derive(node.call.kind, &node.call.krate, &node.call.name)
+                || app.is_builtin_attr(node.call.kind, &node.call.krate, &node.call.name);
             let inert = inert || builtin;
             let kind_label = if builtin {
                 "Builtin"
@@ -5172,6 +5360,52 @@ struct ProgressState {
     cache: Option<Arc<(Mutex<CacheInner>, Condvar)>>,
 }
 
+/// Trim `s` to at most `w` *display* columns, dropping trailing characters (never
+/// bytes — a wide glyph counts as one `char` but occupies two cells). No ellipsis
+/// and no padding: the progress line already clears itself with `\x1b[2K` before
+/// every redraw, so a line shorter than the terminal needs nothing appended, and
+/// appending anything — even an ellipsis — would itself be one more column to fit
+/// inside the budget `progress_line_budget` already trims for.
+fn truncate_to_width(s: &str, w: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in s.chars() {
+        let cw = ch.width().unwrap_or(0);
+        if used + cw > w {
+            break;
+        }
+        out.push(ch);
+        used += cw;
+    }
+    out
+}
+
+/// How many display columns the progress line may use without risking a wrap.
+///
+/// The drawn line is one row redrawn in place with `\r\x1b[2K`, which only clears
+/// the row the cursor ends up on — a line that wraps leaves its overflow rows sitting
+/// above in scrollback forever, contradicting this type's own doc comment ("leaving
+/// the output the command actually produced and nothing else"). `stty cols 40`
+/// reproduces it: the drawn text (~63 columns with a long phase and an expansion
+/// count) wraps onto two rows, and only the second is ever cleared.
+///
+/// One column short of the terminal's reported width, not the width itself: whether
+/// a line that exactly fills the last column counts as "full" or is already
+/// considered wrapped is the classic auto-margin (`xenl`) ambiguity, and terminals
+/// disagree. Falling short by one column costs nothing visible and holds the
+/// invariant — one physical row, always — regardless of which behavior this
+/// terminal has. Falls back to 80, the traditional default, on the rare terminal
+/// that answers `is_terminal()` but not a size query; that can only ever be too
+/// conservative on a wider terminal, never risk a wrap on a narrower one.
+fn progress_line_budget() -> usize {
+    crossterm::terminal::size()
+        .map(|(cols, _)| cols as usize)
+        .unwrap_or(80)
+        .saturating_sub(1)
+        .max(1)
+}
+
 impl Progress {
     fn new(phase: &str) -> Self {
         use std::io::IsTerminal;
@@ -5208,15 +5442,16 @@ impl Progress {
                     Some(n) => format!(" — {n} expansions"),
                     None => String::new(),
                 };
-                let mut err = std::io::stderr();
-                let _ = write!(
-                    err,
-                    "\r\x1b[2K{} {}{} ({:.0}s)",
+                let full = format!(
+                    "{} {}{} ({:.0}s)",
                     FRAMES[i % FRAMES.len()],
                     phase,
                     detail,
                     start.elapsed().as_secs_f32()
                 );
+                let line = truncate_to_width(&full, progress_line_budget());
+                let mut err = std::io::stderr();
+                let _ = write!(err, "\r\x1b[2K{line}");
                 let _ = err.flush();
                 i += 1;
                 std::thread::sleep(std::time::Duration::from_millis(100));
@@ -5517,6 +5752,56 @@ struct MacroPath {
     last: Option<usize>,
 }
 
+/// The message `list`/`expand` report, on top of whatever they already printed,
+/// when `cargo check` itself failed.
+///
+/// Before this, a broken crate made both commands exit 0: `run_expand`'s
+/// no-selector loop already printed `Build Error: cargo check failed, so 'vec' was
+/// not expanded.` for the one macro it happened to try and then fell through to
+/// `print_buffer` and `Ok(())`, and `run_list` never consulted the build result at
+/// all — a build that never produced a trace mostly reads as "unclassified" to
+/// `is_builtin_derive`/`is_builtin_attr` until the stream ends, and ends up looking
+/// like a file with nothing to expand ("No macros found."), not a failure. Neither
+/// shape is what a build failure is: this is "the output above is incomplete", a
+/// different statement from "this one macro had no trace" (an ordinary, expected
+/// outcome the rest of the run is deliberately built to shrug off — one macro's
+/// missing or ambiguous trace must not abort the whole file). So this message names
+/// the build failure specifically, and is only ever produced for that case.
+///
+/// A pure string builder — not the `io::Error` itself — so the wording is
+/// unit-testable without going anywhere near a real `cargo check` (`run_list` and
+/// `run_expand` are the only callers, and both of them shell out to one).
+fn build_failure_message(build_err: &str) -> String {
+    format!(
+        "cargo check failed, so the output above is incomplete — this is not the \
+         same as one macro having no trace.\n\n{build_err}"
+    )
+}
+
+/// The one-line summary `run_list` prints for `node` at position `idx + 1`.
+///
+/// Pulled out of `run_list`'s loop as a pure function so the exact line it
+/// produces — in particular, which line number it names — is unit-testable
+/// without a real `cargo check`.
+///
+/// The line printed here has to be the same one `print_context`/`-C` centres on,
+/// or the number in the header can point outside the block shown under it.
+/// `context_window` centres on `App::node_cursor_pos`, which uses `derive_line`
+/// rather than `call.line` for a derive — the two differ as soon as a
+/// `#[derive(...)]` list spans more than one line, since every derive in it
+/// shares `call.line` (the attribute's opening line) but has its own
+/// `derive_line` (the line its own name sits on).
+fn list_entry_line(idx: usize, node: &MacroNode) -> String {
+    let (own_line, _) = App::node_cursor_pos(node);
+    format!(
+        "{:>3}. {:<8}{}  (line {})",
+        idx + 1,
+        node.call.kind.as_str(),
+        node.call.name,
+        own_line,
+    )
+}
+
 /// `cargo macra list`: number the macros that can be expanded, in source order.
 ///
 /// Macros macra already knows have no expansion — compiler built-in derives, derive
@@ -5534,6 +5819,11 @@ fn run_list(args: &Args) -> io::Result<()> {
     let mut progress = Progress::new("Starting");
     let mut app = load_app_headless(args, &progress)?;
     progress.finish();
+    // Read once, before `walk_macro_path` can fail its own way (a selector that
+    // matches nothing once the build left no trace to match against) — that path
+    // already exits non-zero, but not with this message, so it is captured here to
+    // be reported at every exit from this function, not just the one below.
+    let build_err = app.expansion_cache.build_error();
     let frontier = walk_macro_path(&mut app, &args.macro_selectors)?.frontier;
 
     if frontier.is_empty() {
@@ -5542,6 +5832,9 @@ fn run_list(args: &Args) -> io::Result<()> {
         } else {
             println!("No macros inside that expansion.");
         }
+        if let Some(build_err) = build_err {
+            return Err(io::Error::other(build_failure_message(&build_err)));
+        }
         return Ok(());
     }
 
@@ -5549,17 +5842,13 @@ fn run_list(args: &Args) -> io::Result<()> {
         let Some(node) = app.get_node(id) else {
             continue;
         };
-        let line = format!(
-            "{:>3}. {:<8}{}  (line {})",
-            idx + 1,
-            node.call.kind.as_str(),
-            node.call.name,
-            node.call.line,
-        );
-        println!("{line}");
+        println!("{}", list_entry_line(idx, node));
         if args.context > 0 {
             print_context(&app, id, args.context);
         }
+    }
+    if let Some(build_err) = build_err {
+        return Err(io::Error::other(build_failure_message(&build_err)));
     }
     Ok(())
 }
@@ -5614,13 +5903,18 @@ fn print_context(app: &App, id: usize, context: usize) {
 /// Just the lines one expanded macro now occupies — its own output, including
 /// anything a deeper `--macro` step expanded inside it.
 ///
-/// `actual_expanded_line_count` is what makes the nesting work: it grows the region by
-/// whatever the children added, so the range still covers the whole result rather than
-/// cutting it off at the original output's length.
+/// `printed_expansion_line_count` is what makes the nesting work: it grows the region
+/// by whatever the children added, so the range still covers the whole result rather
+/// than cutting it off at the original output's length. Unlike
+/// `actual_expanded_line_count` (which this used to call directly), it excludes a
+/// trailing sibling `#[derive(..)]` line or rescued item tail that belongs to the
+/// buffer, not to `id`'s own expansion — printing `--macro 13` for `Greet` in
+/// `#[derive(Greet, Describe)]` used to end with `#[derive(Describe)]`, a macro the
+/// user never selected.
 fn print_expanded_region(app: &App, id: usize, color: bool) {
     let Some(node) = app.get_node(id) else { return };
     let start = node.call.line.saturating_sub(1);
-    let len = app.actual_expanded_line_count(id).max(1);
+    let len = app.printed_expansion_line_count(id).max(1);
     let end = (start + len).min(app.source_lines.len());
     let mut text = app.source_lines[start.min(end)..end].join("\n");
     text.push('\n');
@@ -5672,6 +5966,11 @@ fn run_expand(args: &Args) -> io::Result<()> {
     let mut app = load_app_headless(args, &progress)?;
     progress.finish();
     let color = args.color.resolve();
+    // Read once, before anything below can fail its own way — see
+    // `build_failure_message` for why a build failure gets its own message instead
+    // of folding into whatever the ordinary "no trace"/"ambiguous" paths already
+    // report.
+    let build_err = app.expansion_cache.build_error();
 
     // `--macro` names a path, so expand exactly it and stop: each further `--macro` is
     // how the user asks to go one level deeper, which would be meaningless if this
@@ -5684,6 +5983,9 @@ fn run_expand(args: &Args) -> io::Result<()> {
         // (with any deeper `--macro` steps expanded inside it).
         let id = path.last.expect("a non-empty path expanded something");
         print_expanded_region(&app, id, color);
+        if let Some(build_err) = build_err {
+            return Err(io::Error::other(build_failure_message(&build_err)));
+        }
         return Ok(());
     }
 
@@ -5754,6 +6056,9 @@ fn run_expand(args: &Args) -> io::Result<()> {
     }
 
     print_buffer(&app, color);
+    if let Some(build_err) = build_err {
+        return Err(io::Error::other(build_failure_message(&build_err)));
+    }
     Ok(())
 }
 
@@ -6005,6 +6310,7 @@ mod tests {
             expansion_failed: false,
             original_lines: Vec::new(),
             expanded_content: None,
+            own_expanded_line_count: 0,
             children: Vec::new(),
             children_visible: true,
             original_line_origins: Vec::new(),
@@ -6819,6 +7125,7 @@ pub struct Page;
             aliases: std::collections::HashMap::new(),
             helper_attrs: HelperAttrs::new(),
             traced_derives: std::collections::HashSet::new(),
+            traced_attrs: std::collections::HashSet::new(),
             done: false,
             error: None,
             build_error: None,
@@ -8580,5 +8887,400 @@ pub struct Page {
         assert_eq!(first, 0);
         assert_eq!(last, app.source_lines.len() - 1);
         assert_eq!(centre, 2, "centred on the macro's own line");
+    }
+
+    // ---- PR #2 audit fixes --------------------------------------------------
+
+    /// Finding 1: `#[test]` (and rustc's other built-in attribute macros) must be
+    /// classified by the same evidence rule as a built-in derive — a known name
+    /// under which no trace record has arrived, only once the stream has ended —
+    /// not by a bare name list. Mirrors
+    /// `a_built_in_name_is_not_judged_until_the_stream_ends` one level up.
+    ///
+    /// BEFORE this fix `App::is_builtin_attr` did not exist at all (this test
+    /// would not compile), and `unexpandable_tag` had no attribute-macro branch:
+    /// `#[test]` got an ordinary node, `list` numbered it, and selecting it ran a
+    /// trace lookup that could never succeed (rustc expands `#[test]` inside the
+    /// compiler, so no record ever crosses the proc-macro bridge under that name).
+    #[test]
+    fn a_builtin_attribute_name_is_not_judged_until_the_stream_ends() {
+        let mut app = test_app("#[test]\nfn it_works() {}\n");
+
+        // Mid-build: nothing has arrived yet, so no verdict — same reasoning as
+        // `is_builtin_derive`, and for the same reason (a proc macro named `test`
+        // may still be streaming in).
+        app.trace_finished = false;
+        assert!(
+            !app.is_builtin_attr(MacroKind::Attribute, "", "test"),
+            "a pending stream must not yield a built-in verdict"
+        );
+
+        // Stream ended with no record under that name: now it is proved.
+        app.trace_finished = true;
+        assert!(app.is_builtin_attr(MacroKind::Attribute, "", "test"));
+
+        // ... unless a proc macro answered to it (a crate defining its own
+        // `#[proc_macro_attribute] fn test`).
+        app.traced_attrs.insert("test".to_string());
+        assert!(
+            !app.is_builtin_attr(MacroKind::Attribute, "", "test"),
+            "a traced `test` is an ordinary attribute macro"
+        );
+    }
+
+    /// Finding 1, end to end at the `App`/`list` level: `#[test]` gets a node (it
+    /// is not in `macro_finder::is_builtin_attribute`'s hidden list — that list is
+    /// for markers like `#[inline]` that never get a node at all), is tagged
+    /// "builtin attribute" once the trace has run out, is left out of what
+    /// `walk_macro_path`'s frontier offers (matching `list`'s own numbering), and
+    /// — named explicitly — gets the friendly reason rather than a lookup failure.
+    ///
+    /// BEFORE this fix: the node existed and was offered as an ordinary `attr`
+    /// entry by `list`; `resolve_one`'s "is a builtin attribute" branch did not
+    /// exist, so naming it by number (as `list` had just told the user to) drove
+    /// `expand_node` into a trace lookup that always failed with a generic
+    /// "Expansion Error: No trace found for 'test'", not a "builtin" message.
+    #[test]
+    fn a_hash_test_attribute_is_reported_as_builtin_not_missing() {
+        let mut app = test_app("#[test]\nfn it_works() {}\n");
+        assert_eq!(
+            node_names(&app),
+            ["test"],
+            "#[test] must still get a node, unlike an is_builtin_attribute marker"
+        );
+        app.refresh_helper_knowledge();
+
+        let id = app.nodes[0].id;
+        let node = app.get_node(id).unwrap();
+        assert_eq!(app.unexpandable_tag(node), Some("builtin attribute"));
+
+        // `list`/`--macro`'s frontier leaves it out...
+        let path = walk_macro_path(&mut app, &[]).unwrap();
+        assert!(
+            path.frontier.is_empty(),
+            "a builtin attribute must not be offered as expandable"
+        );
+
+        // ...but naming it explicitly still gets the reason, not "no such macro" —
+        // replicating the split `walk_macro_path` does internally.
+        let all: Vec<usize> = app.nodes.iter().map(|n| n.id).collect();
+        let (frontier, hidden): (Vec<usize>, Vec<usize>) = all.into_iter().partition(|&id| {
+            app.get_node(id)
+                .map(|n| app.unexpandable_tag(n).is_none())
+                .unwrap_or(false)
+        });
+        let err = resolve_one(&app, &frontier, &hidden, "test").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("builtin attribute"), "{msg}");
+        assert!(
+            !msg.contains("no such macro") && !msg.contains("no macro matches --macro"),
+            "a name `list` deliberately leaves out must get its reason, not a bare \
+             not-found: {msg}"
+        );
+    }
+
+    /// Finding 2 (the worst of the five): a failed `cargo check` must be visible
+    /// and must make the command exit non-zero, for both `list` and `expand`, with
+    /// or without a `--macro` selector. `expand` still prints what it managed —
+    /// the fixture's build fails on a *later* statement than the `vec!` it can
+    /// still expand, so throwing that output away would make the non-zero exit
+    /// less useful, not more.
+    ///
+    /// BEFORE this fix: `run_list` never consulted `build_error()` at all, and
+    /// `run_expand`'s no-selector loop only reported the failure per-macro (on
+    /// stderr, via `app.error_message`) and still fell through to `print_buffer`
+    /// and `Ok(())`. Both commands exited 0 on a crate that never compiled. This
+    /// was confirmed by disabling the four `build_failure_message` call sites
+    /// this test exercises and re-running it: both `run_list` and `run_expand`
+    /// returned `Ok(())` against the same broken fixture (see the audit report for
+    /// the captured before-output — this test cannot itself run twice with the
+    /// fix on and off within one binary).
+    #[test]
+    fn a_failed_build_is_visible_and_non_zero_for_both_commands() {
+        let manifest = write_broken_fixture_crate();
+
+        let list_args = Args::parse_from([
+            "cargo-macra",
+            "list",
+            "--manifest-path",
+            manifest.to_str().unwrap(),
+            "--lib",
+        ]);
+        let err = run_list(&list_args)
+            .expect_err("a failed build must surface as an error, not a silent Ok");
+        let msg = err.to_string();
+        assert!(msg.contains("cargo check failed"), "{msg}");
+        assert!(
+            msg.contains("incomplete"),
+            "must read as \"incomplete\", distinct from an ordinary missing trace: {msg}"
+        );
+
+        let expand_args = Args::parse_from([
+            "cargo-macra",
+            "expand",
+            "--manifest-path",
+            manifest.to_str().unwrap(),
+            "--lib",
+        ]);
+        let err = run_expand(&expand_args)
+            .expect_err("a failed build must surface as an error, not a silent Ok");
+        let msg = err.to_string();
+        assert!(msg.contains("cargo check failed"), "{msg}");
+        assert!(msg.contains("incomplete"), "{msg}");
+
+        let _ = std::fs::remove_dir_all(manifest.parent().unwrap());
+    }
+
+    /// A tiny crate, written to the OS temp directory at test time (never under
+    /// the macra repo itself), that fails `cargo check` — a type error on the
+    /// `return` after a `vec!` — while still being syntactically valid enough for
+    /// `find_macros` to find the `vec!` inside it. Returns its manifest path.
+    fn write_broken_fixture_crate() -> PathBuf {
+        let unique = format!(
+            "macra_broken_fixture_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"macra_broken_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/lib.rs"),
+            "pub fn broken() -> i32 {\n    let v = vec![1, 2, 3];\n    \"not a number\"\n}\n",
+        )
+        .unwrap();
+        dir.join("Cargo.toml")
+    }
+
+    /// Finding 3: printing one derive's own expansion must not include a sibling
+    /// `#[derive(..)]` still waiting to be expanded. `actual_expanded_line_count`
+    /// (and the `remaining_derives` fold that feeds it) are left exactly as they
+    /// were — the TUI's split view and undo/`shift_nodes` depend on both counting
+    /// the sibling line as part of the buffer region `Greet` currently occupies —
+    /// only the *printed* region, computed by `printed_expansion_line_count`, is
+    /// trimmed to the block the markers actually bracket.
+    ///
+    /// BEFORE this fix: `own_expanded_line_count` did not exist (every node's
+    /// value was implicitly the same as `actual_expanded_line_count`), so slicing
+    /// `source_lines[start..start+printed_expansion_line_count]` for `Greet`
+    /// included the trailing `#[derive(Describe)]` line the fold appends — exactly
+    /// what `print_expanded_region` (used by `expand --macro N`) printed.
+    #[test]
+    fn a_sibling_derives_attribute_does_not_leak_into_the_printed_region() {
+        let source = "#[derive(Greet, Describe)]\npub struct MultiDeriveOneAttr;\n";
+        let mut app = test_app_with(
+            source,
+            vec![
+                derive_expansion(
+                    "Greet",
+                    "pub struct MultiDeriveOneAttr;",
+                    "impl Greet for MultiDeriveOneAttr {}",
+                    &[],
+                ),
+                derive_expansion(
+                    "Describe",
+                    "pub struct MultiDeriveOneAttr;",
+                    "impl Describe for MultiDeriveOneAttr {}",
+                    &[],
+                ),
+            ],
+        );
+        let greet_id = node_named(&app, "Greet");
+        app.expand_node(greet_id, None);
+        assert!(app.get_node(greet_id).unwrap().expanded, "{}", app.status);
+
+        let full_len = app.actual_expanded_line_count(greet_id);
+        let printed_len = app.printed_expansion_line_count(greet_id);
+        assert!(
+            printed_len < full_len,
+            "the sibling #[derive(Describe)] line must still count toward the \
+             buffer region ({full_len}) but not the printed one ({printed_len})"
+        );
+
+        let start = app.get_node(greet_id).unwrap().call.line - 1;
+        let printed = &app.source_lines[start..start + printed_len];
+        assert!(printed.iter().any(|l| l.contains("expanded: Greet")));
+        assert!(printed.iter().any(|l| l.contains("end Greet")));
+        assert!(
+            !printed.iter().any(|l| l.contains("Describe")),
+            "Describe must not appear in Greet's own printed region: {printed:?}"
+        );
+
+        // Drilling to the same `Describe` as a child (`--macro <Greet> --macro
+        // <Describe>`) must still print a clean region of its own — the fold's
+        // child-discovery path already re-parses that trailing line as a proper
+        // node, so this was already correct; pinned down so a future change to
+        // `own_trailing_lines` cannot regress it silently.
+        let describe_child = app
+            .get_node(greet_id)
+            .unwrap()
+            .children
+            .iter()
+            .copied()
+            .find(|&id| app.get_node(id).unwrap().call.name == "Describe")
+            .expect("Describe must be discovered as Greet's child");
+        push_expansion(
+            &app,
+            derive_expansion(
+                "Describe",
+                "pub struct MultiDeriveOneAttr;",
+                "impl Describe for MultiDeriveOneAttr {}",
+                &[],
+            ),
+        );
+        app.expand_node(describe_child, None);
+        assert!(
+            app.get_node(describe_child).unwrap().expanded,
+            "{}",
+            app.status
+        );
+        let d_full = app.actual_expanded_line_count(describe_child);
+        let d_printed = app.printed_expansion_line_count(describe_child);
+        assert_eq!(
+            d_printed, d_full,
+            "the last derive in the group has no trailing sibling to exclude"
+        );
+    }
+
+    /// The milder case the same fix also resolves: a one-line functional macro
+    /// used as a statement (`make_answer!(get_answer);`) leaves its own trailing
+    /// `;` out of `formatted_lines` after the end marker via `tail_rebase`; that
+    /// `;` is not this macro's output either, and `own_trailing_lines` excludes it
+    /// the same way it excludes a sibling derive.
+    ///
+    /// BEFORE this fix, printing this macro's region included a bare trailing `;`
+    /// line after `// -- end make_answer --`.
+    #[test]
+    fn a_bare_trailing_semicolon_does_not_leak_into_the_printed_region() {
+        let source = "make_answer!(get_answer);\n";
+        let mut app = test_app_with(
+            source,
+            vec![bang_expansion(
+                "make_answer",
+                "get_answer",
+                "fn get_answer() -> u32 { 42 }",
+            )],
+        );
+        let id = node_named(&app, "make_answer");
+        app.expand_node(id, None);
+        assert!(app.get_node(id).unwrap().expanded, "{}", app.status);
+
+        let full_len = app.actual_expanded_line_count(id);
+        let printed_len = app.printed_expansion_line_count(id);
+        assert!(
+            printed_len < full_len,
+            "the trailing `;` must count toward the buffer region but not the \
+             printed one"
+        );
+        let start = app.get_node(id).unwrap().call.line - 1;
+        let printed = &app.source_lines[start..start + printed_len];
+        assert!(
+            !printed.iter().any(|l| l.trim() == ";"),
+            "a bare trailing `;` must not appear in the printed region: {printed:?}"
+        );
+        assert!(printed.last().unwrap().contains("end make_answer"));
+    }
+
+    /// Finding 4: the line number `list` prints in its "(line N)" header must be
+    /// the same line `-C`/`print_context` centres its window on — both have to
+    /// agree on what "this macro's own line" means for a derive, or the header can
+    /// point outside the block shown under it.
+    ///
+    /// BEFORE this fix, `run_list`'s loop formatted its own line inline as
+    /// `node.call.line` (the `#[derive(...)]` attribute's *opening* line, shared
+    /// by every derive in the list) while `context_window`/`print_context` centre
+    /// on `App::node_cursor_pos`, which uses `derive_line` (the line the derive's
+    /// own name sits on) for a `MacroKind::Derive` node. For a `#[derive(\n
+    /// Greet,\n    Describe,\n)]` spanning lines 1-4, `list -C 1` printed entry 2
+    /// (`Describe`) as "(line 1)" while the window shown was centred on line 3 —
+    /// the number was not even in the block under it. Calls the extracted
+    /// `list_entry_line` directly (the exact function `run_list`'s loop calls),
+    /// not a hand-rolled reimplementation, so this cannot pass while `run_list`
+    /// itself still used the old `node.call.line` — a bare invariant check on
+    /// `node_cursor_pos` alone (unchanged by this fix) would have.
+    #[test]
+    fn list_line_number_matches_the_context_window_for_a_multiline_derive_list() {
+        let source = "#[derive(\n    Greet,\n    Describe,\n)]\npub struct S;\n";
+        let app = test_app(source);
+        let describe_id = node_named(&app, "Describe");
+        let node = app.get_node(describe_id).unwrap();
+
+        // The fixture actually separates the two lines `run_list` used to conflate.
+        assert_eq!(node.call.line, 1, "the attribute's opening line");
+        assert_eq!(node.call.derive_line, 3, "Describe's own name is on line 3");
+
+        // Exactly what `run_list`'s loop prints as entry 2's header.
+        let printed = list_entry_line(1, node);
+        assert!(
+            printed.contains("(line 3)"),
+            "must name the derive's own line, not the attribute's: {printed:?}"
+        );
+        assert!(
+            !printed.contains("(line 1)"),
+            "must not still be the attribute's opening line: {printed:?}"
+        );
+
+        // What `-C` centres the window on — the invariant the header must share.
+        let (_, centre, _) = context_window(&app, describe_id, 1).unwrap();
+        assert_eq!(
+            centre + 1,
+            3,
+            "the header's line number and the context window's centre must agree \
+             (context_window is 0-indexed)"
+        );
+    }
+
+    /// Finding 5: the progress line must never be wide enough to wrap, on any
+    /// terminal — `\r\x1b[2K` only clears the row the cursor ends on, so a wrapped
+    /// line leaves its overflow rows sitting in scrollback forever.
+    ///
+    /// BEFORE this fix, the formatted line (spinner, phase, expansion count,
+    /// elapsed time — around 63 columns with a long phase and a 3-digit count) was
+    /// written to stderr unconditionally, with no truncation at all: this
+    /// function did not exist, and the draw call formatted straight into `write!`.
+    #[test]
+    fn truncate_to_width_never_exceeds_the_budget() {
+        let long = "⠋ Building (cargo check -Z trace-macros) — 999 expansions (999s)";
+        let full_width = unicode_width::UnicodeWidthStr::width(long);
+        assert!(
+            full_width > 40,
+            "fixture must actually be wider than a 40-column terminal ({full_width})"
+        );
+
+        for budget in [1usize, 10, 39, 40, 63, 80, 200] {
+            let truncated = truncate_to_width(long, budget);
+            let width = unicode_width::UnicodeWidthStr::width(truncated.as_str());
+            assert!(
+                width <= budget,
+                "budget {budget}: truncated width {width} exceeds it ({truncated:?})"
+            );
+        }
+    }
+
+    /// A defensive companion: truncation must land on a character boundary and
+    /// never cut a wide glyph in half (which would either panic or silently over-
+    /// or under-shoot the budget by a column).
+    #[test]
+    fn truncate_to_width_does_not_split_a_wide_glyph() {
+        let s = "😀😀😀😀"; // each emoji is 2 display columns wide
+        let out = truncate_to_width(s, 3);
+        assert_eq!(unicode_width::UnicodeWidthStr::width(out.as_str()), 2);
+        assert_eq!(out.chars().count(), 1);
+    }
+
+    /// `progress_line_budget` must always return at least one usable column, and
+    /// must never report more than the fallback would allow it to be *wrong* about
+    /// (this test's environment may or may not have a real terminal on stderr, so
+    /// it only pins the invariant that holds either way).
+    #[test]
+    fn progress_line_budget_is_always_at_least_one() {
+        assert!(progress_line_budget() >= 1);
     }
 }
