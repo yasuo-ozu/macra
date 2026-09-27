@@ -7,7 +7,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use cargo_macra::parse_trace::{MacroExpansion, MacroExpansionKind};
-use cargo_macra::trace_macros::{MacroExpansionIter, TraceMacros};
+use cargo_macra::trace_macros::{MacroExpansionIter, TraceMacros, TraceRun};
 use clap::Parser;
 use crossterm::{
     ExecutableCommand,
@@ -23,6 +23,22 @@ use ratatui::{
 #[command(name = "cargo-macra")]
 #[command(bin_name = "cargo macra")]
 #[command(about = "Interactive macro expansion viewer for Rust")]
+#[command(long_about = "\
+Interactive macro expansion viewer for Rust.
+
+  cargo macra [MODULE]                          launch the TUI (default)
+  cargo macra list   [MODULE] [--macro SEL]...  numbered listing of macros
+  cargo macra expand [MODULE] [--macro SEL]...  expanded source on stdout
+
+`--macro SEL` (repeatable) selects which macro(s) `list`/`expand` act on: a
+1-based number from `list`'s own output, or a macro name matched on its last
+path segment. With none, `expand` expands everything reachable.
+
+A module literally named `list` or `expand` is reached with a leading `--`:
+`cargo macra -- expand` opens module `expand`, not the `expand` subcommand.
+
+A LATER `--` keeps its ordinary meaning: everything after it is forwarded to
+the underlying `cargo check`, e.g. `cargo macra expand foo -- --release`.")]
 struct Args {
     /// Subcommand name (when invoked as `cargo macra`)
     #[arg(hide = true)]
@@ -60,12 +76,120 @@ struct Args {
     #[arg(long, value_name = "WHEN", value_enum, default_value_t = pretty::ColorChoice::Auto)]
     color: pretty::ColorChoice,
 
-    /// Module path to open (e.g., "foo::bar" opens the file for module `crate::foo::bar`)
+    /// Module path to open (e.g., "foo::bar" opens the file for module `crate::foo::bar`).
+    /// A module literally named `list` or `expand` needs a leading `--` ahead of it
+    /// (`cargo macra -- expand`) so it is not mistaken for that subcommand.
     module: Option<String>,
 
-    /// Additional arguments to pass to cargo
+    /// Select which macro(s) `list`/`expand` operate on: a 1-based number from
+    /// `list`'s output, or a macro name matched on its last path segment (so
+    /// `syan::visit::Ast` is selectable as `Ast`). Repeatable; a name selects every
+    /// macro with that name. Ignored — and rejected — outside `list`/`expand`.
+    #[arg(long = "macro", value_name = "SELECTOR")]
+    macro_selectors: Vec<String>,
+
+    /// Additional arguments to pass to cargo, after a literal `--`
+    /// (e.g. `cargo macra expand foo -- --release`).
     #[arg(trailing_var_arg = true)]
     cargo_args: Vec<String>,
+}
+
+/// The non-interactive verb the command line led with, decided by [`normalize_argv`]
+/// before `Args` ever sees the argument list. `None` means the ordinary TUI (or
+/// `--show-expansion`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Verb {
+    /// `cargo macra list`: a numbered listing of expandable macros.
+    List,
+    /// `cargo macra expand`: expanded source on stdout, cargo-expand style.
+    Expand,
+}
+
+/// Strip the token `cargo` inserts for `cargo macra` and, unless escaped, a leading
+/// `list`/`expand` verb, before `Args` — a flat clap struct with no real subcommands
+/// — ever sees the argument list.
+///
+/// `Args` keeps a hidden leading positional (`_subcommand`) purely to swallow the
+/// `cargo`-inserted token when it is there; `module` is the next positional, and
+/// `cargo_args` (`trailing_var_arg`) mops up whatever follows a literal `--`. Layering
+/// `list`/`expand` on top of that shape as real clap subcommands would fight those
+/// positionals — clap cannot tell "no verb, this is the module" from "a verb" without
+/// the shape changing depending on invocation style, which is exactly what already
+/// happens with `_subcommand`/`module`.
+///
+/// So a detected verb is not simply deleted — it is *replaced* with the same literal
+/// `"macra"` sentinel `cargo macra` itself would have put there, before `Args` ever
+/// sees the line. This is the one rule that keeps `--`'s two jobs from colliding
+/// (see below): every invocation, verb or not, direct or through `cargo`, reaches
+/// `Args` in exactly the shape a plain `cargo macra [MODULE] [-- CARGO_ARGS...]`
+/// already had, so the pre-existing `_subcommand` fixup in `run_main` and clap's own
+/// positional/`trailing_var_arg` distribution keep doing exactly what they already
+/// did — `module` is always the first positional `_subcommand` doesn't eat, and a
+/// literal `--` always starts `cargo_args`, regardless of whether a verb was typed.
+/// Deleting the verb outright instead of replacing it used to shift `module` and
+/// `cargo_args` left by one slot only when a verb was present, so `cargo macra expand
+/// foo -- --release` put `--release` into `module` and dropped it from `cargo_args`
+/// entirely — the exact collision between "verb" and "forward to cargo" this
+/// sentinel avoids.
+///
+/// A module literally named `expand` or `list` is reached with a *leading* `--`,
+/// checked below before it is otherwise meaningful to us: `cargo macra -- expand`
+/// and `cargo-macra -- expand` both skip verb detection and fall through to the
+/// `_subcommand` fixup, which relabels the escaped token as the module. Only a `--`
+/// in that leading position is special; any later one keeps its ordinary clap
+/// meaning (stop option parsing, and feed whatever positional slots — `module`, then
+/// `cargo_args` — are still open), which is what lets a verb, a module and forwarded
+/// cargo flags all appear on the same line: `cargo macra expand foo -- --release`.
+///
+/// The `"macra"` sentinel itself is only ever *peeked*, never removed on its own —
+/// removing it unconditionally would shift `module`/`cargo_args` by one slot even
+/// when there is no verb to make room for, breaking the plain, verb-less `cargo
+/// macra foo -- --release` this whole scheme must leave alone. It is removed only
+/// as part of dropping the verb that follows it (the cargo-driven form), and never
+/// otherwise.
+fn normalize_argv<I: IntoIterator<Item = std::ffi::OsString>>(
+    argv: I,
+) -> (Option<Verb>, Vec<std::ffi::OsString>) {
+    use std::ffi::{OsStr, OsString};
+
+    let mut it = argv.into_iter();
+    let prog = it.next().unwrap_or_default();
+    let mut rest: Vec<OsString> = it.collect();
+
+    // The verb, if any, sits right after a leading "macra" sentinel when there is
+    // one (cargo-driven invocation), else at the very front (direct invocation).
+    let has_macra_prefix = rest.first().map(|s| s.as_os_str()) == Some(OsStr::new("macra"));
+    let verb_idx = usize::from(has_macra_prefix);
+
+    let is_escaped = rest.get(verb_idx).map(|s| s.as_os_str()) == Some(OsStr::new("--"));
+    let verb = if is_escaped {
+        None
+    } else {
+        match rest.get(verb_idx).and_then(|s| s.to_str()) {
+            Some("expand") => Some(Verb::Expand),
+            Some("list") => Some(Verb::List),
+            _ => None,
+        }
+    };
+
+    if verb.is_some() {
+        if has_macra_prefix {
+            // The sentinel ahead of the verb already gives `module`/`cargo_args`
+            // the shape they need; just drop the verb token itself.
+            rest.remove(verb_idx);
+        } else {
+            // Direct invocation: put the same sentinel in the verb's place, so the
+            // rest of the line lines up exactly as the cargo-driven form does —
+            // see the doc comment above for why replacing (not just deleting)
+            // matters once `--`-forwarded cargo args are in the picture too.
+            rest[0] = OsString::from("macra");
+        }
+    }
+
+    let mut out = Vec::with_capacity(rest.len() + 1);
+    out.push(prog);
+    out.extend(rest);
+    (verb, out)
 }
 
 /// A node in the macro tree
@@ -1223,6 +1347,24 @@ impl ExpansionCache {
         mutex.lock().unwrap().done
     }
 
+    /// Block until the expansion stream has finished (`stream_done`).
+    ///
+    /// The TUI never calls this: it redraws every tick and can afford
+    /// `is_builtin_derive`'s "unclassified" reading while the build is still running,
+    /// correcting it on a later frame. The non-interactive `list`/`expand` commands
+    /// have no later frame — a verdict given once is the only one the user sees — so
+    /// they wait here before building the node tree, the same trade `--show-expansion`
+    /// already makes by collecting its whole iterator before printing.
+    fn wait_done(&self) {
+        let (ref mutex, ref condvar) = *self.inner;
+        let guard = mutex.lock().unwrap();
+        drop(
+            condvar
+                .wait_while(guard, |c| !c.done)
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+    }
+
     /// The names derive records have arrived under so far (see
     /// `CacheInner::traced_derives`). Non-blocking, like `helper_attributes`.
     fn traced_derives(&self) -> std::collections::HashSet<String> {
@@ -1862,6 +2004,25 @@ impl App {
             && self.trace_finished
     }
 
+    /// The short reason `node` cannot be expanded — a derive's own helper attribute
+    /// (inert; never runs) or a compiler built-in derive (rustc expands it itself and
+    /// leaves no trace) — or `None` when it is an ordinary macro a lookup might find.
+    ///
+    /// The single place both checks live, so `expandable_spans_on` (which decides
+    /// what gets underlined in the source) and the `list`/`expand` subcommands
+    /// (which annotate or silently skip these) can never disagree about which nodes
+    /// they are.
+    fn unexpandable_tag(&self, node: &MacroNode) -> Option<&'static str> {
+        if node.call.kind == MacroKind::Attribute && self.inert_attrs.contains_key(&node.call.name)
+        {
+            return Some("helper attribute");
+        }
+        if self.is_builtin_derive(node.call.kind, &node.call.krate, &node.call.name) {
+            return Some("builtin derive");
+        }
+        None
+    }
+
     /// Once per event-loop tick: learn any newly reported helpers and, if that
     /// changes which attributes are inert, bring the root nodes up to date.
     ///
@@ -2148,11 +2309,7 @@ impl App {
             .iter()
             .filter_map(|&id| self.get_node(id))
             .filter(|n| !n.expanded && !n.expansion_failed)
-            .filter(|n| {
-                let inert = n.call.kind == MacroKind::Attribute
-                    && self.inert_attrs.contains_key(&n.call.name);
-                !inert && !self.is_builtin_derive(n.call.kind, &n.call.krate, &n.call.name)
-            })
+            .filter(|n| self.unexpandable_tag(n).is_none())
             .filter_map(|n| Self::node_col_span(n, line))
             .filter(|(s, e)| e > s)
             .collect();
@@ -4919,7 +5076,8 @@ fn main() -> std::process::ExitCode {
 }
 
 fn run_main() -> io::Result<()> {
-    let mut args = Args::parse();
+    let (verb, argv) = normalize_argv(std::env::args_os());
+    let mut args = Args::parse_from(argv);
 
     // When invoked via `cargo run -- symbol` (without "macra" subcommand),
     // _subcommand consumes the module path. Detect and fix this.
@@ -4931,8 +5089,58 @@ fn run_main() -> io::Result<()> {
         }
     }
 
+    // `--macro` only means something once there is a `list`/`expand` to apply it
+    // to; the TUI has no notion of "the selected macro" ahead of a keypress, so
+    // silently accepting it there would make it look wired up when it does nothing.
+    if verb.is_none() && !args.macro_selectors.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--macro requires the `list` or `expand` subcommand",
+        ));
+    }
+
+    match verb {
+        Some(Verb::List) => return run_list(&args),
+        Some(Verb::Expand) => return run_expand(&args),
+        None => {}
+    }
+
+    let loaded = load_source_and_trace(&args)?;
+
+    if args.show_expansion {
+        let expansions: Vec<_> = loaded.run.iter.collect::<io::Result<Vec<_>>>()?;
+        print_expansions(&expansions, args.color.resolve());
+        return Ok(());
+    }
+
+    let cache = ExpansionCache::new(loaded.run.iter, loaded.run.check_result, loaded.run.child);
+    run_app(
+        loaded.source,
+        loaded.src_path,
+        loaded.top_level_path,
+        loaded.module_path,
+        cache,
+        loaded.tm,
+    )
+}
+
+/// Everything `run_main` needs before it can either launch the TUI, print raw
+/// expansions (`--show-expansion`), or — the two new callers — build a headless
+/// `App` for `list`/`expand`. Factored out of `run_main` so those two extra callers
+/// do not re-diverge from the source-file/module-resolution/cargo-invocation logic
+/// the TUI path already had right.
+struct LoadedSource {
+    source: String,
+    src_path: PathBuf,
+    top_level_path: PathBuf,
+    module_path: Vec<String>,
+    run: TraceRun,
+    tm: TraceMacros,
+}
+
+fn load_source_and_trace(args: &Args) -> io::Result<LoadedSource> {
     eprintln!("Finding source file via cargo metadata...");
-    let top_level_path = match find_source_file(&args) {
+    let top_level_path = match find_source_file(args) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("Error finding source file: {}", e);
@@ -4964,17 +5172,323 @@ fn run_main() -> io::Result<()> {
     let _ = filetime::set_file_mtime(&src_path, filetime::FileTime::now());
 
     eprintln!("Running cargo with -Z trace-macros...");
-    let tm = build_trace_macros(&args);
+    let tm = build_trace_macros(args);
     let run = tm.run()?;
 
-    if args.show_expansion {
-        let expansions: Vec<_> = run.iter.collect::<io::Result<Vec<_>>>()?;
-        print_expansions(&expansions, args.color.resolve());
+    Ok(LoadedSource {
+        source,
+        src_path,
+        top_level_path,
+        module_path,
+        run,
+        tm,
+    })
+}
+
+/// Build the `App` that `list`/`expand` drive headlessly: same source, same trace,
+/// same node tree the TUI would show — reusing `App::expand_node` and
+/// `build_root_nodes` (via `App::new`) rather than a second implementation of
+/// either — but with the whole expansion stream waited out first (`wait_done`) and
+/// folded in (`refresh_helper_knowledge`), since neither command gets a later frame
+/// to correct an early "unclassified" helper/derive verdict.
+///
+/// Safe to drive without a terminal: `App::new` never touches one, and the two
+/// helpers `expand_node` calls while a lookup is waiting — `draw_wait_notice` and
+/// `wait_cancelled` — already degrade to no-ops when stdout/stdin are not a TTY
+/// (checked at their call sites), which is exactly the case here.
+fn load_app_headless(args: &Args) -> io::Result<App> {
+    let loaded = load_source_and_trace(args)?;
+    let cache = ExpansionCache::new(loaded.run.iter, loaded.run.check_result, loaded.run.child);
+    cache.wait_done();
+    let mut app = App::new(
+        loaded.source,
+        loaded.src_path,
+        loaded.top_level_path,
+        loaded.module_path,
+        cache,
+        loaded.tm,
+    );
+    app.refresh_helper_knowledge();
+    Ok(app)
+}
+
+/// One `--macro` selector, as given on the command line: either a 1-based number —
+/// the position `list` printed — or a macro name, matched on the last path segment
+/// (`syan::visit::Ast` is reachable as `Ast`) so a selector never has to spell the
+/// defining crate.
+enum Selector<'a> {
+    Index(usize),
+    Name(&'a str),
+}
+
+fn parse_selector(raw: &str) -> Selector<'_> {
+    match raw.parse::<usize>() {
+        Ok(n) => Selector::Index(n),
+        Err(_) => Selector::Name(raw),
+    }
+}
+
+/// Resolve one `--macro` selector against the macros currently on offer.
+///
+/// `candidates` is exactly what the matching `list` prints at this depth: the file's
+/// own macros for the first selector, and the macros found *inside* the previous
+/// step's expansion for every selector after it. Numbers are therefore 1-based within
+/// the step, never a global index — the numbers a user has actually been shown are the
+/// only ones they can use.
+///
+/// A name takes the *first* macro with exactly that name, in the order `list` shows
+/// them — `--macro Ast` means "the first `Ast` here". A number is the way to reach a
+/// later one. Only a selector matching nothing at all is an error, and it lists what
+/// would have worked.
+fn resolve_one(app: &App, candidates: &[usize], raw: &str) -> io::Result<usize> {
+    let leaf = |id: usize| {
+        app.get_node(id)
+            .map(|n| macro_leaf(&n.call.name).to_string())
+            .unwrap_or_default()
+    };
+    let hits: Vec<usize> = match parse_selector(raw) {
+        Selector::Index(n) if n >= 1 && n <= candidates.len() => vec![candidates[n - 1]],
+        Selector::Index(_) => Vec::new(),
+        // First exact match, in the order `list` printed them.
+        Selector::Name(name) => candidates
+            .iter()
+            .copied()
+            .find(|&id| leaf(id) == name)
+            .into_iter()
+            .collect(),
+    };
+    if let Some(&id) = hits.first() {
+        return Ok(id);
+    }
+    let numbers = if candidates.is_empty() {
+        "none".to_string()
+    } else {
+        format!("1-{}", candidates.len())
+    };
+    let mut names: Vec<String> = candidates.iter().map(|&id| leaf(id)).collect();
+    names.sort();
+    names.dedup();
+    let names = if names.is_empty() {
+        "none".to_string()
+    } else {
+        names.join(", ")
+    };
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("no macro matches --macro '{raw}' here (available: {numbers}; names: {names})"),
+    ))
+}
+
+/// Walk a `--macro` path, expanding one macro per step, and return the macros visible
+/// at the end of it.
+///
+/// This is the drill-down the TUI does with Enter, replayed non-interactively: each
+/// selector picks one macro from what is currently on offer and expands it, and the
+/// macros appearing in *its* output become the choices for the next selector. So
+/// `--macro 3 --macro 2` reads "expand 3, then expand the 2nd macro inside its
+/// result", and it is why `--macro` repeats: a path, not a set.
+///
+/// `list` then prints the macros this returns; `expand` prints the buffer they sit in.
+fn walk_macro_path(app: &mut App, selectors: &[String]) -> io::Result<Vec<usize>> {
+    let mut frontier: Vec<usize> = app.nodes.iter().map(|n| n.id).collect();
+    for raw in selectors {
+        let id = resolve_one(app, &frontier, raw)?;
+        let name = app
+            .get_node(id)
+            .map(|n| n.call.name.clone())
+            .unwrap_or_default();
+        // Asked for by name, so it gets a reason rather than an empty result.
+        if let Some(tag) = app.get_node(id).and_then(|n| app.unexpandable_tag(n)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("'{name}' is a {tag}: there is no expansion to look inside"),
+            ));
+        }
+        app.expand_node(id, None);
+        let (expanded, children) = match app.get_node(id) {
+            Some(n) => (n.expanded, n.children.clone()),
+            None => (false, Vec::new()),
+        };
+        if !expanded {
+            // A step that cannot be taken ends the walk: every later selector is
+            // numbered against output that does not exist, so continuing would resolve
+            // them against the wrong list.
+            let why = if let Some(choice) = app.pending_choice.take() {
+                format!(
+                    "'{name}' matches {} different expansions, and a non-interactive \
+                     command cannot ask which you meant",
+                    choice.candidates.len()
+                )
+            } else if let Some(err) = app.error_message.take() {
+                format!(
+                    "could not expand '{name}': {}",
+                    err.trim_end_matches("\n\nPress Enter to dismiss.").trim()
+                )
+            } else {
+                format!("could not expand '{name}'")
+            };
+            return Err(io::Error::other(why));
+        }
+        frontier = children;
+    }
+    Ok(frontier)
+}
+
+/// `cargo macra list`: number the macros on offer, in source order, marking the ones
+/// macra already knows it cannot expand instead of hiding them.
+///
+/// With no `--macro` those are the file's own macros. With `--macro` it first walks
+/// that path (see `walk_macro_path`) and lists the macros found *inside* the last
+/// expansion — "show me the expansion points in this macro's result". The numbers
+/// printed are the ones the next `--macro` accepts, at every depth.
+fn run_list(args: &Args) -> io::Result<()> {
+    let mut app = load_app_headless(args)?;
+    let frontier = walk_macro_path(&mut app, &args.macro_selectors)?;
+
+    if frontier.is_empty() {
+        if args.macro_selectors.is_empty() {
+            println!("No macros found.");
+        } else {
+            println!("No macros inside that expansion.");
+        }
         return Ok(());
     }
 
-    let cache = ExpansionCache::new(run.iter, run.check_result, run.child);
-    run_app(source, src_path, top_level_path, module_path, cache, tm)
+    for (idx, &id) in frontier.iter().enumerate() {
+        let Some(node) = app.get_node(id) else {
+            continue;
+        };
+        let line = format!(
+            "{:>3}. {:<8}{}  (line {})",
+            idx + 1,
+            node.call.kind.as_str(),
+            node.call.name,
+            node.call.line,
+        );
+        match app.unexpandable_tag(node) {
+            Some(tag) => println!("{line}  [{tag}, not expandable]"),
+            None => println!("{line}"),
+        }
+    }
+    Ok(())
+}
+
+/// The buffer as it stands, syntax-highlighted only when asked for — `expand` is meant
+/// to be piped, so plain text is the default when stdout is not a terminal.
+fn print_buffer(app: &App, color: bool) {
+    let mut text = app.source_lines.join("\n");
+    text.push('\n');
+    if color {
+        print!("{}", pretty::highlight(&text));
+    } else {
+        print!("{}", text);
+    }
+}
+
+/// Hard cap on recursive-expansion rounds, one round per level of macro nesting
+/// `expand` reveals. 128 matches rustc's own default `#[recursion_limit]`: no
+/// macro nesting rustc itself would have accepted while producing this trace can be
+/// deeper than that, so hitting the cap only ever means a very unusual build (one
+/// that raised its recursion limit), not the ordinary case. When it is hit, the
+/// remaining unexpanded macros are left as they are and named on stderr; the
+/// command still exits 0 and prints whatever it did manage to expand.
+const EXPAND_ROUND_CAP: usize = 128;
+
+/// `cargo macra expand`: cargo-expand-style output, but selective — with no
+/// `--macro` it expands everything reachable (cargo-expand's default), and with one
+/// or more it expands only the named macros, recursively.
+///
+/// Recursion: expanding a node can reveal child macros in its own output (a
+/// `macro_rules!` a proc macro emitted, an attribute that rewrote its item into
+/// something with its own macro calls). Each round expands the current frontier —
+/// initially the selected roots — and the children `App::expand_node` discovers
+/// become next round's frontier; this is a plain fixed-point BFS, bounded by
+/// `EXPAND_ROUND_CAP`. Termination does not actually depend on the cap: every
+/// child gets a fresh id and `expand_node` refuses an already-expanded node, so a
+/// node can enter the queue at most once and the process is bounded by the
+/// (finite) trace already produced by a completed build. The cap exists purely to
+/// bound a pathological case rather than to make an otherwise-unbounded loop safe.
+fn run_expand(args: &Args) -> io::Result<()> {
+    let mut app = load_app_headless(args)?;
+    let color = args.color.resolve();
+
+    // `--macro` names a path, so expand exactly it and stop: each further `--macro` is
+    // how the user asks to go one level deeper, which would be meaningless if this
+    // recursed on its own and expanded the deeper levels anyway.
+    if !args.macro_selectors.is_empty() {
+        walk_macro_path(&mut app, &args.macro_selectors)?;
+        print_buffer(&app, color);
+        return Ok(());
+    }
+
+    // No selector: cargo-expand's default, everything reachable, leaving out what macra
+    // already knows it cannot expand — silently, since `list` is where that gets named.
+    let root_ids: Vec<usize> = {
+        app.nodes
+            .iter()
+            .filter(|n| app.unexpandable_tag(n).is_none())
+            .map(|n| n.id)
+            .collect()
+    };
+
+    let mut queue = root_ids;
+    let mut round = 0usize;
+    while !queue.is_empty() {
+        round += 1;
+        if round > EXPAND_ROUND_CAP {
+            eprintln!(
+                "warning: hit the expansion round cap ({EXPAND_ROUND_CAP}); {} macro(s) left unexpanded",
+                queue.len()
+            );
+            break;
+        }
+        let mut next_queue = Vec::new();
+        for id in queue {
+            let name = match app.get_node(id) {
+                Some(n) => n.call.name.clone(),
+                None => continue,
+            };
+            app.expand_node(id, None);
+            let (expanded, children) = match app.get_node(id) {
+                Some(n) => (n.expanded, n.children.clone()),
+                None => (false, Vec::new()),
+            };
+            if expanded {
+                for cid in children {
+                    // Newly discovered, never selected by the user, so — like the
+                    // default case above — left out without a stderr note.
+                    let skip = match app.get_node(cid) {
+                        Some(child) => app.unexpandable_tag(child).is_some(),
+                        None => true,
+                    };
+                    if !skip {
+                        next_queue.push(cid);
+                    }
+                }
+            } else if let Some(choice) = app.pending_choice.take() {
+                // The TUI would ask which candidate the user meant; a non-interactive
+                // command cannot, and guessing would make the output wrong in a way
+                // the user cannot see. Expand nothing for it instead.
+                eprintln!(
+                    "'{}' matches {} different expansions — skipping (ambiguous).",
+                    name,
+                    choice.candidates.len()
+                );
+            } else if let Some(err) = app.error_message.take() {
+                // One macro's lookup failing (a hung trace, a genuinely unmatched
+                // call) must not cost the rest of the file.
+                eprintln!(
+                    "could not expand '{}':\n{}",
+                    name,
+                    err.trim_end_matches("\n\nPress Enter to dismiss.")
+                );
+            }
+        }
+        queue = next_queue;
+    }
+
+    print_buffer(&app, color);
+    Ok(())
 }
 
 /// Print all macro expansions to stdout in a human-readable format.
@@ -5031,6 +5545,175 @@ fn print_expansions(expansions: &[cargo_macra::parse_trace::MacroExpansion], col
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Run one command line through the real pipeline — `normalize_argv` then
+    /// `Args::parse_from` then the `_subcommand` fixup from `run_main` — and return
+    /// `(verb, module, cargo_args)`, which is everything downstream dispatch acts on.
+    fn parsed(argv: &[&str]) -> (Option<Verb>, Option<String>, Vec<String>) {
+        let (verb, out) = normalize_argv(argv.iter().map(std::ffi::OsString::from));
+        let mut args = Args::parse_from(out);
+        if args.module.is_none() {
+            if let Some(ref sub) = args._subcommand {
+                if sub != "macra" {
+                    args.module = Some(sub.clone());
+                }
+            }
+        }
+        (verb, args.module, args.cargo_args)
+    }
+
+    #[test]
+    fn cargo_macra_with_no_verb_is_unchanged() {
+        assert_eq!(parsed(&["cargo-macra"]), (None, None, vec![]));
+        assert_eq!(parsed(&["cargo-macra", "macra"]), (None, None, vec![]));
+        assert_eq!(
+            parsed(&["cargo-macra", "macra", "foo::bar"]),
+            (None, Some("foo::bar".into()), vec![])
+        );
+        assert_eq!(
+            parsed(&["cargo-macra", "foo::bar"]),
+            (None, Some("foo::bar".into()), vec![])
+        );
+    }
+
+    #[test]
+    fn verb_alone_leaves_module_unset() {
+        assert_eq!(
+            parsed(&["cargo-macra", "macra", "list"]),
+            (Some(Verb::List), None, vec![])
+        );
+        // Direct invocation (no cargo-inserted "macra") behaves the same.
+        assert_eq!(
+            parsed(&["cargo-macra", "list"]),
+            (Some(Verb::List), None, vec![])
+        );
+    }
+
+    #[test]
+    fn verb_plus_module_both_ways() {
+        assert_eq!(
+            parsed(&["cargo-macra", "macra", "expand", "foo::bar"]),
+            (Some(Verb::Expand), Some("foo::bar".into()), vec![])
+        );
+        assert_eq!(
+            parsed(&["cargo-macra", "expand", "foo::bar"]),
+            (Some(Verb::Expand), Some("foo::bar".into()), vec![])
+        );
+    }
+
+    /// `cargo macra list -- foo::bar`: an explicit `--` between the verb and the
+    /// module must be equivalent to leaving it out.
+    #[test]
+    fn dashdash_between_verb_and_module_is_a_no_op() {
+        assert_eq!(
+            parsed(&["cargo-macra", "macra", "list", "--", "foo::bar"]),
+            (Some(Verb::List), Some("foo::bar".into()), vec![])
+        );
+    }
+
+    /// `cargo macra -- expand`: the escape hatch for a module literally named
+    /// `expand`/`list` — no verb, `expand` is the module.
+    #[test]
+    fn leading_dashdash_escapes_a_module_named_like_a_verb() {
+        assert_eq!(
+            parsed(&["cargo-macra", "macra", "--", "expand"]),
+            (None, Some("expand".into()), vec![])
+        );
+        assert_eq!(
+            parsed(&["cargo-macra", "--", "expand"]),
+            (None, Some("expand".into()), vec![])
+        );
+        assert_eq!(
+            parsed(&["cargo-macra", "macra", "--", "list"]),
+            (None, Some("list".into()), vec![])
+        );
+    }
+
+    /// A verb, a module, *and* cargo args forwarded after `--` must all survive
+    /// together — the conflict the verb/`--`-escape design has to not create.
+    #[test]
+    fn verb_module_and_forwarded_cargo_args_coexist() {
+        assert_eq!(
+            parsed(&[
+                "cargo-macra",
+                "macra",
+                "expand",
+                "foo::bar",
+                "--",
+                "--release"
+            ]),
+            (
+                Some(Verb::Expand),
+                Some("foo::bar".into()),
+                vec!["--release".to_string()]
+            )
+        );
+        // Direct invocation, same shape.
+        assert_eq!(
+            parsed(&["cargo-macra", "expand", "foo::bar", "--", "--release"]),
+            (
+                Some(Verb::Expand),
+                Some("foo::bar".into()),
+                vec!["--release".to_string()]
+            )
+        );
+    }
+
+    /// No verb at all: forwarding cargo args after `--` must keep working exactly as
+    /// it always did (the pre-existing convention this change must not break).
+    #[test]
+    fn no_verb_forwarded_cargo_args_still_work() {
+        assert_eq!(
+            parsed(&["cargo-macra", "macra", "foo::bar", "--", "--release"]),
+            (None, Some("foo::bar".into()), vec!["--release".to_string()])
+        );
+    }
+
+    /// The four forms the coordinator asked for explicitly, spelled out literally
+    /// rather than through `parsed`'s building blocks, so a future refactor of
+    /// `normalize_argv` or the fixup has to keep these exact command lines working.
+    #[test]
+    fn the_four_required_invocation_shapes() {
+        // `cargo macra list` — verb, no module.
+        assert_eq!(
+            parsed(&["cargo-macra", "macra", "list"]),
+            (Some(Verb::List), None, vec![])
+        );
+        // `cargo macra list foo::bar` — verb + module.
+        assert_eq!(
+            parsed(&["cargo-macra", "macra", "list", "foo::bar"]),
+            (Some(Verb::List), Some("foo::bar".into()), vec![])
+        );
+        // `cargo macra list -- foo::bar` — same thing, explicitly separated.
+        assert_eq!(
+            parsed(&["cargo-macra", "macra", "list", "--", "foo::bar"]),
+            (Some(Verb::List), Some("foo::bar".into()), vec![])
+        );
+        // `cargo macra -- expand` — NO verb; module literally named `expand`.
+        assert_eq!(
+            parsed(&["cargo-macra", "macra", "--", "expand"]),
+            (None, Some("expand".into()), vec![])
+        );
+    }
+
+    /// `cargo run --bin cargo-macra -- list` reaches us as `["list"]` (`cargo run`'s
+    /// own `--` never crosses into our argv), the harder of the two invocation
+    /// styles: no cargo-inserted `"macra"` sentinel at all. This used to arrive as
+    /// `_subcommand="list", module=None` — indistinguishable from a plain, verb-less
+    /// invocation — and fall into the `_subcommand` fixup, which relabelled `list`
+    /// as the module and sent `resolve_module_path` looking for a module that was
+    /// never meant to exist.
+    #[test]
+    fn direct_invocation_with_verb_does_not_leak_into_module() {
+        assert_eq!(
+            parsed(&["cargo-macra", "list"]),
+            (Some(Verb::List), None, vec![])
+        );
+        assert_eq!(
+            parsed(&["cargo-macra", "expand"]),
+            (Some(Verb::Expand), None, vec![])
+        );
+    }
 
     fn node(kind: MacroKind, line: usize, col_start: usize, col_end: usize) -> MacroNode {
         MacroNode {
@@ -7546,6 +8229,59 @@ pub struct Page {
         assert!(
             !spans.contains(&debug_cols),
             "a built-in derive must not be offered; spans={spans:?} debug={debug_cols:?}"
+        );
+    }
+
+    /// `--macro` resolves against the macros on offer at that depth — the numbers the
+    /// matching `list` printed — and a name takes the first of them.
+    #[test]
+    fn a_macro_selector_takes_a_number_or_the_first_matching_name() {
+        let app = test_app("#[derive(Debug, Greet)]\nstruct A;\n#[derive(Greet)]\nstruct B;\n");
+        let frontier: Vec<usize> = app.nodes.iter().map(|n| n.id).collect();
+        let at = |i: usize| app.get_node(frontier[i]).unwrap().call.name.clone();
+
+        // A number is 1-based over exactly that list.
+        assert_eq!(resolve_one(&app, &frontier, "1").unwrap(), frontier[0]);
+        assert_eq!(resolve_one(&app, &frontier, "3").unwrap(), frontier[2]);
+
+        // A name takes the FIRST macro with that name, not every one of them: there
+        // are two `Greet`s here, and a later one is reachable only by number.
+        let first_greet = frontier
+            .iter()
+            .copied()
+            .find(|&id| app.get_node(id).unwrap().call.name == "Greet")
+            .unwrap();
+        assert_eq!(resolve_one(&app, &frontier, "Greet").unwrap(), first_greet);
+        assert_ne!(at(0), "Greet", "fixture should not start with Greet");
+
+        // Nothing matched is an error that says what would have.
+        let err = resolve_one(&app, &frontier, "nope").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("no macro matches"), "{msg}");
+        assert!(
+            msg.contains("Greet"),
+            "should name the available names: {msg}"
+        );
+        // A number past the end is the same kind of refusal, not a silent clamp.
+        assert!(resolve_one(&app, &frontier, "99").is_err());
+        assert!(resolve_one(&app, &frontier, "0").is_err());
+    }
+
+    /// With no selectors the walk expands nothing and offers the file's own macros, so
+    /// `list` and `expand` agree on what number 1 means before anything happens.
+    #[test]
+    fn an_empty_macro_path_leaves_the_file_untouched() {
+        let mut app = test_app("#[derive(Greet)]\nstruct A;\n");
+        let before = app.source_lines.clone();
+        let frontier = walk_macro_path(&mut app, &[]).unwrap();
+        assert_eq!(
+            frontier,
+            app.nodes.iter().map(|n| n.id).collect::<Vec<_>>(),
+            "an empty path offers exactly the root macros"
+        );
+        assert_eq!(
+            app.source_lines, before,
+            "nothing should have been expanded"
         );
     }
 }
