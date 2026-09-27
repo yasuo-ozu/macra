@@ -86,6 +86,53 @@ Print traced expansions without launching TUI:
 cargo macra --manifest-path /path/to/Cargo.toml --show-expansion
 ```
 
+### Non-interactive: `list` and `expand`
+
+`cargo macra expand` prints expanded source like `cargo-expand`, and with no
+arguments it expands everything:
+
+```bash
+cargo macra expand
+```
+
+Unlike `cargo-expand`, you can expand *one macro at a time*. `cargo macra list`
+numbers what is expandable:
+
+```bash
+$ cargo macra list
+  1. attr    add_hello_method  (line 21)
+  2. fn      make_answer  (line 27)
+  3. derive  Greet  (line 30)
+```
+
+`--macro` then picks one, by number or by name (the first macro with that name):
+
+```bash
+cargo macra expand --macro 3        # expand just that derive
+cargo macra expand --macro Greet    # the same one, by name
+```
+
+`--macro` repeats to go *deeper*, because a macro's expansion usually contains
+more macros. `list` shows what is inside a result, and `expand` shows the result
+itself:
+
+```bash
+$ cargo macra list --macro Greet    # what appears inside Greet's expansion
+  1. fn      format  (line 33)
+
+$ cargo macra expand --macro Greet --macro 1    # ... and expand that too
+```
+
+So each `--macro` is one step down a path, and the numbers are always the ones
+the matching `list` just printed. A `--` may separate the subcommand from a
+module path, which is also how to reach a module whose name collides with a
+subcommand:
+
+```bash
+cargo macra list -- foo::bar
+cargo macra -- expand              # the module `expand`, not the subcommand
+```
+
 ## CLI Options
 
 ```text
