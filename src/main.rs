@@ -5289,8 +5289,9 @@ fn resolve_one(app: &App, candidates: &[usize], raw: &str) -> io::Result<usize> 
 /// result", and it is why `--macro` repeats: a path, not a set.
 ///
 /// `list` then prints the macros this returns; `expand` prints the buffer they sit in.
-fn walk_macro_path(app: &mut App, selectors: &[String]) -> io::Result<Vec<usize>> {
+fn walk_macro_path(app: &mut App, selectors: &[String]) -> io::Result<MacroPath> {
     let mut frontier: Vec<usize> = app.nodes.iter().map(|n| n.id).collect();
+    let mut last = None;
     for raw in selectors {
         let id = resolve_one(app, &frontier, raw)?;
         let name = app
@@ -5329,9 +5330,17 @@ fn walk_macro_path(app: &mut App, selectors: &[String]) -> io::Result<Vec<usize>
             };
             return Err(io::Error::other(why));
         }
+        last = Some(id);
         frontier = children;
     }
-    Ok(frontier)
+    Ok(MacroPath { frontier, last })
+}
+
+/// Where a `--macro` path ended: the macros now on offer, and the macro whose
+/// expansion they came out of (`None` for an empty path, which expands nothing).
+struct MacroPath {
+    frontier: Vec<usize>,
+    last: Option<usize>,
 }
 
 /// `cargo macra list`: number the macros on offer, in source order, marking the ones
@@ -5343,7 +5352,7 @@ fn walk_macro_path(app: &mut App, selectors: &[String]) -> io::Result<Vec<usize>
 /// printed are the ones the next `--macro` accepts, at every depth.
 fn run_list(args: &Args) -> io::Result<()> {
     let mut app = load_app_headless(args)?;
-    let frontier = walk_macro_path(&mut app, &args.macro_selectors)?;
+    let frontier = walk_macro_path(&mut app, &args.macro_selectors)?.frontier;
 
     if frontier.is_empty() {
         if args.macro_selectors.is_empty() {
@@ -5371,6 +5380,26 @@ fn run_list(args: &Args) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Just the lines one expanded macro now occupies — its own output, including
+/// anything a deeper `--macro` step expanded inside it.
+///
+/// `actual_expanded_line_count` is what makes the nesting work: it grows the region by
+/// whatever the children added, so the range still covers the whole result rather than
+/// cutting it off at the original output's length.
+fn print_expanded_region(app: &App, id: usize, color: bool) {
+    let Some(node) = app.get_node(id) else { return };
+    let start = node.call.line.saturating_sub(1);
+    let len = app.actual_expanded_line_count(id).max(1);
+    let end = (start + len).min(app.source_lines.len());
+    let mut text = app.source_lines[start.min(end)..end].join("\n");
+    text.push('\n');
+    if color {
+        print!("{}", pretty::highlight(&text));
+    } else {
+        print!("{}", text);
+    }
 }
 
 /// The buffer as it stands, syntax-highlighted only when asked for — `expand` is meant
@@ -5416,8 +5445,13 @@ fn run_expand(args: &Args) -> io::Result<()> {
     // how the user asks to go one level deeper, which would be meaningless if this
     // recursed on its own and expanded the deeper levels anyway.
     if !args.macro_selectors.is_empty() {
-        walk_macro_path(&mut app, &args.macro_selectors)?;
-        print_buffer(&app, color);
+        let path = walk_macro_path(&mut app, &args.macro_selectors)?;
+        // Print the selected macro's own result, not the whole file. Asking for one
+        // macro and being handed the entire expanded file back is what `expand` with no
+        // selector already does; the point of naming a macro is to see just its output
+        // (with any deeper `--macro` steps expanded inside it).
+        let id = path.last.expect("a non-empty path expanded something");
+        print_expanded_region(&app, id, color);
         return Ok(());
     }
 
@@ -8273,9 +8307,10 @@ pub struct Page {
     fn an_empty_macro_path_leaves_the_file_untouched() {
         let mut app = test_app("#[derive(Greet)]\nstruct A;\n");
         let before = app.source_lines.clone();
-        let frontier = walk_macro_path(&mut app, &[]).unwrap();
+        let path = walk_macro_path(&mut app, &[]).unwrap();
+        assert!(path.last.is_none(), "an empty path expands nothing");
         assert_eq!(
-            frontier,
+            path.frontier,
             app.nodes.iter().map(|n| n.id).collect::<Vec<_>>(),
             "an empty path offers exactly the root macros"
         );
