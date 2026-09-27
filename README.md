@@ -108,9 +108,12 @@ $ cargo macra list
 `--macro` then picks one, by number or by name (the first macro with that name):
 
 ```bash
-cargo macra expand --macro 3        # expand just that derive
+cargo macra expand --macro 3        # print just that derive's expansion
 cargo macra expand --macro Greet    # the same one, by name
 ```
+
+With no `--macro`, `expand` prints the whole file like `cargo-expand`. With one, it
+prints only that macro's own result.
 
 `--macro` repeats to go *deeper*, because a macro's expansion usually contains
 more macros. `list` shows what is inside a result, and `expand` shows the result
