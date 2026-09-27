@@ -5105,15 +5105,21 @@ fn run_main() -> io::Result<()> {
         None => {}
     }
 
-    let loaded = load_source_and_trace(&args)?;
+    // The TUI clears the screen anyway, but `--show-expansion` prints to stdout and is
+    // piped as often as the new subcommands are, so it gets the same quiet treatment.
+    let mut progress = Progress::new("Starting");
+    let loaded = load_source_and_trace(&args, &progress)?;
 
     if args.show_expansion {
+        progress.phase("Building (cargo check -Z trace-macros)");
         let expansions: Vec<_> = loaded.run.iter.collect::<io::Result<Vec<_>>>()?;
+        progress.finish();
         print_expansions(&expansions, args.color.resolve());
         return Ok(());
     }
 
     let cache = ExpansionCache::new(loaded.run.iter, loaded.run.check_result, loaded.run.child);
+    progress.finish();
     run_app(
         loaded.source,
         loaded.src_path,
@@ -5125,6 +5131,126 @@ fn run_main() -> io::Result<()> {
 }
 
 /// Everything `run_main` needs before it can either launch the TUI, print raw
+/// A single self-erasing stderr line for the slow part of a run.
+///
+/// This replaces three unconditional `eprintln!`s ("Finding source file…", "Loading
+/// source from…", "Running cargo with -Z trace-macros…"). `list` and `expand` exist to
+/// be piped, and three lines of diagnostics on every run is noise a pipeline has to
+/// filter; meanwhile the genuinely useful fact — that a full `cargo check` is running
+/// and how much of it has arrived — was never reported at all.
+///
+/// Draws nothing whatsoever when stderr is not a terminal, so a pipe, a CI log or a
+/// redirect stays clean. When it is a terminal, one line is redrawn in place and erased
+/// on `finish`, leaving the output the command actually produced and nothing else.
+struct Progress {
+    state: Arc<Mutex<ProgressState>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+struct ProgressState {
+    phase: String,
+    /// Set once the trace is streaming, so the line can report how many expansions
+    /// have arrived — the only real measure of progress available, since cargo's own
+    /// output is captured for parsing and cannot be shown.
+    cache: Option<Arc<(Mutex<CacheInner>, Condvar)>>,
+}
+
+impl Progress {
+    fn new(phase: &str) -> Self {
+        use std::io::IsTerminal;
+        let state = Arc::new(Mutex::new(ProgressState {
+            phase: phase.to_string(),
+            cache: None,
+        }));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if !std::io::stderr().is_terminal() {
+            return Self {
+                state,
+                stop,
+                handle: None,
+            };
+        }
+        let (st, sp) = (Arc::clone(&state), Arc::clone(&stop));
+        let handle = std::thread::spawn(move || {
+            use std::io::Write;
+            const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            let start = std::time::Instant::now();
+            let mut i = 0usize;
+            while !sp.load(std::sync::atomic::Ordering::Relaxed) {
+                // Both locks are held only long enough to copy two small values; the
+                // reader thread pushing expansions must not be made to wait on drawing.
+                let (phase, count) = {
+                    let s = st.lock().unwrap_or_else(|e| e.into_inner());
+                    let count = s.cache.as_ref().map(|c| {
+                        let (ref m, _) = **c;
+                        m.lock().unwrap_or_else(|e| e.into_inner()).expansions.len()
+                    });
+                    (s.phase.clone(), count)
+                };
+                let detail = match count {
+                    Some(n) => format!(" — {n} expansions"),
+                    None => String::new(),
+                };
+                let mut err = std::io::stderr();
+                let _ = write!(
+                    err,
+                    "\r\x1b[2K{} {}{} ({:.0}s)",
+                    FRAMES[i % FRAMES.len()],
+                    phase,
+                    detail,
+                    start.elapsed().as_secs_f32()
+                );
+                let _ = err.flush();
+                i += 1;
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            let mut err = std::io::stderr();
+            let _ = write!(err, "\r\x1b[2K");
+            let _ = err.flush();
+        });
+        Self {
+            state,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn phase(&self, phase: &str) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).phase = phase.to_string();
+    }
+
+    /// Start reporting how many expansions have streamed in.
+    fn watch(&self, cache: Arc<(Mutex<CacheInner>, Condvar)>) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).cache = Some(cache);
+    }
+
+    /// Stop drawing and clear the line so a message can be printed where the spinner
+    /// was. The spinner does not come back: anything worth printing mid-run is worth
+    /// keeping on screen, and a redraw would scribble over it.
+    fn clear_for_message(&self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        // The drawing thread clears the line on its way out; give it its tick to do so
+        // rather than racing it with our own write.
+        std::thread::sleep(std::time::Duration::from_millis(120));
+    }
+
+    /// Stop drawing and clear the line. Idempotent, and called before anything else
+    /// writes — a half-drawn spinner left above real output is worse than no spinner.
+    fn finish(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for Progress {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
 /// expansions (`--show-expansion`), or — the two new callers — build a headless
 /// `App` for `list`/`expand`. Factored out of `run_main` so those two extra callers
 /// do not re-diverge from the source-file/module-resolution/cargo-invocation logic
@@ -5138,11 +5264,14 @@ struct LoadedSource {
     tm: TraceMacros,
 }
 
-fn load_source_and_trace(args: &Args) -> io::Result<LoadedSource> {
-    eprintln!("Finding source file via cargo metadata...");
+fn load_source_and_trace(args: &Args, progress: &Progress) -> io::Result<LoadedSource> {
+    progress.phase("Locating target");
     let top_level_path = match find_source_file(args) {
         Ok(p) => p,
         Err(e) => {
+            // The progress line has to go before the error, or the spinner's next redraw
+            // overwrites it.
+            progress.clear_for_message();
             eprintln!("Error finding source file: {}", e);
             std::process::exit(1);
         }
@@ -5153,6 +5282,7 @@ fn load_source_and_trace(args: &Args) -> io::Result<LoadedSource> {
         match resolve_module_path(&top_level_path, module_str) {
             Ok(result) => result,
             Err(e) => {
+                progress.clear_for_message();
                 eprintln!("Error resolving module path '{}': {}", module_str, e);
                 std::process::exit(1);
             }
@@ -5161,7 +5291,7 @@ fn load_source_and_trace(args: &Args) -> io::Result<LoadedSource> {
         (top_level_path.clone(), vec!["crate".to_string()])
     };
 
-    eprintln!("Loading source from {}", src_path.display());
+    progress.phase("Reading source");
     let source = expand_tabs(&std::fs::read_to_string(&src_path)?);
 
     // Touch the source file to invalidate cargo's cache and force recompilation.
@@ -5171,7 +5301,8 @@ fn load_source_and_trace(args: &Args) -> io::Result<LoadedSource> {
     // stderr won't contain proc-macro expansion data.
     let _ = filetime::set_file_mtime(&src_path, filetime::FileTime::now());
 
-    eprintln!("Running cargo with -Z trace-macros...");
+    // The slow phase by far: a full `cargo check` of the target and its dependencies.
+    progress.phase("Building (cargo check -Z trace-macros)");
     let tm = build_trace_macros(args);
     let run = tm.run()?;
 
@@ -5196,9 +5327,12 @@ fn load_source_and_trace(args: &Args) -> io::Result<LoadedSource> {
 /// helpers `expand_node` calls while a lookup is waiting — `draw_wait_notice` and
 /// `wait_cancelled` — already degrade to no-ops when stdout/stdin are not a TTY
 /// (checked at their call sites), which is exactly the case here.
-fn load_app_headless(args: &Args) -> io::Result<App> {
-    let loaded = load_source_and_trace(args)?;
+fn load_app_headless(args: &Args, progress: &Progress) -> io::Result<App> {
+    let loaded = load_source_and_trace(args, progress)?;
     let cache = ExpansionCache::new(loaded.run.iter, loaded.run.check_result, loaded.run.child);
+    // From here the expansion count is a real measure of progress, so let the line show
+    // it while `wait_done` blocks for the rest of the build.
+    progress.watch(Arc::clone(&cache.inner));
     cache.wait_done();
     let mut app = App::new(
         loaded.source,
@@ -5351,7 +5485,10 @@ struct MacroPath {
 /// expansion — "show me the expansion points in this macro's result". The numbers
 /// printed are the ones the next `--macro` accepts, at every depth.
 fn run_list(args: &Args) -> io::Result<()> {
-    let mut app = load_app_headless(args)?;
+    // Erased before anything is printed, so the output is only what was asked for.
+    let mut progress = Progress::new("Starting");
+    let mut app = load_app_headless(args, &progress)?;
+    progress.finish();
     let frontier = walk_macro_path(&mut app, &args.macro_selectors)?.frontier;
 
     if frontier.is_empty() {
@@ -5438,7 +5575,10 @@ const EXPAND_ROUND_CAP: usize = 128;
 /// (finite) trace already produced by a completed build. The cap exists purely to
 /// bound a pathological case rather than to make an otherwise-unbounded loop safe.
 fn run_expand(args: &Args) -> io::Result<()> {
-    let mut app = load_app_headless(args)?;
+    // Erased before anything is printed, so the output is only what was asked for.
+    let mut progress = Progress::new("Starting");
+    let mut app = load_app_headless(args, &progress)?;
+    progress.finish();
     let color = args.color.resolve();
 
     // `--macro` names a path, so expand exactly it and stop: each further `--macro` is
