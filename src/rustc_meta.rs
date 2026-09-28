@@ -18,16 +18,21 @@
 //!
 //! # Layout
 //!
-//! The `.rustc` section is `METADATA_HEADER` (`rust\0\0\0` + format version 10),
+//! The `.rustc` section is a header (`rust\0\0\0` + a metadata format version),
 //! a little-endian `u64` length, then the metadata blob. All positions below are
 //! offsets into that blob, which starts at section offset 16.
 //!
 //! The blob repeats the header, then holds the `CrateRoot` position as a raw
-//! little-endian `u64`, then the `rustc <version>` string. Everything else uses
+//! little-endian `u64`, then — in metadata format 11 only — another raw `u64` and
+//! a 16-byte hash, then the `rustc <version>` string. Everything else uses
 //! the opaque encoder: integers are LEB128, a `String` is `<len> <bytes> 0xC1`,
 //! an `Option` is a `0`/`1` byte, a derived enum's discriminant is one byte, a
 //! `Symbol` is `0x00` + string, `0x01` + offset of an earlier string, or `0x02` +
 //! predefined index.
+//!
+//! The two bracketed fields above are the ones that have moved: metadata format 11
+//! (1.101) dropped both `CrateHeader::hash` and `CrateRoot::extra_filename`. Which
+//! of the two shapes a blob uses is not looked up but tried, see `SHAPES`.
 //!
 //! Metadata is a post-order tree. A `LazyValue`/`LazyArray` field does not hold
 //! an absolute position: the first lazy field in a node stores the *backward*
@@ -35,12 +40,13 @@
 //! previous lazy field's target. `LazyArray` stores its element count first and
 //! omits the distance when the count is zero.
 //!
-//! `CrateRoot` starts with `CrateHeader { triple, hash: Svh (16 raw bytes),
-//! name: Symbol, is_proc_macro_crate, is_stub }`, then `extra_filename: String`,
+//! `CrateRoot` starts with `CrateHeader { triple, [hash: Svh (16 raw bytes)],
+//! name: Symbol, is_proc_macro_crate, is_stub }`, then `[extra_filename: String]`,
 //! `stable_crate_id` (8 raw bytes), `required_panic_strategy: Option<_>`,
 //! `panic_in_drop_strategy`, `edition`, four `bool`s, a run of `LazyArray`s (15 on
-//! 1.98, 16 from 1.99 — `canonical_symbols` was added; a proc-macro crate leaves
-//! every one of them empty, so each is a single `0` byte), then
+//! 1.98, 16 from 1.99 — `canonical_symbols` was added — and 17 on 1.101; a
+//! proc-macro crate leaves every one of them empty, so each is a single `0` byte),
+//! then
 //! `proc_macro_data: Option<ProcMacroData { proc_macro_decls_static: DefIndex,
 //! stability: Option<_>, macros: LazyArray<(DefIndex, LazyValue<ProcMacroKind>)> }>`.
 //!
@@ -71,35 +77,58 @@ pub struct ProcMacroEntry {
     pub helpers: Vec<String>,
 }
 
-/// `rust\0\0\0` followed by `METADATA_VERSION`, which is 10 on 1.98 through 1.100.
-const METADATA_HEADER: &[u8; 8] = b"rust\0\0\0\x0a";
+/// The fixed part of a `.rustc` section header; the byte after it is the metadata
+/// format version.
+const METADATA_PREFIX: &[u8; 7] = b"rust\0\0\0";
+/// The oldest metadata format version this module decodes: 10, which is 1.98
+/// through 1.100. Every later version is attempted — 11 arrived with 1.101 — for
+/// the same reason [`LAZY_ARRAY_COUNTS`] tries every count. rustc bumps this byte
+/// whenever anything in the encoding moves, including the parts this module never
+/// reads, so refusing an unrecognised version would put capture on rustc's release
+/// schedule rather than macra's. Nothing is taken on trust by accepting it: a bump
+/// that did move the fields read here still has to survive the structural checks
+/// and [`validate`], and fails closed when it does not.
+const MIN_METADATA_VERSION: u8 = 10;
 /// Terminates every encoded `str`; the decoder asserts on it.
 const STR_SENTINEL: u8 = 0xC1;
 const SYMBOL_STR: u8 = 0;
 const SYMBOL_OFFSET: u8 = 1;
 const SYMBOL_PREDEFINED: u8 = 2;
-/// Header, then the raw `u64` root position: the version string starts here.
-const BLOB_VERSION_POS: usize = 16;
+/// Where the `rustc <version>` string can start, nearest first.
+///
+/// In metadata format 10 it follows the repeated header and the raw `u64` root
+/// position. Format 11 (1.101) inserts two more fields there — another raw `u64`
+/// and a 16-byte hash, the `Svh` that left `CrateHeader` — moving the string to 40.
+/// Which one a blob uses is settled by reading it: the string is length-prefixed
+/// and begins `rustc `, and the other offset lands on raw little-endian bytes that
+/// do not decode to any such string.
+const BLOB_VERSION_POS: [usize; 2] = [16, 40];
 
 /// The metadata blob inside a `.rustc` section, if the framing checks out.
 fn blob(meta: &[u8]) -> Option<&[u8]> {
-    if meta.get(..8)? != METADATA_HEADER {
+    let header = meta.get(..8)?;
+    if header.get(..7)? != METADATA_PREFIX || header[7] < MIN_METADATA_VERSION {
         return None;
     }
     let len = u64::from_le_bytes(meta.get(8..16)?.try_into().ok()?);
     let end = 16usize.checked_add(usize::try_from(len).ok()?)?;
     let blob = meta.get(16..end)?;
-    (blob.get(..8)? == METADATA_HEADER).then_some(blob)
+    // The blob repeats the section header verbatim, format version included, so
+    // requiring the two to be equal also pins the version the outer header claimed.
+    (blob.get(..8)? == header).then_some(blob)
 }
 
 /// The `CrateRoot`'s position within the blob.
 fn root_pos(blob: &[u8]) -> Option<usize> {
     let pos = usize::try_from(u64::from_le_bytes(blob.get(8..16)?.try_into().ok()?)).ok()?;
-    (pos >= BLOB_VERSION_POS && pos < blob.len()).then_some(pos)
+    (pos >= BLOB_VERSION_POS[0] && pos < blob.len()).then_some(pos)
 }
 
 fn blob_version(blob: &[u8]) -> Option<&str> {
-    Reader::at(blob, BLOB_VERSION_POS)?.str()
+    BLOB_VERSION_POS.iter().find_map(|&pos| {
+        let s = Reader::at(blob, pos)?.str()?;
+        s.starts_with("rustc ").then_some(s)
+    })
 }
 
 /// The `rustc <version>` string recorded at the head of a `.rustc` section.
@@ -257,6 +286,45 @@ impl Node {
     }
 }
 
+/// The two parts of the scalar prefix that have moved, and so are tried rather
+/// than looked up.
+///
+/// Metadata format 11 (1.101) dropped `CrateHeader::hash`, a 16-byte `Svh` sitting
+/// between the target tuple and the crate name, and `CrateRoot::extra_filename`, a
+/// `String` just after `is_stub`. Both are fields this module only ever skipped
+/// over, so their removal changes nothing it needs — it just moves everything after
+/// them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Shape {
+    header_hash: bool,
+    extra_filename: bool,
+}
+
+/// Every prefix shape [`discover`] tries, newest first.
+///
+/// Gating these on the format version would work today and is how the version byte
+/// is meant to be read, but it would also mean a hard failure on the next bump that
+/// leaves this prefix alone — and rustc bumps that byte for any encoding change
+/// anywhere in `CrateRoot`, most of which this module never reads. Trying both
+/// shapes costs one extra walk over a few dozen bytes and keeps such a release
+/// decoding. The two are near-exclusive in practice: read with the wrong one, the
+/// crate name lands on raw hash bytes whose first byte is almost never a valid
+/// `Symbol` tag, and `extra_filename` lands on a `stable_crate_id` byte that is
+/// almost never a valid length. Anything that survives both still has to pass
+/// [`validate`], and two surviving shapes still have to agree.
+const SHAPES: [Shape; 2] = [
+    // 1.101 on, metadata format 11.
+    Shape {
+        header_hash: false,
+        extra_filename: false,
+    },
+    // 1.98 through 1.100, metadata format 10.
+    Shape {
+        header_hash: true,
+        extra_filename: true,
+    },
+];
+
 /// Position and element count of `ProcMacroData::macros`.
 struct MacrosArray {
     pos: usize,
@@ -264,7 +332,7 @@ struct MacrosArray {
 }
 
 /// Walk `CrateRoot` from its start to `proc_macro_data.macros`.
-fn macros_array(blob: &[u8], root: usize, n_arrays: usize) -> Option<MacrosArray> {
+fn macros_array(blob: &[u8], root: usize, n_arrays: usize, shape: Shape) -> Option<MacrosArray> {
     let mut r = Reader::at(blob, root)?;
     let mut node = Node::new(root);
 
@@ -281,7 +349,9 @@ fn macros_array(blob: &[u8], root: usize, n_arrays: usize) -> Option<MacrosArray
         }
         _ => return None,
     }
-    r.skip(16)?; // hash: Svh, a Fingerprint written as raw bytes
+    if shape.header_hash {
+        r.skip(16)?; // hash: Svh, a Fingerprint written as raw bytes
+    }
     r.symbol()?; // name
     if !r.bool()? {
         return None; // is_proc_macro_crate: this is not a proc-macro crate
@@ -291,7 +361,9 @@ fn macros_array(blob: &[u8], root: usize, n_arrays: usize) -> Option<MacrosArray
     }
 
     // CrateRoot scalars.
-    r.str()?; // extra_filename
+    if shape.extra_filename {
+        r.str()?; // extra_filename
+    }
     r.skip(8)?; // stable_crate_id: Hash64 written as raw bytes
     if r.bool()? {
         r.u8()?; // required_panic_strategy: Some(PanicStrategy)
@@ -412,9 +484,10 @@ fn decode(
     blob: &[u8],
     root: usize,
     n_arrays: usize,
+    shape: Shape,
     fn_names: &[String],
 ) -> Option<Vec<ProcMacroEntry>> {
-    let array = macros_array(blob, root, n_arrays)?;
+    let array = macros_array(blob, root, n_arrays, shape)?;
     if array.len != fn_names.len() {
         return None;
     }
@@ -452,14 +525,16 @@ fn decode(
 /// the cases where the real count is in the window and outvotes the coincidence.
 fn discover(blob: &[u8], root: usize, fn_names: &[String]) -> Option<(usize, Vec<ProcMacroEntry>)> {
     let mut found: Option<(usize, Vec<ProcMacroEntry>)> = None;
-    for n_arrays in LAZY_ARRAY_COUNTS {
-        let Some(entries) = decode(blob, root, n_arrays, fn_names) else {
-            continue;
-        };
-        match &found {
-            Some((_, prev)) if *prev != entries => return None,
-            Some(_) => {}
-            None => found = Some((n_arrays, entries)),
+    for shape in SHAPES {
+        for n_arrays in LAZY_ARRAY_COUNTS {
+            let Some(entries) = decode(blob, root, n_arrays, shape, fn_names) else {
+                continue;
+            };
+            match &found {
+                Some((_, prev)) if *prev != entries => return None,
+                Some(_) => {}
+                None => found = Some((n_arrays, entries)),
+            }
         }
     }
     found
@@ -645,7 +720,26 @@ mod tests {
         /// name where a walk two arrays too long lands, so that two candidate
         /// counts both decode. Needs exactly one macro, a derive.
         decoy: Option<&'static str>,
+        /// The metadata format version to stamp into both headers.
+        meta_version: u8,
+        /// Which scalar-prefix shape to emit.
+        shape: Shape,
+        /// Emit metadata format 11's longer blob prologue, which pushes the version
+        /// string from offset 16 to 40.
+        long_prologue: bool,
         macros: Vec<Macro>,
+    }
+
+    /// Metadata format 11's prefix, and format 10's.
+    const MODERN_SHAPE: Shape = SHAPES[0];
+    const LEGACY_SHAPE: Shape = SHAPES[1];
+
+    /// A `.rustc` header carrying `version` as its format byte.
+    fn header(version: u8) -> [u8; 8] {
+        let mut h = [0u8; 8];
+        h[..7].copy_from_slice(METADATA_PREFIX);
+        h[7] = version;
+        h
     }
 
     impl Synth {
@@ -660,6 +754,9 @@ mod tests {
                 stability: false,
                 extra_scalar: None,
                 decoy: None,
+                meta_version: MIN_METADATA_VERSION,
+                shape: LEGACY_SHAPE,
+                long_prologue: false,
                 macros,
             }
         }
@@ -684,8 +781,12 @@ mod tests {
             }
 
             let mut b = Vec::new();
-            b.extend_from_slice(METADATA_HEADER);
+            b.extend_from_slice(&header(self.meta_version));
             b.extend_from_slice(&[0u8; 8]); // root position, patched below
+            if self.long_prologue {
+                b.extend_from_slice(&[0x77; 8]); // format 11's extra raw u64
+                b.extend_from_slice(&[0x88; 16]); // and the hoisted Svh
+            }
             string(&mut b, self.version);
 
             // Filler resembling the def-path table entries that precede the
@@ -773,7 +874,9 @@ mod tests {
                 b.push(0);
                 string(&mut b, "x86_64-unknown-linux-gnu");
             }
-            b.extend_from_slice(&[0xab; 16]); // Svh
+            if self.shape.header_hash {
+                b.extend_from_slice(&[0xab; 16]); // Svh
+            }
             if self.predefined_crate_name {
                 b.push(SYMBOL_PREDEFINED);
                 leb(&mut b, 4242);
@@ -783,7 +886,9 @@ mod tests {
             }
             b.push(self.is_proc_macro as u8);
             b.push(0); // is_stub
-            string(&mut b, "-0123456789abcdef");
+            if self.shape.extra_filename {
+                string(&mut b, "-0123456789abcdef");
+            }
             b.extend_from_slice(&[0xcd; 8]); // stable_crate_id
             b.push(0); // required_panic_strategy: None
             b.push(0); // panic_in_drop_strategy
@@ -830,7 +935,7 @@ mod tests {
             b[8..16].copy_from_slice(&(root as u64).to_le_bytes());
 
             let mut section = Vec::new();
-            section.extend_from_slice(METADATA_HEADER);
+            section.extend_from_slice(&header(self.meta_version));
             section.extend_from_slice(&(b.len() as u64).to_le_bytes());
             section.extend_from_slice(&b);
             (section, records.iter().map(|r| r + 16).collect())
@@ -856,7 +961,11 @@ mod tests {
         let blob = blob(sec).expect("framing");
         let root = root_pos(blob).expect("root");
         LAZY_ARRAY_COUNTS
-            .filter(|&n| decode(blob, root, n, fns).is_some())
+            .filter(|&n| {
+                SHAPES
+                    .iter()
+                    .any(|&sh| decode(blob, root, n, sh, fns).is_some())
+            })
             .collect()
     }
 
@@ -950,28 +1059,93 @@ mod tests {
         assert_eq!(supported_minor("rustc 2.0.0"), None);
         assert_eq!(supported_minor("clang 1.98.0"), None);
 
-        // The verified layouts: 15 arrays on 1.98, 16 from 1.99. Discovery finds
-        // each from the bytes alone, and reports which count it was.
+        // The verified layouts: 15 arrays on 1.98, 16 from 1.99, 17 on 1.101, which
+        // also moved to metadata format 11 and its shorter scalar prefix. Discovery
+        // finds each from the bytes alone, and reports which count it was.
         let fns = names(&PROBE_FNS);
-        for (version, n_arrays) in [
-            ("rustc 1.98.0 (88d9e12ae 2026-08-18)", 15),
-            ("rustc 1.98.1 (48a229cea 2026-09-01)", 15),
-            ("rustc 1.99.0-beta.7 (aa0593682 2026-09-19)", 16),
-            ("rustc 1.100.0-nightly (cea272fa3 2026-09-07)", 16),
-            // What 1.101 would look like if it inserted another array: the case the
-            // version lookup could only guess at.
-            ("rustc 1.101.0-nightly (0 2026-10-01)", 17),
+        for (version, n_arrays, meta_version, shape, long_prologue) in [
+            (
+                "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+                15,
+                10,
+                LEGACY_SHAPE,
+                false,
+            ),
+            (
+                "rustc 1.98.1 (48a229cea 2026-09-01)",
+                15,
+                10,
+                LEGACY_SHAPE,
+                false,
+            ),
+            (
+                "rustc 1.99.0-beta.7 (aa0593682 2026-09-19)",
+                16,
+                10,
+                LEGACY_SHAPE,
+                false,
+            ),
+            (
+                "rustc 1.100.0-nightly (cea272fa3 2026-09-07)",
+                16,
+                10,
+                LEGACY_SHAPE,
+                false,
+            ),
+            // 1.101 as it actually ships: format 11, no `CrateHeader::hash`, no
+            // `extra_filename`, 17 arrays.
+            (
+                "rustc 1.101.0-nightly (d080e7dff 2026-09-27)",
+                17,
+                11,
+                MODERN_SHAPE,
+                true,
+            ),
+            // Neither axis is read off the other: the old prefix under a bumped
+            // format version, and the new prefix under the old one, both decode.
+            (
+                "rustc 1.101.0-nightly (0 2026-10-01)",
+                17,
+                11,
+                LEGACY_SHAPE,
+                true,
+            ),
+            (
+                "rustc 1.100.0-nightly (0 2026-09-07)",
+                16,
+                10,
+                MODERN_SHAPE,
+                false,
+            ),
             // The version string plays no part in the choice: 1.98's string over
             // the 16-array root decodes as the 16-array root.
-            ("rustc 1.98.0 (88d9e12ae 2026-08-18)", 16),
+            (
+                "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+                16,
+                10,
+                LEGACY_SHAPE,
+                false,
+            ),
         ] {
-            let (sec, _) = Synth::new(version, n_arrays, probe_macros()).build();
+            let mut synth = Synth::new(version, n_arrays, probe_macros());
+            synth.meta_version = meta_version;
+            synth.shape = shape;
+            synth.long_prologue = long_prologue;
+            let (sec, _) = synth.build();
             let blob = blob(&sec).unwrap();
             let (found, got) = discover(blob, root_pos(blob).unwrap(), &fns)
                 .unwrap_or_else(|| panic!("{version} with {n_arrays} arrays"));
             assert_eq!(found, n_arrays, "{version}");
             assert_eq!(got, entries(&PROBE_ENTRIES), "{version}");
             assert_eq!(counts_that_decode(&sec, &fns), vec![n_arrays], "{version}");
+            // Through the public entry point too, so that the version gate in
+            // front of `discover` has to find the version string as well. Format
+            // 11 moved it, and a `discover`-only assertion would not have noticed.
+            assert_eq!(
+                proc_macro_entries(&sec, &fns),
+                Some(entries(&PROBE_ENTRIES)),
+                "{version}"
+            );
         }
 
         // Outside the window nothing is tried, so nothing is found. The bounds are
@@ -1017,6 +1191,40 @@ mod tests {
         );
     }
 
+    /// A bumped metadata format version still decodes, because rustc bumps that
+    /// byte for encoding changes anywhere in `CrateRoot`, most of which this module
+    /// never reads — 1.101 stamped 11 and moved nothing that matters here. Versions
+    /// below the floor stay refused, and the blob's copy of the header has to carry
+    /// the same version the section claimed.
+    #[test]
+    fn newer_metadata_format_versions_decode_and_older_ones_do_not() {
+        let fns = names(&["derive_real"]);
+        let want = Some(entries(&[(KIND_DERIVE, "Real", &[])]));
+        let synth = |v: u8| {
+            let mut s = Synth::new(
+                "rustc 1.101.0-nightly (d080e7dff 2026-09-27)",
+                16,
+                vec![derive("Real", &[])],
+            );
+            s.meta_version = v;
+            s.build().0
+        };
+
+        for version in [MIN_METADATA_VERSION, MIN_METADATA_VERSION + 1, u8::MAX] {
+            let sec = synth(version);
+            assert_eq!(proc_macro_entries(&sec, &fns), want, "version {version}");
+        }
+        let old = synth(MIN_METADATA_VERSION - 1);
+        assert_eq!(blob(&old), None);
+        assert_eq!(proc_macro_entries(&old, &fns), None);
+
+        // Outer header says 11, the blob's copy still says 10.
+        let mut split = synth(MIN_METADATA_VERSION + 1);
+        split[16 + 7] = MIN_METADATA_VERSION;
+        assert_eq!(blob(&split), None);
+        assert_eq!(proc_macro_entries(&split, &fns), None);
+    }
+
     /// Two counts that both decode must agree, or nothing is returned. The decoy
     /// here is a derive record that a one-derive crate's function name cannot rule
     /// out — exactly the mislabel a wrong layout could produce — so the only defence
@@ -1036,9 +1244,12 @@ mod tests {
         let blob = blob(&sec).unwrap();
         let root = root_pos(blob).unwrap();
         // Each count on its own passes every structural check and `validate`.
-        assert_eq!(decode(blob, root, 15, &fns), Some(real.clone()));
         assert_eq!(
-            decode(blob, root, 17, &fns),
+            decode(blob, root, 15, LEGACY_SHAPE, &fns),
+            Some(real.clone())
+        );
+        assert_eq!(
+            decode(blob, root, 17, LEGACY_SHAPE, &fns),
             Some(entries(&[(KIND_DERIVE, "Decoy", &[])]))
         );
         assert_eq!(counts_that_decode(&sec, &fns), vec![15, 17]);
