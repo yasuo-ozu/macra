@@ -86,6 +86,82 @@ Print traced expansions without launching TUI:
 cargo macra --manifest-path /path/to/Cargo.toml --show-expansion
 ```
 
+## CLI Options
+
+```text
+  cargo macra [MODULE]                          launch the TUI (default)
+  cargo macra list   [MODULE] [--macro SEL]...  numbered listing of macros
+  cargo macra expand [MODULE] [--macro SEL]...  expanded source on stdout
+
+`--macro SEL` (repeatable) selects which macro(s) `list`/`expand` act on: a 1-based number from `list`'s own output, or a macro name matched on its last path segment. With none, `expand` expands everything reachable.
+
+Arguments:
+  [MODULE]
+          Module path to open (e.g., "foo::bar" opens the file for module `crate::foo::bar`). A module literally named `list` or `expand` needs a leading `--` ahead of it (`cargo macra -- expand`) so it is not mistaken for that subcommand
+  [CARGO_ARGS]...
+          Additional arguments to pass to cargo, after a literal `--` (e.g. `cargo macra expand foo -- --release`)
+
+Options:
+  -p, --package <PACKAGE>
+          Package to check
+      --bin <BIN>
+          Build only the specified binary
+      --lib
+          Build only the specified library
+      --test <TEST>
+          Build only the specified test target
+      --example <EXAMPLE>
+          Build only the specified example
+      --manifest-path <MANIFEST_PATH>
+          Path to Cargo.toml
+      --show-expansion
+          Print all macro expansions to stdout and exit without launching the TUI
+      --color <WHEN>
+          Coloring of printed expansions
+      --macro <SELECTOR>
+          Select which macro `list`/`expand` operate on: a 1-based number from `list`'s output, or a macro name match
+```
+
+## TUI Keys
+
+- `j` / `k`, `Up` / `Down`: Move cursor
+- `h` / `l`, `Left` / `Right`: Move between macros that share the current line
+- `g` / `G`, `Home` / `End`: Jump top/bottom
+- `n` / `N`: Jump next/previous macro
+- `Enter`: Expand/collapse macro or enter `mod` file
+- `Backspace`: Return to parent module
+- `Tab` / `Shift+Tab`: Move tree selection
+- `Space`: Toggle child visibility in macro tree
+- `v`: Toggle split view (compare original vs expanded)
+- `PageUp` / `PageDown`: Move a screenful
+- `r`: Reload trace data
+- `q`: Quit
+- `Esc`: Cancel a pending expansion, or dismiss the expansion-choice popup
+- `Ctrl-C` / `Ctrl-D`: Quit, and cancel a pending expansion
+
+`Esc` deliberately does not quit: it is the cancel key for a pending expansion, and an
+`Esc` arriving just after the trace landed would otherwise exit the application.
+
+### Split view
+
+By default an expansion is inlined in place of the code it replaced. Press `v` to
+compare the two instead: every expanded range becomes a two-column block with the
+original source on the left and the macro output on the right.
+
+```text
+  91 │
+  92 │ #[derive(Greet, Describe)]
+     ├─ original ─────────────────┬─ expanded: Describe ──────────────
+     │ #[derive(Greet, Describe)]  │ impl MultiDeriveOneAttr {
+     │                             │     pub fn describe() -> String {
+     │                             │         format!("{} is a struct", ..)
+     │                             │     }
+     │                             │ }
+     │                             │ #[derive(Greet)]
+     ├─────────────────────────────┴──────────────────────────────────
+  93 │ pub struct MultiDeriveOneAttr;
+```
+
 ### Non-interactive: `list` and `expand`
 
 `cargo macra expand` prints expanded source like `cargo-expand`, and with no
@@ -148,77 +224,6 @@ subcommand:
 cargo macra list -- foo::bar
 cargo macra -- expand              # the module `expand`, not the subcommand
 ```
-
-## CLI Options
-
-```text
-Usage: cargo macra [OPTIONS] [MODULE] [CARGO_ARGS]...
-
-Arguments:
-  [MODULE]         Module path to open (e.g., "foo::bar")
-  [CARGO_ARGS]...  Additional arguments to pass to cargo
-
-Options:
-  -p, --package <PACKAGE>              Package to check
-      --bin <BIN>                      Build only the specified binary
-      --lib                            Build only the specified library
-      --test <TEST>                    Build only the specified test target
-      --example <EXAMPLE>              Build only the specified example
-      --manifest-path <MANIFEST_PATH>  Path to Cargo.toml
-      --show-expansion                 Print expansions and exit
-      --color <WHEN>                   Coloring of printed expansions
-                                       [default: auto] [possible values: auto, always, never]
-  -h, --help                           Print help
-```
-
-Printed expansions are pretty-printed with `prettyplease` and syntax-highlighted.
-With `--color auto` (the default) colors are emitted only when stdout is a
-terminal; `NO_COLOR` and `TERM=dumb` disable them as well.
-
-## TUI Keys
-
-- `j` / `k`, `Up` / `Down`: Move cursor
-- `h` / `l`, `Left` / `Right`: Move between macros that share the current line
-- `g` / `G`, `Home` / `End`: Jump top/bottom
-- `n` / `N`: Jump next/previous macro
-- `Enter`: Expand/collapse macro or enter `mod` file
-- `Backspace`: Return to parent module
-- `Tab` / `Shift+Tab`: Move tree selection
-- `Space`: Toggle child visibility in macro tree
-- `v`: Toggle split view (compare original vs expanded)
-- `PageUp` / `PageDown`: Move a screenful
-- `r`: Reload trace data
-- `q`: Quit
-- `Esc`: Cancel a pending expansion, or dismiss the expansion-choice popup
-- `Ctrl-C` / `Ctrl-D`: Quit, and cancel a pending expansion
-
-`Esc` deliberately does not quit: it is the cancel key for a pending expansion, and an
-`Esc` arriving just after the trace landed would otherwise exit the application.
-
-### Split view
-
-By default an expansion is inlined in place of the code it replaced. Press `v` to
-compare the two instead: every expanded range becomes a two-column block with the
-original source on the left and the macro output on the right. Code outside those
-ranges stays full width, so only what actually changed is split.
-
-```text
-  91 │
-  92 │ #[derive(Greet, Describe)]
-     ├─ original ─────────────────┬─ expanded: Describe ──────────────
-     │ #[derive(Greet, Describe)]  │ impl MultiDeriveOneAttr {
-     │                             │     pub fn describe() -> String {
-     │                             │         format!("{} is a struct", ..)
-     │                             │     }
-     │                             │ }
-     │                             │ #[derive(Greet)]
-     ├─────────────────────────────┴──────────────────────────────────
-  93 │ pub struct MultiDeriveOneAttr;
-```
-
-Both columns are syntax highlighted; the original is dimmed to keep the expansion
-in focus. Nested expansions do not nest columns — only the outermost expanded range
-of a nest is split, since inner expansions already sit inside its output.
 
 ## Development
 
