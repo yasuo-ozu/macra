@@ -5778,6 +5778,31 @@ fn build_failure_message(build_err: &str) -> String {
     )
 }
 
+/// The failure, if any, that means this run's output cannot be trusted.
+///
+/// A failed build reaches the cache by **two** channels, and checking only one was a
+/// real bug: `ExpansionCache::new`'s reader sets `build_error` from the child's exit
+/// status — but only after the expansion stream is exhausted. If the stream itself
+/// yields an `Err` first, the reader records `error`, marks the cache done, and
+/// `break`s *before* ever reading the exit status (main.rs ~772-786), so `build_error`
+/// stays `None` however badly the build went. Checking `build_error` alone therefore
+/// reported success on CI while passing locally, which is the worst possible split.
+///
+/// Both are reported, with different wording: a non-zero `cargo check` means the output
+/// is incomplete, whereas a stream error means macra lost the trace midway and cannot
+/// say how much is missing.
+fn run_failure(app: &App) -> Option<io::Error> {
+    if let Some(build_err) = app.expansion_cache.build_error() {
+        return Some(io::Error::other(build_failure_message(&build_err)));
+    }
+    app.expansion_cache.take_error().map(|e| {
+        io::Error::other(format!(
+            "the expansion stream failed, so the output above is incomplete — macra \
+             cannot tell how much of the trace was lost.\n\n{e}"
+        ))
+    })
+}
+
 /// The one-line summary `run_list` prints for `node` at position `idx + 1`.
 ///
 /// Pulled out of `run_list`'s loop as a pure function so the exact line it
@@ -5823,7 +5848,7 @@ fn run_list(args: &Args) -> io::Result<()> {
     // matches nothing once the build left no trace to match against) — that path
     // already exits non-zero, but not with this message, so it is captured here to
     // be reported at every exit from this function, not just the one below.
-    let build_err = app.expansion_cache.build_error();
+    let failure = run_failure(&app);
     let frontier = walk_macro_path(&mut app, &args.macro_selectors)?.frontier;
 
     if frontier.is_empty() {
@@ -5832,8 +5857,8 @@ fn run_list(args: &Args) -> io::Result<()> {
         } else {
             println!("No macros inside that expansion.");
         }
-        if let Some(build_err) = build_err {
-            return Err(io::Error::other(build_failure_message(&build_err)));
+        if let Some(failure) = failure {
+            return Err(failure);
         }
         return Ok(());
     }
@@ -5847,8 +5872,8 @@ fn run_list(args: &Args) -> io::Result<()> {
             print_context(&app, id, args.context);
         }
     }
-    if let Some(build_err) = build_err {
-        return Err(io::Error::other(build_failure_message(&build_err)));
+    if let Some(failure) = failure {
+        return Err(failure);
     }
     Ok(())
 }
@@ -5970,7 +5995,7 @@ fn run_expand(args: &Args) -> io::Result<()> {
     // `build_failure_message` for why a build failure gets its own message instead
     // of folding into whatever the ordinary "no trace"/"ambiguous" paths already
     // report.
-    let build_err = app.expansion_cache.build_error();
+    let failure = run_failure(&app);
 
     // `--macro` names a path, so expand exactly it and stop: each further `--macro` is
     // how the user asks to go one level deeper, which would be meaningless if this
@@ -5983,8 +6008,8 @@ fn run_expand(args: &Args) -> io::Result<()> {
         // (with any deeper `--macro` steps expanded inside it).
         let id = path.last.expect("a non-empty path expanded something");
         print_expanded_region(&app, id, color);
-        if let Some(build_err) = build_err {
-            return Err(io::Error::other(build_failure_message(&build_err)));
+        if let Some(failure) = failure {
+            return Err(failure);
         }
         return Ok(());
     }
@@ -6056,8 +6081,8 @@ fn run_expand(args: &Args) -> io::Result<()> {
     }
 
     print_buffer(&app, color);
-    if let Some(build_err) = build_err {
-        return Err(io::Error::other(build_failure_message(&build_err)));
+    if let Some(failure) = failure {
+        return Err(failure);
     }
     Ok(())
 }
@@ -9008,8 +9033,13 @@ pub struct Page {
         ]);
         let err = run_list(&list_args)
             .expect_err("a failed build must surface as an error, not a silent Ok");
+        // Deliberately not asserting *which* channel reported it. A failed build can
+        // arrive either as a non-zero exit status or as an errored expansion stream
+        // (see `run_failure`), and which one you get depends on the environment — this
+        // very test passed locally and reported success on CI while it insisted on the
+        // exit-status wording. What must hold everywhere is that the run does not claim
+        // success and says the output is incomplete.
         let msg = err.to_string();
-        assert!(msg.contains("cargo check failed"), "{msg}");
         assert!(
             msg.contains("incomplete"),
             "must read as \"incomplete\", distinct from an ordinary missing trace: {msg}"
@@ -9025,7 +9055,6 @@ pub struct Page {
         let err = run_expand(&expand_args)
             .expect_err("a failed build must surface as an error, not a silent Ok");
         let msg = err.to_string();
-        assert!(msg.contains("cargo check failed"), "{msg}");
         assert!(msg.contains("incomplete"), "{msg}");
 
         let _ = std::fs::remove_dir_all(manifest.parent().unwrap());
@@ -9282,5 +9311,42 @@ pub struct Page {
     #[test]
     fn progress_line_budget_is_always_at_least_one() {
         assert!(progress_line_budget() >= 1);
+    }
+
+    /// A failed build reaches the cache by two channels, and `run_failure` must see
+    /// both. Checking only `build_error` passed locally and reported success on CI:
+    /// when the expansion stream errors, the reader records `error`, marks the cache
+    /// done and breaks *before* reading cargo's exit status, so `build_error` stays
+    /// `None` no matter how the build went.
+    #[test]
+    fn both_failure_channels_are_reported() {
+        // Channel 1: a non-zero `cargo check`.
+        let app = test_app("foo!();\n");
+        {
+            let (ref m, _) = *app.expansion_cache.inner;
+            m.lock().unwrap().build_error = Some("error[E0308]: mismatched types".into());
+        }
+        let err = run_failure(&app).expect("a non-zero cargo check must be reported");
+        assert!(err.to_string().contains("cargo check failed"), "{err}");
+
+        // Channel 2: the stream failed, so `build_error` was never even read.
+        let app = test_app("foo!();\n");
+        {
+            let (ref m, _) = *app.expansion_cache.inner;
+            let mut c = m.lock().unwrap();
+            c.error = Some("stream closed early".into());
+            assert!(
+                c.build_error.is_none(),
+                "this is the channel that was missed"
+            );
+        }
+        let err = run_failure(&app).expect("a stream failure must be reported too");
+        let msg = err.to_string();
+        assert!(msg.contains("expansion stream failed"), "{msg}");
+        assert!(msg.contains("stream closed early"), "{msg}");
+
+        // A healthy run reports nothing.
+        let app = test_app("foo!();\n");
+        assert!(run_failure(&app).is_none());
     }
 }
