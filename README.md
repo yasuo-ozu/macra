@@ -1,4 +1,4 @@
-# cargo-macra [![Latest Version]][crates.io] [![Documentation]][docs.rs] [![Check]][check] [![1.86-1.98]][versions] [![Nightly]][nightly] [![MSRV]][msrv] [![License]][license]
+# cargo-macra [![Latest Version]][crates.io] [![Documentation]][docs.rs] [![Check]][check-link] [![1.86-1.98]][versions] [![Nightly]][nightly-link] [![MSRV]][msrv-link] [![License]][license-link]
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/yasuo-ozu/macra/refs/heads/main/logo.png" alt="cargo-macra logo" width="320" />
@@ -9,15 +9,15 @@
 [Documentation]: https://img.shields.io/docsrs/cargo-macra
 [docs.rs]: https://docs.rs/cargo-macra/latest/cargo_macra/
 [Check]: https://github.com/yasuo-ozu/macra/actions/workflows/check.yml/badge.svg
-[check]: https://github.com/yasuo-ozu/macra/actions/workflows/check.yml
+[check-link]: https://github.com/yasuo-ozu/macra/actions/workflows/check.yml
 [1.86-1.98]: https://github.com/yasuo-ozu/macra/actions/workflows/1.86-1.98.yml/badge.svg
 [versions]: https://github.com/yasuo-ozu/macra/actions/workflows/1.86-1.98.yml
 [Nightly]: https://github.com/yasuo-ozu/macra/actions/workflows/nightly.yml/badge.svg
-[nightly]: https://github.com/yasuo-ozu/macra/actions/workflows/nightly.yml
+[nightly-link]: https://github.com/yasuo-ozu/macra/actions/workflows/nightly.yml
 [MSRV]: https://img.shields.io/badge/MSRV-1.86-blue.svg
-[msrv]: https://github.com/yasuo-ozu/macra/blob/main/Cargo.toml
+[msrv-link]: https://github.com/yasuo-ozu/macra/blob/main/Cargo.toml
 [License]: https://img.shields.io/crates/l/cargo-macra.svg
-[license]: https://github.com/yasuo-ozu/macra/blob/main/LICENSE
+[license-link]: https://github.com/yasuo-ozu/macra/blob/main/LICENSE
 
 
 Interactive Rust macro expansion viewer with a terminal UI.

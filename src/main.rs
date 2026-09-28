@@ -730,6 +730,31 @@ struct ExpansionCache {
     child: Arc<Mutex<std::process::Child>>,
 }
 
+/// ANSI escape sequences removed, so a line can be matched by its text.
+///
+/// `cargo` colours its output whenever `CARGO_TERM_COLOR=always` is set — which CI
+/// does — and a coloured "error[E0308]" line starts with `\x1b[` rather than `error`.
+fn strip_ansi_escapes(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        // CSI: `ESC [ ... final-byte-in-@..~`. Anything else: drop the ESC alone.
+        if chars.next() != Some('[') {
+            continue;
+        }
+        for t in chars.by_ref() {
+            if ('\x40'..='\x7e').contains(&t) {
+                break;
+            }
+        }
+    }
+    out
+}
+
 impl ExpansionCache {
     fn new(
         iter: MacroExpansionIter,
@@ -809,15 +834,30 @@ impl ExpansionCache {
                     return None;
                 }
                 // Extract compiler error lines from stderr (skip hook/trace noise).
-                let errors: Vec<&str> = result
+                //
+                // Matched after stripping ANSI, because CI commonly sets
+                // `CARGO_TERM_COLOR=always` and a coloured line begins with an escape
+                // sequence, not with "error" — so a plain `starts_with` matched nothing
+                // and the whole build failure evaporated. That reproduced exactly:
+                // `CARGO_TERM_COLOR=always cargo test` failed where the same test
+                // passed without it.
+                let plain: Vec<String> = result
                     .stderr
                     .lines()
-                    .filter(|l| l.starts_with("error"))
+                    .map(strip_ansi_escapes)
+                    .filter(|l| l.trim_start().starts_with("error"))
                     .collect();
-                if errors.is_empty() {
-                    None
+                // Never `None` here: the build *did* fail, and saying nothing because no
+                // line happened to match would report success — which is how a failing
+                // build reached the user as a clean exit 0.
+                if plain.is_empty() {
+                    Some(
+                        "cargo check exited non-zero, but no error line could be \
+                         extracted from its output"
+                            .to_string(),
+                    )
                 } else {
-                    Some(errors.join("\n"))
+                    Some(plain.join("\n"))
                 }
             }
             Ok(Err(e)) => Some(format!("failed to wait for cargo check: {}", e)),
@@ -9348,5 +9388,50 @@ pub struct Page {
         // A healthy run reports nothing.
         let app = test_app("foo!();\n");
         assert!(run_failure(&app).is_none());
+    }
+
+    /// A failed build must be reported whether or not cargo coloured its output.
+    ///
+    /// CI sets `CARGO_TERM_COLOR=always`, so the error line begins with an escape
+    /// sequence; matching `starts_with("error")` on the raw line found nothing and the
+    /// failure was reported as success. And a failure with no recognisable error line
+    /// must still be a failure.
+    #[test]
+    fn a_failed_build_is_recognised_even_when_cargo_colours_its_output() {
+        use cargo_macra::trace_macros::CheckResult;
+        let failed = |stderr: &str| CheckResult {
+            success: false,
+            stdout: String::new(),
+            stderr: stderr.to_string(),
+        };
+
+        let plain = ExpansionCache::check_result_to_build_error(Ok(Ok(failed(
+            "error[E0308]: mismatched types\n   --> src/lib.rs:2:5\n",
+        ))))
+        .expect("a plain failure must be reported");
+        assert!(plain.contains("E0308"), "{plain}");
+
+        // The same output as cargo writes it under CARGO_TERM_COLOR=always.
+        let coloured = ExpansionCache::check_result_to_build_error(Ok(Ok(failed(
+            "\x1b[1m\x1b[31merror[E0308]\x1b[0m: mismatched types\n",
+        ))))
+        .expect("a coloured failure must be reported too");
+        assert!(coloured.contains("E0308"), "{coloured}");
+
+        // Nothing recognisable, but it still failed — must not report success.
+        let unrecognised =
+            ExpansionCache::check_result_to_build_error(Ok(Ok(failed("something odd\n"))))
+                .expect("a failure with no error line is still a failure");
+        assert!(unrecognised.contains("non-zero"), "{unrecognised}");
+
+        // A successful build reports nothing.
+        assert!(
+            ExpansionCache::check_result_to_build_error(Ok(Ok(CheckResult {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            })))
+            .is_none()
+        );
     }
 }
