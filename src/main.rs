@@ -3350,9 +3350,9 @@ impl App {
             // (other attrs + the item body itself)
             let after_attr_idx = line_end; // line_end (1-indexed) used as 0-index = next line
             let item_end_idx = item_line_end.saturating_sub(1);
-            for idx in after_attr_idx..=item_end_idx.min(self.source_lines.len().saturating_sub(1))
-            {
-                parts.push(self.source_lines[idx].clone());
+            let last = item_end_idx.min(self.source_lines.len().saturating_sub(1));
+            if !self.source_lines.is_empty() && after_attr_idx <= last {
+                parts.extend(self.source_lines[after_attr_idx..=last].iter().cloned());
             }
             parts.join("\n")
         } else {
