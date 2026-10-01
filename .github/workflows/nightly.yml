@@ -19,7 +19,7 @@ on:
   workflow_dispatch:
 
 # A newer push supersedes this run: the old one can only report on code nobody is
-# looking at any more, and the release matrix alone is 30 cells.
+# looking at any more, and the release matrix alone is 36 cells.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true

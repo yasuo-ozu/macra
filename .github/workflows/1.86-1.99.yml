@@ -1,7 +1,8 @@
-# The release channels macra claims to support. Every cell gates: 1.98 included, since
-# the proc-macro tests skip rather than fail on a compiler with no mapped bridge ABI,
-# so a red 1.98 means something other than the known unmapped table layout.
-name: "1.86-1.98"
+# The release channels macra claims to support. Every cell gates, the 1.98 and 1.99
+# cells included, since the proc-macro tests skip rather than fail on a compiler whose
+# bridge ABI is unmapped or whose table layout the hook cannot drive, so a red cell
+# there means something other than that known gap.
+name: "1.86-1.99"
 
 on:
   push:
@@ -10,7 +11,7 @@ on:
   pull_request:
 
 # A newer push supersedes this run: the old one can only report on code nobody is
-# looking at any more, and the release matrix alone is 30 cells.
+# looking at any more, and the release matrix alone is 36 cells.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -38,6 +39,7 @@ jobs:
           - "1.96"
           - "1.97"
           - "1.98"
+          - "1.99"
     steps:
       - name: Checkout
         uses: actions/checkout@v6

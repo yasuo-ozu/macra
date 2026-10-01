@@ -1,4 +1,4 @@
-# cargo-macra [![Latest Version]][crates.io] [![Documentation]][docs.rs] [![Check]][check-link] [![1.86-1.98]][versions] [![Nightly]][nightly-link] [![MSRV]][msrv-link] [![License]][license-link]
+# cargo-macra [![Latest Version]][crates.io] [![Documentation]][docs.rs] [![Check]][check-link] [![1.86-1.99]][versions] [![Nightly]][nightly-link] [![MSRV]][msrv-link] [![License]][license-link]
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/yasuo-ozu/macra/refs/heads/main/logo.png" alt="cargo-macra logo" width="320" />
@@ -10,8 +10,8 @@
 [docs.rs]: https://docs.rs/cargo-macra/latest/cargo_macra/
 [Check]: https://github.com/yasuo-ozu/macra/actions/workflows/check.yml/badge.svg
 [check-link]: https://github.com/yasuo-ozu/macra/actions/workflows/check.yml
-[1.86-1.98]: https://github.com/yasuo-ozu/macra/actions/workflows/1.86-1.98.yml/badge.svg
-[versions]: https://github.com/yasuo-ozu/macra/actions/workflows/1.86-1.98.yml
+[1.86-1.99]: https://github.com/yasuo-ozu/macra/actions/workflows/1.86-1.99.yml/badge.svg
+[versions]: https://github.com/yasuo-ozu/macra/actions/workflows/1.86-1.99.yml
 [Nightly]: https://github.com/yasuo-ozu/macra/actions/workflows/nightly.yml/badge.svg
 [nightly-link]: https://github.com/yasuo-ozu/macra/actions/workflows/nightly.yml
 [MSRV]: https://img.shields.io/badge/MSRV-1.86-blue.svg
@@ -41,7 +41,7 @@ context, which is useful for:
 
 | Category | Supported |
 | --- | --- |
-| rustc versions (CI) | `1.86` through `1.98`, plus `nightly` |
+| rustc versions (CI) | `1.86` through `1.99`, plus `nightly` |
 | Platforms (CI) | `ubuntu-latest`, `ubuntu-24.04-arm`, `windows-latest`, `windows-11-arm`, `macos-latest` (Apple Silicon), `macos-15-intel` (Intel) |
 
 ## Install
