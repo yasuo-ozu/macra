@@ -10,8 +10,23 @@ pub mod trace_macros;
 /// - Removes spaces adjacent to punctuation (e.g., `a :: b` -> `a::b`)
 /// - Collapses remaining whitespace to a single space
 /// - Normalizes bracket types (`{}`, `[]` -> `()`)
+/// - Drops a comma directly before a closing delimiter (see below)
 /// - Folds every doc comment, however it was rendered, to a bare `#(doc)` /
 ///   `#!(doc)` marker (see below)
+///
+/// The trailing comma is the same kind of divergence as the doc comments. syn's
+/// `ToTokens` emits a separator after *every* element, rustc's pretty-printer omits
+/// the last one, so one side renders `enum E { V = {..}, }` and the other
+/// `enum E { V = {..} }`. Derives compare inputs exactly, so that lone comma was
+/// enough to lose the trace of a derive on any item ending in a trailing separator --
+/// seen on an `announce` mock, where the generated single-variant enum made the comma
+/// the only difference between the query and the cached entry.
+///
+/// Folding it conflates `(T,)` with `(T)`, a one-element tuple with a parenthesized
+/// type. That is a smaller step than this function already takes -- it maps `{}`, `[]`
+/// and `()` onto one delimiter, so far coarser pairs already compare equal -- and it
+/// lands the same way: two cached entries that now look alike become the ambiguity
+/// popup, which is visible, rather than a silent miss.
 ///
 /// The two sides of a comparison render doc comments differently. rustc hands a
 /// proc macro the item with its doc comments still in `///` form, and that is what
@@ -75,7 +90,16 @@ pub fn normalize_tokens(s: &str) -> String {
         } else {
             match c {
                 '{' | '[' => result.push('('),
-                '}' | ']' => result.push(')'),
+                '}' | ']' | ')' => {
+                    // A comma can only reach the end of `result` as the most recent
+                    // token, so one directly before this closer is a trailing
+                    // separator: drop it. Rust admits at most one, so a single pop
+                    // is enough.
+                    if result.ends_with(',') {
+                        result.pop();
+                    }
+                    result.push(')');
+                }
                 _ => result.push(c),
             }
             i += 1;
@@ -795,8 +819,42 @@ mod normalize_tests {
         assert_eq!(normalize_tokens(hook), normalize_tokens(syn));
         assert_eq!(
             normalize_tokens(hook),
-            "#(doc)#(subast(crate::graphics::GraphicsElem))pub enum GraphicsElem(Fill(Color,Path),)"
+            "#(doc)#(subast(crate::graphics::GraphicsElem))pub enum GraphicsElem(Fill(Color,Path))"
         );
+    }
+
+    /// syn's `ToTokens` puts a separator after every element, rustc's pretty-printer
+    /// omits the last one. These are the two renderings of one `announce` mock that a
+    /// cache lookup failed on: byte for byte what the hook stored and what the query
+    /// carried, differing only in that comma.
+    #[test]
+    fn trailing_separators_compare_equal() {
+        let hook = "#[allow(dead_code, non_camel_case_types)] enum __AnnounceCap_0080900758da8d6e\n\
+                    {\n    V =\n    {\n        /// announce mock of [`::core::any::Any`].\n\
+                    pub trait Any: 'static { fn type_id(&self) -> ::core::any::TypeId; } 0\n    }\n}";
+        let syn = "# [allow (dead_code , non_camel_case_types)] \
+                   enum __AnnounceCap_0080900758da8d6e { V = { \
+                   # [doc = \" announce mock of [`::core::any::Any`].\"] \
+                   pub trait Any : 'static { fn type_id (& self) -> :: core :: any :: TypeId ; } 0 } , }";
+        assert_eq!(normalize_tokens(hook), normalize_tokens(syn));
+        assert!(
+            normalize_tokens(syn).ends_with("TypeId;)0))"),
+            "trailing comma survived: {}",
+            normalize_tokens(syn)
+        );
+
+        // Every delimiter the fold applies to, and a comma that is not trailing.
+        assert_eq!(normalize_tokens("f(a, b,)"), normalize_tokens("f(a, b)"));
+        assert_eq!(normalize_tokens("[a, b,]"), normalize_tokens("[a, b]"));
+        assert_eq!(
+            normalize_tokens("S { a, b, }"),
+            normalize_tokens("S { a, b }")
+        );
+        assert_eq!(normalize_tokens("f(a, b)"), "f(a,b)");
+
+        // The fold reaches one separator, not a run: `(a,,)` is not Rust, and a
+        // genuine empty element must not be eaten alongside it.
+        assert_eq!(normalize_tokens("(a,,)"), "(a,)");
     }
 
     /// Each `///` line is one attribute on the syn side, and a `/** */` block is one

@@ -170,8 +170,17 @@ fn assert_has_prefix(expansions: &[MacroExpansion], kind: MacroExpansionKind, pr
 }
 
 fn starts_with_normalized(actual: &str, expected_prefix: &str) -> bool {
-    cargo_macra::normalize_tokens(actual)
-        .starts_with(&cargo_macra::normalize_tokens(expected_prefix))
+    let actual = cargo_macra::normalize_tokens(actual);
+    let expected = cargo_macra::normalize_tokens(expected_prefix);
+    // `normalize_tokens` drops a comma sitting directly before a closing delimiter,
+    // which makes it prefix-unstable: a prefix cut right after a separator keeps the
+    // comma that the full text, where a closer follows it, drops. That is a boundary
+    // artefact of truncating the expectation, not a difference in the expansion, so
+    // the trailing separator is optional here.
+    actual.starts_with(&expected)
+        || expected
+            .strip_suffix(',')
+            .is_some_and(|e| actual.starts_with(e))
 }
 
 fn equals_normalized(actual: &str, expected: &str) -> bool {
