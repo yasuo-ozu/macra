@@ -49,6 +49,8 @@
 //! then
 //! `proc_macro_data: Option<ProcMacroData { proc_macro_decls_static: DefIndex,
 //! stability: Option<_>, macros: LazyArray<(DefIndex, LazyValue<ProcMacroKind>)> }>`.
+//! Part-way through 1.101 `proc_macro_decls_static` became a `LazyValue`, which
+//! changes how `macros` is reached rather than anything it holds — see `SHAPES`.
 //!
 //! The `macros` array is the anchor: rustc fills it in the same loop that emits
 //! the decls table (`proc_macro_harness::mk_decls` calls `declare_proc_macro` per
@@ -286,7 +288,7 @@ impl Node {
     }
 }
 
-/// The two parts of the scalar prefix that have moved, and so are tried rather
+/// The parts of the walk that have moved between releases, and so are tried rather
 /// than looked up.
 ///
 /// Metadata format 11 (1.101) dropped `CrateHeader::hash`, a 16-byte `Svh` sitting
@@ -294,10 +296,19 @@ impl Node {
 /// `String` just after `is_stub`. Both are fields this module only ever skipped
 /// over, so their removal changes nothing it needs — it just moves everything after
 /// them.
+///
+/// Later in the same 1.101 cycle `ProcMacroData::proc_macro_decls_static` turned from
+/// a `DefIndex` into a `LazyValue<LocalDefId>`. That one is not a skip: a `LazyValue`
+/// is a lazy field, so besides consuming a distance it becomes the *first* one in the
+/// node whenever the `LazyArray`s ahead of it are empty, which for a proc-macro crate
+/// they always are. It therefore takes the backward-from-node-start distance that
+/// `macros` used to take, and `macros` turns into a forward hop from it. Read without
+/// knowing that, `macros` resolves to a position far from any record.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Shape {
     header_hash: bool,
     extra_filename: bool,
+    decls_lazy: bool,
 }
 
 /// Every prefix shape [`discover`] tries, newest first.
@@ -310,18 +321,26 @@ struct Shape {
 /// decoding. The two are near-exclusive in practice: read with the wrong one, the
 /// crate name lands on raw hash bytes whose first byte is almost never a valid
 /// `Symbol` tag, and `extra_filename` lands on a `stable_crate_id` byte that is
-/// almost never a valid length. Anything that survives both still has to pass
+/// almost never a valid length. Anything that survives all of them still has to pass
 /// [`validate`], and two surviving shapes still have to agree.
-const SHAPES: [Shape; 2] = [
-    // 1.101 on, metadata format 11.
+const SHAPES: [Shape; 3] = [
+    // 1.101 from the `LazyValue` change on, metadata format 11.
     Shape {
         header_hash: false,
         extra_filename: false,
+        decls_lazy: true,
+    },
+    // Early 1.101, metadata format 11.
+    Shape {
+        header_hash: false,
+        extra_filename: false,
+        decls_lazy: false,
     },
     // 1.98 through 1.100, metadata format 10.
     Shape {
         header_hash: true,
         extra_filename: true,
+        decls_lazy: false,
     },
 ];
 
@@ -386,7 +405,13 @@ fn macros_array(blob: &[u8], root: usize, n_arrays: usize, shape: Shape) -> Opti
     if !r.bool()? {
         return None;
     }
-    r.leb()?; // proc_macro_decls_static: DefIndex
+    if shape.decls_lazy {
+        // A `LazyValue<LocalDefId>`: resolving it is what moves the lazy cursor, so
+        // the `macros` distance below is measured forward from here.
+        node.resolve(r.leb()?)?;
+    } else {
+        r.leb()?; // proc_macro_decls_static: DefIndex
+    }
     if r.bool()? {
         // stability: Some(..) needs `#![feature(staged_api)]`, so only the
         // standard library's own proc-macro crates would get here. Its encoding
@@ -731,8 +756,21 @@ mod tests {
     }
 
     /// Metadata format 11's prefix, and format 10's.
-    const MODERN_SHAPE: Shape = SHAPES[0];
-    const LEGACY_SHAPE: Shape = SHAPES[1];
+    const LAZY_DECLS_SHAPE: Shape = Shape {
+        header_hash: false,
+        extra_filename: false,
+        decls_lazy: true,
+    };
+    const MODERN_SHAPE: Shape = Shape {
+        header_hash: false,
+        extra_filename: false,
+        decls_lazy: false,
+    };
+    const LEGACY_SHAPE: Shape = Shape {
+        header_hash: true,
+        extra_filename: true,
+        decls_lazy: false,
+    };
 
     /// A `.rustc` header carrying `version` as its format byte.
     fn header(version: u8) -> [u8; 8] {
@@ -831,6 +869,15 @@ mod tests {
                 b.extend_from_slice(&[0x2a, 0x2b, k as u8]);
             }
 
+            // The `LazyValue` target for `proc_macro_decls_static`, for the shape
+            // where it is one. Placed before the array so the forward hop to
+            // `macros` is positive.
+            let decls_value = self.shape.decls_lazy.then(|| {
+                let pos = b.len();
+                leb(&mut b, 13); // LocalDefId
+                pos
+            });
+
             // The decoy's record: a derive with no helpers, right before the array.
             let decoy_record = self.decoy.map(|name| {
                 let pos = b.len();
@@ -912,7 +959,18 @@ mod tests {
                 b.push(scalar);
             }
             b.push(1); // proc_macro_data: Some
-            leb(&mut b, 13); // proc_macro_decls_static
+            match decls_value {
+                // A `LazyValue`: a distance, and it moves the lazy cursor.
+                Some(pos) => {
+                    let dist = match prev {
+                        None => root - pos,
+                        Some(p) => pos - p,
+                    };
+                    leb(&mut b, dist);
+                    prev = Some(pos);
+                }
+                None => leb(&mut b, 13), // proc_macro_decls_static: DefIndex
+            }
             if self.stability {
                 b.extend_from_slice(&[1, 0, 0, 0, 0]);
             } else {
@@ -1092,13 +1150,23 @@ mod tests {
                 LEGACY_SHAPE,
                 false,
             ),
-            // 1.101 as it actually ships: format 11, no `CrateHeader::hash`, no
-            // `extra_filename`, 17 arrays.
+            // Early 1.101: format 11, no `CrateHeader::hash`, no `extra_filename`,
+            // 17 arrays, `proc_macro_decls_static` still a plain `DefIndex`.
             (
                 "rustc 1.101.0-nightly (d080e7dff 2026-09-27)",
                 17,
                 11,
                 MODERN_SHAPE,
+                true,
+            ),
+            // 1.101 once `proc_macro_decls_static` became a `LazyValue`, which is
+            // what nightly ships: it takes the backward distance `macros` used to
+            // take, leaving `macros` a forward hop.
+            (
+                "rustc 1.101.0-nightly (822182db4 2026-10-13)",
+                17,
+                11,
+                LAZY_DECLS_SHAPE,
                 true,
             ),
             // Neither axis is read off the other: the old prefix under a bumped
