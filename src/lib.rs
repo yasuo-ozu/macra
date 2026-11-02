@@ -335,6 +335,58 @@ fn ensure_hook_lib() -> Option<PathBuf> {
     Some(dest_plain)
 }
 
+/// Read a file that a concurrent installer may be replacing.
+///
+/// `rename` is atomic for readers on Unix: the name points at the old file or the
+/// new one, never at nothing. Windows has no such guarantee for the *name*. A
+/// replace deletes the target first, and a delete whose file still has an open
+/// handle only becomes pending -- the name survives, and every `CreateFile` against
+/// it is refused with `ERROR_ACCESS_DENIED` until the last handle closes. The handle
+/// need not even be ours; on CI it is as likely to be a virus scanner that opened
+/// the file we just wrote. So a reader can be told "access denied" for a file it is
+/// perfectly entitled to read, for as long as the replace takes.
+///
+/// What it is never told is a half-written file -- that is the property `rename`
+/// does buy us, and the one the concurrency test checks. So treat the refusal as
+/// the transient it is and look again, as LLVM's Windows file code does. The retry
+/// is Windows-only and skipped for every other error, so a missing file -- the
+/// ordinary case on first install -- still answers at once.
+fn read_installed(path: &Path) -> std::io::Result<Vec<u8>> {
+    let mut last = match std::fs::read(path) {
+        Ok(bytes) => return Ok(bytes),
+        Err(e) => e,
+    };
+    // A replace is over in microseconds; 100 ms is slack, not a wait.
+    for _ in 0..50 {
+        if !(cfg!(windows) && is_replace_window_error(&last)) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        match std::fs::read(path) {
+            Ok(bytes) => return Ok(bytes),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
+/// Whether an open failure is one a replace in flight can raise against a name the
+/// caller is entitled to read.
+///
+/// Both codes mean "someone else is holding this file right now", never "this file
+/// is not yours": a pending delete refuses the open with `ERROR_ACCESS_DENIED`, and
+/// a holder that opened without `FILE_SHARE_*` refuses it with
+/// `ERROR_SHARING_VIOLATION`, which has no [`std::io::ErrorKind`] of its own and so
+/// has to be matched by its raw code, Windows-only because that code is EPIPE here.
+/// Anything else -- above all `NotFound`, the ordinary answer before the first
+/// install -- is a real answer and is returned as it stands.
+fn is_replace_window_error(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::PermissionDenied
+        // Raw codes are per-platform: 32 is ERROR_SHARING_VIOLATION on Windows but
+        // EPIPE on Unix, which is nothing of the kind.
+        || (cfg!(windows) && e.raw_os_error() == Some(32))
+}
+
 /// Make `dest` hold exactly `bytes`, replacing it atomically when it does not.
 ///
 /// The comparison is on content, not size. This cache is what the test suite runs
@@ -350,9 +402,10 @@ fn ensure_hook_lib() -> Option<PathBuf> {
 /// in place, so a thread that had already returned could hand rustc a path another
 /// thread was in the middle of rewriting. `rename` replaces the target atomically on
 /// the same filesystem, so every observer sees either the old complete file or the
-/// new one.
+/// new one -- on Windows, once it can open the name at all, which is what
+/// [`read_installed`] is for.
 fn install_bytes(dest: &Path, bytes: &[u8]) -> Option<()> {
-    let up_to_date = || std::fs::read(dest).is_ok_and(|have| have == bytes);
+    let up_to_date = || read_installed(dest).is_ok_and(|have| have == bytes);
     if up_to_date() {
         return Some(());
     }
@@ -1028,6 +1081,47 @@ mod cache_tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Only the codes a replace in flight can raise are worth looking again for.
+    ///
+    /// `NotFound` is the one that matters: it is the answer before the first install,
+    /// so retrying it would put a 100 ms stall on the common path.
+    #[test]
+    fn only_a_busy_file_is_worth_a_second_look() {
+        use std::io::{Error, ErrorKind};
+        assert!(is_replace_window_error(&Error::from(
+            ErrorKind::PermissionDenied
+        )));
+        assert!(!is_replace_window_error(&Error::from(ErrorKind::NotFound)));
+        assert!(!is_replace_window_error(&Error::from(
+            ErrorKind::InvalidData
+        )));
+        // `cfg!` rather than `#[cfg]` so both arms are compiled on every host: the
+        // Windows one is the arm this fix exists for and the one we cannot run here.
+        if cfg!(windows) {
+            // ERROR_ACCESS_DENIED, the code the CI runner actually raised, and
+            // ERROR_SHARING_VIOLATION, which has no matching `ErrorKind`.
+            assert!(is_replace_window_error(&Error::from_raw_os_error(5)));
+            assert!(is_replace_window_error(&Error::from_raw_os_error(32)));
+        } else {
+            // The same number is EPIPE here, so the raw check stays Windows-only.
+            assert!(!is_replace_window_error(&Error::from_raw_os_error(32)));
+        }
+    }
+
+    /// A file that is simply absent is reported at once, not after the retries.
+    #[test]
+    fn a_missing_file_does_not_wait_for_the_retries() {
+        let missing = scratch("cache-missing").join("never-written.bin");
+        let start = std::time::Instant::now();
+        let err = read_installed(&missing).expect_err("no such file");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(50),
+            "took {:?}, so the retry loop ran for an error it should pass through",
+            start.elapsed()
+        );
+    }
+
     /// Concurrent writers each replace the file whole; no reader ever sees a
     /// truncated or half-written one.
     #[test]
@@ -1043,7 +1137,7 @@ mod cache_tests {
                 std::thread::spawn(move || {
                     for _ in 0..10 {
                         install_bytes(&dest, if i % 2 == 0 { &a } else { &b }).expect("install");
-                        let seen = std::fs::read(&dest).unwrap();
+                        let seen = read_installed(&dest).unwrap();
                         assert!(
                             seen == a || seen == b,
                             "partial file of {} bytes",
