@@ -31,6 +31,33 @@ runs:
       # running at all, hiding whatever else broke.
       run: cargo test --workspace --all-targets --no-fail-fast
 
+    - name: Debug show-expansion for known failing external crates
+      # Must stay ahead of the packaging step: that one empties the checkout, so
+      # from there on there is no `Cargo.toml` and no `tests/external_crates` left
+      # to point at, and every case here answers "could not find `Cargo.toml`".
+      if: ${{ failure() }}
+      shell: pwsh
+      run: |
+        $cases = @(
+          @{ manifest = "tests/external_crates/coinduction/Cargo.toml"; test = "coinduction_integration_test" },
+          @{ manifest = "tests/external_crates/coinduction/Cargo.toml"; test = "complex" },
+          @{ manifest = "tests/external_crates/discriminant/Cargo.toml"; test = "test" },
+          @{ manifest = "tests/external_crates/newer-type/Cargo.toml"; test = "multi_self" },
+          @{ manifest = "tests/external_crates/parametrized/Cargo.toml"; test = "recursive" },
+          @{ manifest = "tests/external_crates/parametrized/Cargo.toml"; test = "test" },
+          @{ manifest = "tests/external_crates/parametrized/Cargo.toml"; test = "test_enum" },
+          @{ manifest = "tests/external_crates/parametrized/Cargo.toml"; test = "tuple" }
+        )
+
+        foreach ($case in $cases) {
+          Write-Host "=== show-expansion: manifest=$($case.manifest) test=$($case.test) ==="
+          cargo run --bin cargo-macra -- --show-expansion --manifest-path $case.manifest --test $case.test
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "show-expansion failed for manifest=$($case.manifest) test=$($case.test)"
+          }
+        }
+        exit 0
+
     - name: Package and install from crate tarball
       shell: pwsh
       if: ${{ always() }}
@@ -94,27 +121,3 @@ runs:
             throw "Expected snippet not found in show-expansion output: $snippet"
           }
         }
-
-    - name: Debug show-expansion for known failing external crates
-      if: ${{ failure() }}
-      shell: pwsh
-      run: |
-        $cases = @(
-          @{ manifest = "tests/external_crates/coinduction/Cargo.toml"; test = "coinduction_integration_test" },
-          @{ manifest = "tests/external_crates/coinduction/Cargo.toml"; test = "complex" },
-          @{ manifest = "tests/external_crates/discriminant/Cargo.toml"; test = "test" },
-          @{ manifest = "tests/external_crates/newer-type/Cargo.toml"; test = "multi_self" },
-          @{ manifest = "tests/external_crates/parametrized/Cargo.toml"; test = "recursive" },
-          @{ manifest = "tests/external_crates/parametrized/Cargo.toml"; test = "test" },
-          @{ manifest = "tests/external_crates/parametrized/Cargo.toml"; test = "test_enum" },
-          @{ manifest = "tests/external_crates/parametrized/Cargo.toml"; test = "tuple" }
-        )
-
-        foreach ($case in $cases) {
-          Write-Host "=== show-expansion: manifest=$($case.manifest) test=$($case.test) ==="
-          cargo run -- --show-expansion --manifest-path $case.manifest --test $case.test
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "show-expansion failed for manifest=$($case.manifest) test=$($case.test)"
-          }
-        }
-        exit 0
