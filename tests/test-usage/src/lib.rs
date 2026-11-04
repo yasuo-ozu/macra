@@ -126,9 +126,10 @@ pub fn call_generated_path_macros() {
 
 // --- Bang macros in type position ---
 
-// `type Id = cxx::type_id!("std::string_view");` in an `unsafe impl` is the report
-// this mirrors. A bang macro may stand wherever its expansion may, and a type is one
-// of those places; `syn` gives it a node of its own, which the finder never visited.
+// A bang macro in an associated type -- `type Id = some_macro!("..");` in an `unsafe
+// impl`, the shape `cxx`'s `ExternType` takes -- is what this mirrors. A bang macro
+// may stand wherever its expansion may, and a type is one of those places; `syn`
+// gives it a node of its own, which the finder never visited.
 macro_rules! unit_ty {
     () => {
         ()
