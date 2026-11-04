@@ -1021,19 +1021,18 @@ struct Baz;
     }
 
     /// A bang macro is an invocation wherever it stands, not only where an expression
-    /// or an item may. `cxx::type_id!` in an associated type is the report that found
-    /// this: `unsafe impl cxx::ExternType for T { type Id = cxx::type_id!("..."); }`
-    /// listed nothing, because only the item, expression and statement positions were
-    /// ever visited.
+    /// or an item may. An associated type is one of those places -- `cxx`'s
+    /// `ExternType` is the shape that found this -- and such a call listed nothing at
+    /// all, because only the item, expression and statement positions were visited.
     #[test]
     fn a_macro_in_type_position_is_found() {
-        let source = "unsafe impl cxx::ExternType for StringView {\n    \
-                      type Id = cxx::type_id!(\"std::string_view\");\n    \
+        let source = "unsafe impl ExternType for MyType {\n    \
+                      type Id = cxx::type_id!(\"my::cpp::Type\");\n    \
                       type Kind = cxx::kind::Trivial;\n}";
         let macros = find_macros(source);
         assert_eq!(
             slice_of(source, &macros, "type_id"),
-            (2, "cxx::type_id!(\"std::string_view\")")
+            (2, "cxx::type_id!(\"my::cpp::Type\")")
         );
     }
 
