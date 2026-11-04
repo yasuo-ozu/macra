@@ -146,3 +146,30 @@ impl HasId for IdHolder {
 }
 
 pub fn type_position_mbe() -> unit_ty!() {}
+
+// --- Attribute macros on associated and foreign items ---
+
+// rustc takes an attribute macro on any item, and an associated or foreign item is
+// one. `syn` gives each its own node, so each was invisible to the finder until it
+// had a hook of its own, and `impl S { #[my_attr] fn f() {} }` listed nothing.
+pub struct Assoc;
+
+impl Assoc {
+    #[test_proc_macros::passthrough]
+    pub fn assoc_method(&self) -> i32 {
+        1
+    }
+
+    #[test_proc_macros::passthrough]
+    pub const ASSOC_CONST: i32 = 2;
+}
+
+pub trait AssocTrait {
+    #[test_proc_macros::passthrough]
+    fn trait_method(&self) -> i32;
+}
+
+unsafe extern "C" {
+    #[test_proc_macros::passthrough]
+    pub fn foreign_fn() -> i32;
+}
