@@ -35,7 +35,7 @@ context, which is useful for:
 
 ## Screenshot
 
-[![asciicast](https://asciinema.org/a/8ZoXg8XHY8jnC8PW.svg)](https://asciinema.org/a/8ZoXg8XHY8jnC8PW)
+[![asciicast](https://raw.githubusercontent.com/yasuo-ozu/macra/refs/heads/main/screenshot.png)](https://asciinema.org/a/8ZoXg8XHY8jnC8PW)
 
 ## Supported rustc versions and platforms
 
