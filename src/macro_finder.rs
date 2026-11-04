@@ -1,7 +1,10 @@
 use quote::ToTokens;
 use syn::spanned::Spanned;
 use syn::visit::Visit;
-use syn::{Attribute, Expr, ExprMacro, Item, ItemMacro, Macro, Stmt, StmtMacro};
+use syn::{
+    Attribute, Expr, ExprMacro, ForeignItemMacro, ImplItemMacro, Item, ItemMacro, Macro, Pat, Stmt,
+    StmtMacro, TraitItemMacro, TypeMacro,
+};
 
 /// Represents a macro call found in the source code.
 #[derive(Debug, Clone)]
@@ -329,6 +332,41 @@ impl<'a> Visit<'a> for MacroVisitor {
     fn visit_stmt_macro(&mut self, node: &'a StmtMacro) {
         self.add_macro_from_path(&node.mac, MacroKind::Functional);
         syn::visit::visit_stmt_macro(self, node);
+    }
+
+    // A bang macro stands wherever its expansion may stand, not only where an item, an
+    // expression or a statement may. The positions below were all invisible until a
+    // `cxx::type_id!` in an associated type listed nothing at all: `syn` gives each of
+    // them its own node, so each needs its own hook, and the default walk recurses past
+    // them without ever offering the `Macro` inside.
+
+    fn visit_type_macro(&mut self, node: &'a TypeMacro) {
+        self.add_macro_from_path(&node.mac, MacroKind::Functional);
+        syn::visit::visit_type_macro(self, node);
+    }
+
+    // `Pat::Macro` is the one position with no node of its own in `syn`'s visitor, so
+    // it is matched here the way `Expr::Macro` and `Stmt::Macro` are above.
+    fn visit_pat(&mut self, pat: &'a Pat) {
+        if let Pat::Macro(m) = pat {
+            self.add_macro_from_path(&m.mac, MacroKind::Functional);
+        }
+        syn::visit::visit_pat(self, pat);
+    }
+
+    fn visit_impl_item_macro(&mut self, node: &'a ImplItemMacro) {
+        self.add_macro_from_path(&node.mac, MacroKind::Functional);
+        syn::visit::visit_impl_item_macro(self, node);
+    }
+
+    fn visit_trait_item_macro(&mut self, node: &'a TraitItemMacro) {
+        self.add_macro_from_path(&node.mac, MacroKind::Functional);
+        syn::visit::visit_trait_item_macro(self, node);
+    }
+
+    fn visit_foreign_item_macro(&mut self, node: &'a ForeignItemMacro) {
+        self.add_macro_from_path(&node.mac, MacroKind::Functional);
+        syn::visit::visit_foreign_item_macro(self, node);
     }
 }
 
@@ -833,6 +871,42 @@ struct Baz;
         );
         let line = source.lines().nth(m.line - 1).unwrap();
         (m.line, &line[m.col_start..m.col_end])
+    }
+
+    /// A bang macro is an invocation wherever it stands, not only where an expression
+    /// or an item may. `cxx::type_id!` in an associated type is the report that found
+    /// this: `unsafe impl cxx::ExternType for T { type Id = cxx::type_id!("..."); }`
+    /// listed nothing, because only the item, expression and statement positions were
+    /// ever visited.
+    #[test]
+    fn a_macro_in_type_position_is_found() {
+        let source = "unsafe impl cxx::ExternType for StringView {\n    \
+                      type Id = cxx::type_id!(\"std::string_view\");\n    \
+                      type Kind = cxx::kind::Trivial;\n}";
+        let macros = find_macros(source);
+        assert_eq!(
+            slice_of(source, &macros, "type_id"),
+            (2, "cxx::type_id!(\"std::string_view\")")
+        );
+    }
+
+    /// The same blind spot in the other positions a bang macro may occupy: an
+    /// associated item, a trait item, an `extern` block and a pattern.
+    #[test]
+    fn a_macro_is_found_in_every_other_position_too() {
+        let cases = [
+            ("impl S {\n    inner!(x);\n}", "inner"),
+            ("trait T {\n    inner!(x);\n}", "inner"),
+            ("unsafe extern \"C\" {\n    inner!(x);\n}", "inner"),
+            ("fn f() {\n    let inner!(x) = y;\n}", "inner"),
+        ];
+        for (source, name) in cases {
+            let macros = find_macros(source);
+            assert!(
+                macros.iter().any(|m| m.name == name),
+                "no `{name}!` found in:\n{source}"
+            );
+        }
     }
 
     /// `assert_eq!`'s output: a block. `parse_file` rejects it, and the `vec!` inside it

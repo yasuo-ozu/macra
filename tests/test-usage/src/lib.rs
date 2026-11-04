@@ -123,3 +123,26 @@ pub fn call_generated_path_macros() {
     pathstruct_hello!();
     multiattrstruct_hello!();
 }
+
+// --- Bang macros in type position ---
+
+// `type Id = cxx::type_id!("std::string_view");` in an `unsafe impl` is the report
+// this mirrors. A bang macro may stand wherever its expansion may, and a type is one
+// of those places; `syn` gives it a node of its own, which the finder never visited.
+macro_rules! unit_ty {
+    () => {
+        ()
+    };
+}
+
+pub trait HasId {
+    type Id;
+}
+
+pub struct IdHolder;
+
+impl HasId for IdHolder {
+    type Id = test_proc_macros::answer_ty!();
+}
+
+pub fn type_position_mbe() -> unit_ty!() {}

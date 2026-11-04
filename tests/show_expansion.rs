@@ -147,6 +147,22 @@ fn show_expansion() {
         "Missing proc_macro (bang) expansion (make_answer!).",
     );
 
+    // The same two kinds again, but standing in type position rather than item or
+    // expression position -- `type Id = cxx::type_id!("...")` is the report that put
+    // these fixtures here. Capture never cared where the call stood; the finder did,
+    // so a call it walked past could not be listed or picked, and the expansion that
+    // had been trapped all along was unreachable.
+    assert!(
+        expansions
+            .iter()
+            .any(|e| expansion_caller(e) == "answer_ty!"),
+        "Missing proc_macro (bang) expansion in type position (answer_ty!).",
+    );
+    assert!(
+        expansions.iter().any(|e| expansion_caller(e) == "unit_ty!"),
+        "Missing macro_rules! expansion in type position (unit_ty!).",
+    );
+
     // proc_macro_attribute
     assert!(
         expansions

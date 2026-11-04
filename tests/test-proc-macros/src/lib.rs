@@ -143,3 +143,13 @@ pub fn derive_phantom_name(_input: TokenStream) -> TokenStream {
 pub fn declared_last(_input: TokenStream) -> TokenStream {
     TokenStream::new()
 }
+
+/// Bang macro whose expansion is a type, so it can stand where only a type may.
+///
+/// This is `cxx::type_id!`'s shape: `unsafe impl cxx::ExternType for T { type Id =
+/// cxx::type_id!("..."); }`. The finder walked straight past every such call, so the
+/// macro was not merely unexpandable but absent from the listing entirely.
+#[proc_macro]
+pub fn answer_ty(_input: TokenStream) -> TokenStream {
+    quote! { i32 }.into()
+}
