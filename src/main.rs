@@ -4165,6 +4165,28 @@ impl App {
 }
 
 /// Find the top-level source file for the target, using `cargo metadata`.
+/// Whether a target is the package's library.
+///
+/// A `[lib]` section is one target whose kinds are its `crate-type`s, so a library
+/// that names its linkage carries those names and not the plain `lib` kind:
+/// `crate-type = ["cdylib", "staticlib", "rlib"]` reports exactly those three. Asking
+/// only for `lib` therefore told a crate built to be linked into C or C++ -- an
+/// ordinary shape, and one macra is useful on -- that it had "no lib or bin target",
+/// when what it had was a library spelled the other way.
+fn is_lib_target(target: &cargo_metadata::Target) -> bool {
+    use cargo_metadata::TargetKind;
+    [
+        TargetKind::Lib,
+        TargetKind::RLib,
+        TargetKind::DyLib,
+        TargetKind::CDyLib,
+        TargetKind::StaticLib,
+        TargetKind::ProcMacro,
+    ]
+    .iter()
+    .any(|kind| target.is_kind(kind.clone()))
+}
+
 fn find_source_file(args: &Args) -> io::Result<PathBuf> {
     let mut cmd = cargo_metadata::MetadataCommand::new();
     if let Some(ref manifest_path) = args.manifest_path {
@@ -4216,10 +4238,7 @@ fn find_source_file(args: &Args) -> io::Result<PathBuf> {
             .iter()
             .find(|t| t.is_kind(TargetKind::Bin) && t.name == *bin_name)
     } else if args.lib {
-        package
-            .targets
-            .iter()
-            .find(|t| t.is_kind(TargetKind::Lib) || t.is_kind(TargetKind::ProcMacro))
+        package.targets.iter().find(|t| is_lib_target(t))
     } else if let Some(ref test_name) = args.test {
         // No fallback to the lib when the name matches nothing. `--test typo` used to
         // open `src/lib.rs` and report "No macro expansions found", which reads as
@@ -4240,7 +4259,7 @@ fn find_source_file(args: &Args) -> io::Result<PathBuf> {
         package
             .targets
             .iter()
-            .find(|t| t.is_kind(TargetKind::Lib) || t.is_kind(TargetKind::ProcMacro))
+            .find(|t| is_lib_target(t))
             .or_else(|| package.targets.iter().find(|t| t.is_kind(TargetKind::Bin)))
     };
 
@@ -6175,6 +6194,63 @@ fn print_expansions(expansions: &[cargo_macra::parse_trace::MacroExpansion], col
         }
         println!("{}", pretty::header("---", color));
         print!("{}", pretty::render(&expansion.to, color));
+    }
+}
+
+#[cfg(test)]
+mod target_kind_tests {
+    use super::is_lib_target;
+
+    fn target(kinds: &[&str], name: &str) -> cargo_metadata::Target {
+        let kinds: Vec<String> = kinds.iter().map(|k| format!("{k:?}")).collect();
+        serde_json::from_str(&format!(
+            r#"{{"kind":[{}],"crate_types":[{}],"name":"{name}","src_path":"/x/src/lib.rs","edition":"2021","doctest":false,"test":true,"doc":true}}"#,
+            kinds.join(","),
+            kinds.join(",")
+        ))
+        .expect("target json")
+    }
+
+    /// A library that names its linkage carries those names instead of `lib`.
+    ///
+    /// `crate-type = ["cdylib", "staticlib", "rlib"]` -- a crate linked into C++ --
+    /// was told it had "no lib or bin target in package `...`", because only the plain
+    /// `lib` kind was looked for.
+    #[test]
+    fn every_library_crate_type_counts_as_the_lib() {
+        for kinds in [
+            &["lib"][..],
+            &["rlib"],
+            &["dylib"],
+            &["cdylib"],
+            &["staticlib"],
+            &["proc-macro"],
+            &["cdylib", "staticlib", "rlib"],
+            &["staticlib"],
+        ] {
+            assert!(
+                is_lib_target(&target(kinds, "l")),
+                "{kinds:?} should count as the library"
+            );
+        }
+    }
+
+    /// Everything that is not the library still must not be mistaken for it, or
+    /// `--lib` would silently open a test or the build script.
+    #[test]
+    fn a_non_library_target_is_not_the_lib() {
+        for kinds in [
+            &["bin"][..],
+            &["test"],
+            &["bench"],
+            &["example"],
+            &["custom-build"],
+        ] {
+            assert!(
+                !is_lib_target(&target(kinds, "o")),
+                "{kinds:?} should not count as the library"
+            );
+        }
     }
 }
 
