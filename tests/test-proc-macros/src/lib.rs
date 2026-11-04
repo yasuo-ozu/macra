@@ -153,3 +153,14 @@ pub fn declared_last(_input: TokenStream) -> TokenStream {
 pub fn answer_ty(_input: TokenStream) -> TokenStream {
     quote! { i32 }.into()
 }
+
+/// Attribute macro that returns its item unchanged.
+///
+/// Attribute macros are legal on items, and an associated or foreign item is still an
+/// item -- but not on a field, a variant, a match arm or a parameter, where only
+/// built-ins and inert derive helpers may stand. A pass-through is the probe that
+/// settles which of those rustc actually accepts, and the fixture for the ones it does.
+#[proc_macro_attribute]
+pub fn passthrough(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    item
+}

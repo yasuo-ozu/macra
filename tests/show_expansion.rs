@@ -163,6 +163,19 @@ fn show_expansion() {
         "Missing macro_rules! expansion in type position (unit_ty!).",
     );
 
+    // An attribute macro on an associated or foreign item: the impl method, the
+    // associated const, the trait method and the `extern` fn in the fixture. rustc
+    // takes an attribute macro on any item and these are items, but `syn` nodes them
+    // separately, so the finder passed over all four.
+    assert_eq!(
+        expansions
+            .iter()
+            .filter(|e| expansion_caller(e) == "#[passthrough]")
+            .count(),
+        4,
+        "Expected the four #[passthrough] expansions on associated and foreign items.",
+    );
+
     // proc_macro_attribute
     assert!(
         expansions

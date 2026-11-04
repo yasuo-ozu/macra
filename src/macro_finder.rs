@@ -2,8 +2,8 @@ use quote::ToTokens;
 use syn::spanned::Spanned;
 use syn::visit::Visit;
 use syn::{
-    Attribute, Expr, ExprMacro, ForeignItemMacro, ImplItemMacro, Item, ItemMacro, Macro, Pat, Stmt,
-    StmtMacro, TraitItemMacro, TypeMacro,
+    Attribute, Expr, ExprMacro, ForeignItem, ForeignItemMacro, ImplItem, ImplItemMacro, Item,
+    ItemMacro, Macro, Pat, Stmt, StmtMacro, TraitItem, TraitItemMacro, TypeMacro,
 };
 
 /// Represents a macro call found in the source code.
@@ -91,6 +91,52 @@ fn crate_qualifier_from_str(path: &str) -> String {
 }
 
 /// Get a mutable reference to the attributes of an `Item`.
+trait Attributed: ToTokens + Clone {
+    fn attrs_mut(&mut self) -> Option<&mut Vec<Attribute>>;
+}
+
+impl Attributed for Item {
+    fn attrs_mut(&mut self) -> Option<&mut Vec<Attribute>> {
+        get_item_attrs_mut(self)
+    }
+}
+
+impl Attributed for ImplItem {
+    fn attrs_mut(&mut self) -> Option<&mut Vec<Attribute>> {
+        match self {
+            ImplItem::Const(i) => Some(&mut i.attrs),
+            ImplItem::Fn(i) => Some(&mut i.attrs),
+            ImplItem::Macro(i) => Some(&mut i.attrs),
+            ImplItem::Type(i) => Some(&mut i.attrs),
+            _ => None,
+        }
+    }
+}
+
+impl Attributed for TraitItem {
+    fn attrs_mut(&mut self) -> Option<&mut Vec<Attribute>> {
+        match self {
+            TraitItem::Const(i) => Some(&mut i.attrs),
+            TraitItem::Fn(i) => Some(&mut i.attrs),
+            TraitItem::Macro(i) => Some(&mut i.attrs),
+            TraitItem::Type(i) => Some(&mut i.attrs),
+            _ => None,
+        }
+    }
+}
+
+impl Attributed for ForeignItem {
+    fn attrs_mut(&mut self) -> Option<&mut Vec<Attribute>> {
+        match self {
+            ForeignItem::Fn(i) => Some(&mut i.attrs),
+            ForeignItem::Macro(i) => Some(&mut i.attrs),
+            ForeignItem::Static(i) => Some(&mut i.attrs),
+            ForeignItem::Type(i) => Some(&mut i.attrs),
+            _ => None,
+        }
+    }
+}
+
 fn get_item_attrs_mut(item: &mut Item) -> Option<&mut Vec<Attribute>> {
     match item {
         Item::Const(i) => Some(&mut i.attrs),
@@ -112,15 +158,16 @@ fn get_item_attrs_mut(item: &mut Item) -> Option<&mut Vec<Attribute>> {
     }
 }
 
-/// Serialize an item without the attribute at the given index.
-fn item_without_attr(item: &Item, attr_idx: usize) -> String {
-    let mut item = item.clone();
-    if let Some(attrs) = get_item_attrs_mut(&mut item) {
+/// Serialize a node without the attribute at the given index -- what the attribute
+/// macro at that index is handed.
+fn item_without_attr<N: Attributed>(node: &N, attr_idx: usize) -> String {
+    let mut node = node.clone();
+    if let Some(attrs) = node.attrs_mut() {
         if attr_idx < attrs.len() {
             attrs.remove(attr_idx);
         }
     }
-    item.to_token_stream().to_string()
+    node.to_token_stream().to_string()
 }
 
 /// Visitor that collects macro calls from a syn AST.
@@ -176,7 +223,7 @@ impl MacroVisitor {
         }
     }
 
-    fn process_attributes(&mut self, attrs: &[Attribute], item: &Item) {
+    fn process_attributes<N: Attributed>(&mut self, attrs: &[Attribute], item: &N) {
         // Get the end line of the full item (attribute + body)
         let item_span = item.to_token_stream().into_iter().last();
         let item_line_end = item_span.map(|t| t.span().end().line).unwrap_or(0);
@@ -301,6 +348,48 @@ impl<'a> Visit<'a> for MacroVisitor {
             _ => {}
         }
         syn::visit::visit_item(self, item);
+    }
+
+    // An attribute macro is legal on an item and nowhere else, so these three join
+    // `visit_item` above. An associated or foreign item *is* an item to rustc, but not
+    // to `syn`, which gives each its own node -- so each needs its own hook, and until
+    // it had one, `impl S { #[my_attr] fn f() {} }` listed nothing. The positions left
+    // out are left out on purpose: a field, a variant, a match arm and a parameter take
+    // only built-ins and inert derive helpers ("expected non-macro attribute, found
+    // attribute macro"), and on a statement or an expression an attribute macro is
+    // still unstable. Listing those would offer expansions that cannot exist.
+
+    fn visit_impl_item(&mut self, node: &'a ImplItem) {
+        match node {
+            ImplItem::Const(i) => self.process_attributes(&i.attrs, node),
+            ImplItem::Fn(i) => self.process_attributes(&i.attrs, node),
+            ImplItem::Macro(i) => self.process_attributes(&i.attrs, node),
+            ImplItem::Type(i) => self.process_attributes(&i.attrs, node),
+            _ => {}
+        }
+        syn::visit::visit_impl_item(self, node);
+    }
+
+    fn visit_trait_item(&mut self, node: &'a TraitItem) {
+        match node {
+            TraitItem::Const(i) => self.process_attributes(&i.attrs, node),
+            TraitItem::Fn(i) => self.process_attributes(&i.attrs, node),
+            TraitItem::Macro(i) => self.process_attributes(&i.attrs, node),
+            TraitItem::Type(i) => self.process_attributes(&i.attrs, node),
+            _ => {}
+        }
+        syn::visit::visit_trait_item(self, node);
+    }
+
+    fn visit_foreign_item(&mut self, node: &'a ForeignItem) {
+        match node {
+            ForeignItem::Fn(i) => self.process_attributes(&i.attrs, node),
+            ForeignItem::Macro(i) => self.process_attributes(&i.attrs, node),
+            ForeignItem::Static(i) => self.process_attributes(&i.attrs, node),
+            ForeignItem::Type(i) => self.process_attributes(&i.attrs, node),
+            _ => {}
+        }
+        syn::visit::visit_foreign_item(self, node);
     }
 
     fn visit_item_macro(&mut self, node: &'a ItemMacro) {
@@ -871,6 +960,64 @@ struct Baz;
         );
         let line = source.lines().nth(m.line - 1).unwrap();
         (m.line, &line[m.col_start..m.col_end])
+    }
+
+    /// An attribute macro on an associated or foreign item.
+    ///
+    /// rustc takes an attribute macro on any item, and an associated or foreign item is
+    /// one; `syn` disagrees, giving each its own node, so each was invisible until it
+    /// had a hook. `impl S { #[my_attr] fn f() {} }` is the common shape.
+    #[test]
+    fn an_attribute_macro_is_found_on_an_associated_item() {
+        let cases = [
+            "impl S {\n    #[my_attr]\n    pub fn f(&self) {}\n}",
+            "impl S {\n    #[my_attr]\n    const C: u8 = 1;\n}",
+            "impl S {\n    #[my_attr]\n    type T = u8;\n}",
+            "trait T {\n    #[my_attr]\n    fn f(&self);\n}",
+            "unsafe extern \"C\" {\n    #[my_attr]\n    pub fn f();\n}",
+            "unsafe extern \"C\" {\n    #[my_attr]\n    pub static S: u8;\n}",
+        ];
+        for source in cases {
+            let macros = find_macros(source);
+            let found = macros
+                .iter()
+                .find(|m| m.name == "my_attr")
+                .unwrap_or_else(|| panic!("no `#[my_attr]` found in:\n{source}"));
+            assert!(
+                matches!(found.kind, MacroKind::Attribute),
+                "`#[my_attr]` should be an attribute macro in:\n{source}"
+            );
+            assert!(
+                !found.input.contains("my_attr"),
+                "the input handed to `#[my_attr]` must not contain the attribute \
+                 itself, got {:?}",
+                found.input
+            );
+        }
+    }
+
+    /// The positions rustc refuses are left unlisted on purpose.
+    ///
+    /// On a field, a variant, a match arm and a parameter an attribute macro is
+    /// rejected outright ("expected non-macro attribute, found attribute macro") --
+    /// only built-ins and inert derive helpers stand there -- and on a statement or an
+    /// expression it is still unstable. Listing them would offer an expansion that
+    /// cannot exist, and would turn every `#[serde(..)]` on a field into a dead entry.
+    #[test]
+    fn attributes_where_a_macro_cannot_stand_are_not_listed() {
+        let cases = [
+            "struct S {\n    #[serde(rename = \"x\")]\n    pub x: u8,\n}",
+            "enum E {\n    #[serde(rename = \"a\")]\n    A,\n}",
+            "fn f(x: u8) -> u8 {\n    match x {\n        #[my_attr]\n        _ => 1,\n    }\n}",
+            "fn f(#[my_attr] x: u8) {}",
+        ];
+        for source in cases {
+            let names: Vec<_> = find_macros(source).iter().map(|m| m.name.clone()).collect();
+            assert!(
+                !names.iter().any(|n| n == "my_attr" || n == "serde"),
+                "listed an attribute rustc would reject here: {names:?} in:\n{source}"
+            );
+        }
     }
 
     /// A bang macro is an invocation wherever it stands, not only where an expression
