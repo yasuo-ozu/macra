@@ -1949,8 +1949,10 @@ fn build_root_nodes(
         match mac.kind {
             MacroKind::Attribute => {
                 // Built-in attributes are not macros we can expand; they show up
-                // as children when a non-built-in sibling is expanded.
-                if is_builtin_attribute(&mac.name) {
+                // as children when a non-built-in sibling is expanded. A path that
+                // cannot reach a built-in is somebody else's attribute macro, whatever
+                // it is called.
+                if mac.may_be_builtin && is_builtin_attribute(&mac.name) {
                     continue;
                 }
                 // A derive's helper is inert too, but it keeps its node (drawn as
@@ -3579,6 +3581,7 @@ impl App {
                         .arguments
                         .replace(DOLLAR_CRATE_PLACEHOLDER, "$crate"),
                     sibling_derives: child_mac.sibling_derives,
+                    may_be_builtin: child_mac.may_be_builtin,
                 },
                 id: child_id,
                 parent_id: Some(node_id),
@@ -6442,6 +6445,7 @@ mod tests {
                 input: String::new(),
                 arguments: String::new(),
                 sibling_derives: Vec::new(),
+                may_be_builtin: true,
             },
             id: 0,
             derive_group: 0,
@@ -7718,6 +7722,28 @@ pub struct Page;
         let marker = &app.source_lines[line - 1];
         assert!(marker.ends_with("// -- expanded: baz --"), "{:?}", marker);
         assert!(!marker.contains("baz!(3)"), "{:?}", marker);
+    }
+
+    /// A built-in's name is not reserved. `autocxx` exports a `macro_rules! include`
+    /// of its own, and its `include_cpp!` expands to one `$crate::include! { __docs }`
+    /// per `#include` directive; judged by name alone, every one of them was taken for
+    /// the compiler's `include!` and dropped, so the expansion kept an invocation that
+    /// had no node and could never be expanded.
+    #[test]
+    fn a_path_qualified_call_on_a_built_ins_name_still_gets_a_child_node() {
+        let mut app = test_app("fn main() {\n    foo!(1);\n}\n");
+        app.expand_node(0, Some("$crate::include! { __docs }".into()));
+        let include = node_named(&app, "include");
+        let n = app.get_node(include).unwrap();
+        // `$crate` names the defining crate, which the call site cannot know.
+        assert_eq!(n.call.krate, "");
+        let text = &app.source_lines[n.call.line - 1];
+        assert_eq!(
+            split_at_cols(text, n.call.col_start, n.call.col_end).1,
+            "$crate::include!(__docs)",
+            "in {:?}",
+            text
+        );
     }
 
     /// What rustc traces for `assert_eq!(a(), vec![1, 2])`: a block, not items.
