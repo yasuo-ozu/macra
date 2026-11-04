@@ -43,6 +43,13 @@ pub struct MacroCall {
     /// For derive macros: names of all derives in the same `#[derive(...)]` attribute.
     /// Empty for non-derive macros.
     pub sibling_derives: Vec<String>,
+    /// Whether this call's path could reach a compiler built-in of the same name.
+    ///
+    /// A built-in's name is not reserved, and `is_builtin_functional` /
+    /// `is_builtin_attribute` only know names. The path is what tells a built-in from
+    /// somebody else's macro that happens to share its name, so it has to be weighed
+    /// before either list is consulted.
+    pub may_be_builtin: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -80,6 +87,29 @@ fn crate_qualifier(mut segments: impl Iterator<Item = String>) -> String {
         "crate" | "self" | "super" | "$crate" => String::new(),
         _ => first,
     }
+}
+
+/// Whether a macro path can reach a compiler built-in.
+///
+/// The built-ins live in the prelude, so a bare name reaches one, and `std`, `core` and
+/// `alloc` re-export them (`core::prelude::v1::cfg` as well as `std::include`). Every
+/// other path names a macro someone else defined, which may share a built-in's name and
+/// has nothing else in common with it: `autocxx` exports a `macro_rules! include` of its
+/// own, and `include_cpp!` expands to a `$crate::include! { __docs }` per `#include`
+/// directive. Judging those by name alone dropped every one of them from the listing.
+fn path_may_name_a_builtin(mut segments: impl Iterator<Item = String>) -> bool {
+    let Some(first) = segments.next() else {
+        return false;
+    };
+    if segments.next().is_none() {
+        return true;
+    }
+    matches!(first.as_str(), "std" | "core" | "alloc")
+}
+
+/// `path_may_name_a_builtin` for a path already rendered as text.
+fn path_may_name_a_builtin_from_str(path: &str) -> bool {
+    path_may_name_a_builtin(path.split("::").map(|s| s.trim().to_string()))
 }
 
 /// `crate_qualifier` for a path already rendered as text, as the derive fallback has.
@@ -188,6 +218,8 @@ impl MacroVisitor {
             .map(|s| s.ident.to_string())
             .unwrap_or_default();
         let krate = crate_qualifier(mac.path.segments.iter().map(|s| s.ident.to_string()));
+        let may_be_builtin =
+            path_may_name_a_builtin(mac.path.segments.iter().map(|s| s.ident.to_string()));
 
         // Get span of the entire macro call
         let start_span = mac.path.segments.first().map(|s| s.ident.span());
@@ -219,6 +251,7 @@ impl MacroVisitor {
                 input,
                 arguments: String::new(),
                 sibling_derives: Vec::new(),
+                may_be_builtin,
             });
         }
     }
@@ -236,6 +269,8 @@ impl MacroVisitor {
                 .map(|s| s.ident.to_string())
                 .unwrap_or_default();
             let krate = crate_qualifier(attr.path().segments.iter().map(|s| s.ident.to_string()));
+            let may_be_builtin =
+                path_may_name_a_builtin(attr.path().segments.iter().map(|s| s.ident.to_string()));
 
             // Get span of the entire attribute
             let attr_span = attr.span();
@@ -284,6 +319,7 @@ impl MacroVisitor {
                     for (derive_name, d_line, d_col_start, d_col_end) in derives {
                         self.macros.push(MacroCall {
                             krate: crate_qualifier_from_str(&derive_name),
+                            may_be_builtin: path_may_name_a_builtin_from_str(&derive_name),
                             name: derive_name,
                             kind: MacroKind::Derive,
                             line,
@@ -320,6 +356,7 @@ impl MacroVisitor {
                     input,
                     arguments,
                     sibling_derives: Vec::new(),
+                    may_be_builtin,
                 });
             }
         }
@@ -565,11 +602,16 @@ pub fn find_macros(source: &str) -> Vec<MacroCall> {
     // Sort by line number
     visitor.macros.sort_by_key(|m| m.line);
 
-    // Filter out compiler built-in macros that don't produce trace output
-    visitor.macros.retain(|m| match m.kind {
-        MacroKind::Functional => !is_builtin_functional(&m.name),
-        MacroKind::Attribute => !is_builtin_attribute(&m.name),
-        MacroKind::Derive => true, // derive macros are always user-defined
+    // Filter out compiler built-in macros that don't produce trace output. Only a call
+    // whose path can reach one is weighed against the lists: a name they share is not a
+    // name they have in common.
+    visitor.macros.retain(|m| {
+        !m.may_be_builtin
+            || match m.kind {
+                MacroKind::Functional => !is_builtin_functional(&m.name),
+                MacroKind::Attribute => !is_builtin_attribute(&m.name),
+                MacroKind::Derive => true, // derive macros are always user-defined
+            }
     });
 
     // Deduplicate based on position and name. The column must be part of the key:
@@ -1003,6 +1045,40 @@ struct Baz;
     /// only built-ins and inert derive helpers stand there -- and on a statement or an
     /// expression it is still unstable. Listing them would offer an expansion that
     /// cannot exist, and would turn every `#[serde(..)]` on a field into a dead entry.
+    /// A built-in's name is not reserved: `include!` is in the prelude, so a macro of
+    /// that name in another crate is reached by a path, and the path is what tells the
+    /// two apart. `autocxx`'s `include_cpp!` expands to one `$crate::include! { __docs }`
+    /// per `#include` directive -- its own `macro_rules! include`, nothing to do with
+    /// the compiler's -- and every one of them was dropped from the listing.
+    #[test]
+    fn a_path_qualified_macro_is_not_the_built_in_that_shares_its_name() {
+        let listed = |src: &str| {
+            find_macros(src)
+                .into_iter()
+                .map(|m| m.name)
+                .collect::<Vec<_>>()
+        };
+
+        // A bare call is the prelude's, and `std`/`core` re-export the same macro.
+        assert!(listed("include!(\"a.rs\");").is_empty());
+        assert!(listed("std::include!(\"a.rs\");").is_empty());
+        assert!(listed("core::include!(\"a.rs\");").is_empty());
+        assert!(listed("::core::include!(\"a.rs\");").is_empty());
+
+        // Any other path names somebody else's macro.
+        assert_eq!(listed("autocxx::include! { __docs }"), ["include"]);
+        assert_eq!(listed("crate::include! { __docs }"), ["include"]);
+        // What `$crate` is rewritten to before an expansion is re-scanned.
+        assert_eq!(
+            listed("__macra_dollar_crate__::include! { __docs }"),
+            ["include"]
+        );
+
+        // The same holds for a built-in attribute.
+        assert!(listed("#[cfg(unix)] fn f() {}").is_empty());
+        assert_eq!(listed("#[other::cfg(unix)] fn f() {}"), ["cfg"]);
+    }
+
     #[test]
     fn attributes_where_a_macro_cannot_stand_are_not_listed() {
         let cases = [
