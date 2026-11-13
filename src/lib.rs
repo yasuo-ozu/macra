@@ -817,12 +817,14 @@ pub fn bridge_abi_for(v: RustcVersion) -> Option<BridgeAbi> {
         // A stable 1.100 necessarily contains the merge — its beta branches from master
         // weeks after it — and nothing else has touched `bridge/` on master through
         // 2026-09-23 (e4d8f07417, 16-bit support, changes only `arena.rs` and
-        // `fxhash.rs`, neither on the wire). Not yet released, so this is the one arm
-        // established from source alone; the nightly above is the same code.
-        // 1.100 and everything after it: assume the newest shape we have verified —
-        // the client slice, with 1.100's tag numbering. A deliberate guess, because
-        // refusing every future release means macra goes dark the day rustc's minor
-        // bumps, which is the failure users actually hit.
+        // `fxhash.rs`, neither on the wire). This arm was written from source alone,
+        // before the release; 1.100.0 (0ef1bc386 2026-11-09) has since confirmed it on
+        // the real compiler — the whole suite passes with capture live (no skip), and
+        // `expand` intercepts bang, attribute and derive expansions through the bridge.
+        // Everything after 1.100: still the deliberate guess, the newest shape we have
+        // verified — the client slice, with 1.100's tag numbering. Refusing every
+        // future release would mean macra goes dark the day rustc's minor bumps, which
+        // is the failure users actually hit.
         //
         // Affordable because the name scan gates independently: for a release whose
         // metadata layout is unverified, `rustc_meta` refuses, the hook hands rustc its
